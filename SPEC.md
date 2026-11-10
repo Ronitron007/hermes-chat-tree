@@ -191,3 +191,156 @@ All tests must pass with `npm test`.
 
 Do not write plugin.js, network providers, docs, the skill, or Python files.
 Do not import `@hermes/plugin-sdk`.
+
+## Network and backend providers (task 2)
+
+Create ONLY these files:
+
+- src/wiki-provider.js
+- src/mdn-provider.js
+- src/coined-provider.js
+- src/llm-provider.js
+- test/network-providers.test.js
+
+Do not modify existing src/ or test/ files except if a truly necessary bugfix in
+the registry is required (prefer not to). Do not add npm dependencies.
+
+All network calls go through `ctx.fetch` (required). Never call the global
+`fetch` so tests can stub it. If `ctx.fetch` is missing, `canResolve` is false
+(except `llm`, which uses `ctx.rest`). Timeouts: pass
+`{ signal: AbortSignal.timeout(4000) }` when `AbortSignal.timeout` exists, else
+no signal. On HTTP errors, non-JSON, or thrown fetch, return null / do not
+resolve.
+
+If `ctx.fetch` fails (throws) and `ctx.rest` is a function, fall back once to:
+
+```
+ctx.rest('/lookup?source=SOURCE&term=' + encodeURIComponent(term))
+```
+
+where SOURCE is `wikipedia`, `wiktionary`, or `mdn`. The rest payload, when
+successful, is a JSON object already in Definition shape (`short`, `long`,
+`source`, `kind`, `url`, …). Use it as the result (still clip short/long).
+A rest throw or a non-success payload means the provider returns null.
+
+### wikipedia (`createWikipediaProvider()`)
+
+GET `https://en.wikipedia.org/api/rest_v1/page/summary/` + encodeURIComponent(term)
+with header `Accept: application/json`.
+
+- 200 with `type` of `disambiguation` or `disambig`: return null.
+- 200 with a non-empty `extract` string: success.
+  - `short` = clipWords(extract, 25)
+  - `long` = clipWords(extract, 120)
+  - `source` = 'Wikipedia'
+  - `kind` = 'standard'
+  - `providerId` = 'wikipedia'
+  - `url` = `content_urls.desktop.page` if present, else
+    `https://en.wikipedia.org/wiki/` + encodeURIComponent(title or term)
+- otherwise null.
+
+`canResolve`: `typeof ctx.fetch === 'function'` or `typeof ctx.rest === 'function'`,
+and the term is non-empty after normalize. (Actual 404 is handled in resolve.)
+
+`label`: 'Wikipedia'
+
+### wiktionary (`createWiktionaryProvider()`)
+
+GET `https://en.wiktionary.org/api/rest_v1/page/definition/` + encodeURIComponent(term)
+with header `Accept: application/json`.
+
+The JSON is `{ "en": [ { partOfSpeech, definitions: [ { definition } ] } ] }`
+(other language keys may exist). Prefer the `en` array; if missing, use the
+first present language array. `definition` may contain HTML — strip tags with a
+simple replace (`/<[^>]+>/g` → ''), decode `&amp; &lt; &gt; &quot; &#39;` only,
+collapse whitespace.
+
+Use the first remaining non-empty definition text.
+
+- `short` = clipWords(text, 25), `long` = clipWords(text, 120)
+- `source` = 'Wiktionary', `kind` = 'standard', `providerId` = 'wiktionary'
+- `url` = `https://en.wiktionary.org/wiki/` + encodeURIComponent(term)
+
+`canResolve` / rest fallback: same pattern as Wikipedia, source `wiktionary`.
+`label`: 'Wiktionary'
+
+### mdn (`createMdnProvider()`)
+
+GET `https://developer.mozilla.org/api/v1/search?q=` + encodeURIComponent(term)
++ `&locale=en-US` with header `Accept: application/json`.
+
+Use `documents[0]` only when its `title` equals the term case-insensitively, OR
+the title starts with the term followed by a space or end (e.g. term `fetch`
+matches `fetch` or `fetch()` or `Fetch API`), OR there is a document whose
+title match is exact after stripping `()` and punctuation. If nothing is a
+reasonable match, return null (do not take an unrelated first hit).
+
+`summary` is the definition text. `mdn_url` is a path like
+`/en-US/docs/Web/API/fetch` — url is `https://developer.mozilla.org` + mdn_url.
+
+- `source` = 'MDN', `kind` = 'standard', `providerId` = 'mdn'
+- `canResolve` / rest fallback: same pattern, source `mdn`.
+- `label`: 'MDN'
+
+### coined (`createCoinedProvider()`)
+
+Last-resort. Never invent a definition of the term itself.
+
+`canResolve`: the term is non-empty AND (`ctx.registry` has a firstUse for this
+term in this session, OR `ctx.fetch` or `ctx.rest` is available so existence
+can be checked).
+
+`resolve`:
+
+1. Check Wikipedia and Wiktionary existence with the same URLs as those
+   providers (via `ctx.fetch`, and rest fallback with those sources). If
+   either returns a usable standard extract/definition, return null — a
+   standard source exists, this provider should not invent or shadow it.
+2. If both miss (404 or empty or disambiguation) or cannot be reached:
+   - If `ctx.registry.firstUse(term, sessionId)` has a quote, return
+     `kind: 'coined'`, `source: 'First use in session'`, `providerId: 'coined'`,
+     `url: null`, `firstUse: { quote, sessionId }`,
+     `short` = clipWords(quote, 25),
+     `long` = `'inferred from context. ' + clipWords(quote, 120)` (the label
+     "inferred from context" must appear in `long`).
+   - Else return `kind: 'uncertain'`, `source: 'Not found'`,
+     `short` and `long` = 'No definition found in the glossary or Wikipedia/Wiktionary.',
+     `providerId: 'coined'`, `url: null`, `firstUse: null`.
+
+`label`: 'Coined-term fallback'
+
+### llm (`createLlmProvider()`)
+
+Disabled by default at the registry (already in DEFAULT_DISABLED). This
+provider itself always can be constructed; the registry keeps it off.
+
+- `canResolve`: `typeof ctx.rest === 'function'` and term is non-empty.
+- `resolve`: `await ctx.rest('/define', { method: 'POST', body: { term, sessionId: ctx.sessionId ?? null, surrounding: ctx.surrounding ?? null } })`.
+  On throw or a payload that is not a success Definition, return null.
+  Clip short/long. `source` defaults to 'LLM', `kind` defaults to 'uncertain',
+  `providerId` = 'llm'. Never call fetch. Never invent a payload client-side.
+- `label`: 'LLM (backend)'
+
+## Tests for task 2
+
+`test/network-providers.test.js` must cover, with a fake `ctx.fetch` (and
+`ctx.rest` where relevant), at least:
+
+1. Wikipedia success maps extract to short/long/url; disambiguation is null;
+   404 is null; thrown fetch with rest fallback uses the rest payload;
+   thrown fetch and no rest is null; missing fetch and no rest → canResolve false.
+2. Wiktionary success strips HTML and decodes entities; missing en uses another
+   language; empty is null.
+3. MDN accepts an exact or close title match and rejects an unrelated first hit.
+4. Coined: both wikis miss + firstUse quote → kind coined, long contains
+   "inferred from context", short/long come from the quote (no invented def).
+   Either wiki hits → resolve returns null.
+   Both miss, no firstUse → kind uncertain, fixed "No definition found..." text.
+5. LLM: no rest → canResolve false; rest success is clipped and tagged llm;
+   rest throw → null.
+6. A registry with all eight providers (task 1 + task 2) walks the default
+   order: inline wins when def is present; with inline disabled and no session
+   def, static can win; with those empty, a stub wiki fetch can win; llm is
+   disabled by default so it is not called.
+
+Do not hit the real network. All tests must pass (`npm test`, including task 1).
