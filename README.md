@@ -41,7 +41,7 @@ Default order:
 
 1. **inline** — definitions written into the reply itself (directive attributes).
 2. **session glossary** — terms already defined earlier in the session.
-3. **static / user glossary** — a bundled glossary of common CS/web terms, plus terms you add (`ctx.storage`).
+3. **static / user glossary** — a bundled glossary of common CS/web terms (case-insensitive, with simple plural/inflection matching), plus terms you add (`ctx.storage`).
 4. **MDN** — the web developer reference.
 5. **Wiktionary**
 6. **Wikipedia** — `ctx.fetch`, with a `ctx.rest` proxy fallback and a 4s timeout.
@@ -50,7 +50,9 @@ Default order:
 
 A **docs / codebase index** provider was ruled out. The Hermes plugin SDK has no index API, and `ctx.files.requestFolder()` would only grant folder access, not a searchable index.
 
-The Python annotator chips first mentions from the bundled glossary, then also looks up a small set of other candidates (bold phrases, mid-sentence capitalised noun phrases, and technical tokens such as camelCase) through the same MDN → Wiktionary → Wikipedia helpers the dashboard proxy uses (`lookup_sources.py`). Lookups share a 1.5s budget and a small process-wide cache, and cap at 8 terms per turn. A definition is never invented: a miss is omitted, or tagged with an empty def so the UI coined fallback can run (bold and technical candidates only).
+The Python annotator chips first mentions from the bundled glossary (case-insensitive, with simple plural/inflection stemming so `Monads` hits `monad`), then also looks up a small set of other candidates (bold phrases — including at the start of a paragraph — mid-sentence capitalised noun phrases, and technical tokens such as camelCase) through the same MDN → Wiktionary → Wikipedia helpers the dashboard proxy uses (`lookup_sources.py`). Multiword bold phrases such as `CSS Flexbox` try the full phrase, then the head noun, then known sub-terms, and the chip covers the visible phrase. Lookups share a 1.5s budget and a small process-wide cache, and cap at 8 terms per turn. A definition is never invented: a miss is omitted, or tagged with an empty def so the UI coined fallback can run (bold and technical candidates only).
+
+The hook is `transform_llm_output` without `hold_stream`, so a reply can appear as plain text for a short time and then be replaced by the tagged `::termline` version. That delay is annotation timing, not a chip re-render flash.
 
 Details, costs, and risks are in [`docs/providers.md`](docs/providers.md). The full design notes are in [`SPEC.md`](SPEC.md).
 
@@ -87,8 +89,8 @@ Rebuild the UI plugin after editing `src/` with `npm run assemble` (writes `desk
 ## Tests
 
 ```bash
-npm test                         # 103 tests (Node built-in test runner, no extra dependencies)
-python3 test/test_annotator.py   # 31 tests
+npm test                         # 111 tests (Node built-in test runner, no extra dependencies)
+python3 test/test_annotator.py   # 42 tests
 python3 test/test_lookup_sources.py  # 22 tests
 ```
 

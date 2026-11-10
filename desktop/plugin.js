@@ -319,9 +319,53 @@ function toMap(entries) {
   return map;
 }
 
+// Conservative inflections of one lowercase word: itself first, then singular
+// forms (ies -> y, es, s but not ss) and plural forms. A form only counts when
+// it is an actual glossary key, so nothing is invented. Mirrors _inflections in
+// __init__.py.
+function wordForms(word) {
+  const w = word.toLowerCase();
+  const out = [w];
+  if (w.length > 3 && w.endsWith('ies')) out.push(`${w.slice(0, -3)}y`);
+  if (w.length > 2 && w.endsWith('s') && !w.endsWith('ss')) out.push(w.slice(0, -1));
+  if (w.length > 3 && w.endsWith('es')) out.push(w.slice(0, -2));
+  if (w.length > 2 && w.endsWith('y') && !'aeiou'.includes(w[w.length - 2])) out.push(`${w.slice(0, -1)}ies`);
+  if (!w.endsWith('s')) out.push(`${w}s`);
+  if (/(?:s|x|z|ch|sh)$/.test(w)) out.push(`${w}es`);
+  return out;
+}
+
+function phraseHit(map, words) {
+  const head = words.slice(0, -1).map((w) => w.toLowerCase());
+  for (const form of wordForms(words[words.length - 1])) {
+    const def = map.get([...head, form].join(' '));
+    if (def && def.trim()) return def.trim();
+  }
+  return null;
+}
+
+// Full phrase, then the head noun (and longer trailing sub-terms), then any
+// other sub-term, so "CSS Flexbox" finds "flexbox" and "Monads" finds "monad".
+function findDefinition(map, term) {
+  const words = normalizeTerm(term).split(' ').filter(Boolean);
+  if (words.length === 0) return null;
+  const whole = phraseHit(map, words);
+  if (whole || words.length === 1) return whole;
+  for (let n = words.length - 1; n >= 1; n--) {
+    const hit = phraseHit(map, words.slice(words.length - n));
+    if (hit) return hit;
+  }
+  for (let n = words.length - 1; n >= 1; n--) {
+    for (let i = 0; i + n < words.length; i++) {
+      const hit = phraseHit(map, words.slice(i, i + n));
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
 function lookupGlossary(term, entries) {
-  const def = toMap(entries).get(normalizeTerm(term));
-  return def && def.trim() ? def.trim() : null;
+  return findDefinition(toMap(entries), term);
 }
 
 function createStaticProvider(entries = DEFAULT_GLOSSARY) {
@@ -329,8 +373,8 @@ function createStaticProvider(entries = DEFAULT_GLOSSARY) {
   const find = (term, ctx) => {
     const user = lookupGlossary(term, ctx?.userGlossary);
     if (user) return { def: user, source: 'User glossary' };
-    const def = bundled.get(normalizeTerm(term));
-    return def && def.trim() ? { def: def.trim(), source: 'Static glossary' } : null;
+    const def = findDefinition(bundled, term);
+    return def ? { def, source: 'Static glossary' } : null;
   };
 
   return {
@@ -1120,6 +1164,7 @@ function createPlugin(deps) {
   // (markdown-text.tsx, MarkdownParagraph), so the chip lands in its own block.
   // Whole sentences go through `termline` instead.
   function renderTerm({ attrs, source, streaming, sessionId } = {}) {
+    useValue($prefsTick);
     const name = str(attrs?.name);
     if (!name) return jsx('span', { children: source });
     const def = str(attrs?.def);
@@ -1129,6 +1174,7 @@ function createPlugin(deps) {
   }
 
   function renderTermline({ attrs, source, streaming, sessionId } = {}) {
+    useValue($prefsTick);
     const parsed = materializeInline(attrs);
     if (!parsed.nodes.length) return jsx('span', { children: source });
     const sid = sessionId ?? null;
@@ -1158,8 +1204,13 @@ function createPlugin(deps) {
         return jsxs('a', { href: node.href, target: '_blank', rel: 'noreferrer noopener', children }, `s${key}`);
       });
     const children = build(parsed.nodes, '');
-    // Not a <p>: the host already gives a solo directive its own block.
-    return jsxs('span', { className: PARAGRAPH_CLASS, style: { display: 'block' }, children });
+    // Not a <p>: the host already gives a solo directive its own block, but
+    // only host <p> elements get the paragraph gap, so mirror it here.
+    return jsxs('span', {
+      className: PARAGRAPH_CLASS,
+      style: { display: 'block', marginBlock: 'var(--paragraph-gap) 0' },
+      children,
+    });
   }
 
   // Rows for the provider list. Shared by the Concepts pane and the standalone
