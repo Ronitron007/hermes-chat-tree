@@ -887,3 +887,87 @@ Add tests (in `test/termline.test.js` and/or the existing test files) for:
 
 Do not modify skill, Python, docs, desktop/plugin.js, package.json, SPEC.md,
 or README in this task. Those follow in a later task after this one is green.
+
+## Skill and annotator follow-up (task 6)
+
+Update the skill and the Python mechanical annotator so they emit the
+paragraph-level `::termline` workaround, not mid-sentence `::term`. Mid-sentence
+`::term` still renders in Desktop but splits the sentence into blocks (see
+task 5). Also note the three Desktop bugfixes briefly in `docs/providers.md`.
+
+Create or modify ONLY these files:
+
+- skills/concept-links/SKILL.md
+- __init__.py
+- docs/providers.md
+
+Do not modify src/, test/, desktop/, package.json, SPEC.md, plugin.yaml, or
+dashboard/plugin_api.py. No npm/Python dependencies. No ~/.hermes install. No
+git push.
+
+### skills/concept-links/SKILL.md
+
+Keep the existing frontmatter (name, description) but extend the description
+so it mentions `::termline` for technical answers.
+
+The body must tell the agent that in Hermes Desktop a mid-sentence
+`::term{name= def=}` is lifted out of the sentence and shown as a separate
+block. To keep the sentence together, the **entire paragraph** must be a
+single `::termline` directive, with no prose before or after it on that
+paragraph.
+
+Syntax (the attribute body cannot contain `{`, `}`, `"`, or the marker
+characters `[`, `]`, `|`):
+
+```
+::termline{v="A [[monoid|A set with an associative operation and an identity element]] lets you fold a list in any grouping, and a [[functor|A mapping between categories that preserves structure]] maps over it."}
+```
+
+Rules:
+
+- The paragraph is only the directive. Do not put other text on that
+  paragraph, or Desktop will split it.
+- Wrap each dense term as `[[name|def]]` inside `v`. `name` is the word as
+  the reader should see it. `def` is one plain sentence, at most about 25
+  words and under about 150 characters.
+- `v` is wrapped in double quotes. Do not put `"`, `{`, `}`, `[`, `]`, `|`
+  or backslashes inside a name or a definition (rephrase instead).
+- First mention only, at most 8 terms per reply, only dense specialised
+  terms, never inside a code fence or inline code, skip a paragraph that is
+  already very long (host drops directives in paragraphs over 4800
+  characters, and the attribute body cap is 2048).
+- Write definitions for a reader who is smart but new to the topic. If you
+  coined a term, prefer a short gloss of how you used it, not a made-up
+  formal definition.
+- Do not use mid-sentence `::term{name= def=}` in Desktop replies. That form
+  still exists for older messages, but it breaks the sentence into blocks.
+
+### __init__.py
+
+Change `annotate_terms` so that, for each prose paragraph that contains
+bundled glossary terms, it replaces the **entire paragraph** with one
+`::termline{v="..."}` (markers `[[name|def]]`, first mention only, max 8
+terms across the reply, skip fences / inline code / existing directives,
+longest-term first, whitespace-or-start only so `(monoid)` is left alone).
+
+If the resulting directive body would exceed 2048 characters, or the
+paragraph exceeds 4800, leave that paragraph unmarked. Do not fall back to
+mid-sentence `::term`. If nothing changes, return None. Never raise.
+
+Keep `register`, `_hook`, and `GLOSSARY`. You may add small helpers in this
+file (sanitise, format). Export `annotate_terms` as today.
+
+If a user later verifies: a short sentence containing monoid (not in a
+fence) is rewritten as a `::termline` whose `v` contains `[[monoid|` and
+does not contain mid-sentence `::term{`. A fenced monoid is left alone
+(returns None).
+
+### docs/providers.md
+
+Add a short "Desktop layout" note (a subsection is fine): mid-sentence
+`::term` is split into block siblings by the host
+(`markdown-text.tsx` `MarkdownParagraph`); the workaround is a paragraph
+that is only `::termline{v=...}`; the Concepts pane now shows the surrounding
+sentence (once) rather than the definition, and provider settings live in
+the Concepts pane as well as the standalone providers pane and a palette
+command. Do not invent other behaviour. Do not add market-research content.
