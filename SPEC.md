@@ -540,3 +540,160 @@ Must cover:
 8. Closing risk: two panes are registered, not one.
 
 All existing tests plus these must pass under `npm test`.
+
+## Skill, providers table, and Python half (task 4)
+
+Create ONLY these files:
+
+- docs/providers.md
+- skills/concept-links/SKILL.md
+- plugin.yaml
+- __init__.py
+- dashboard/plugin_api.py
+
+Do not modify existing src/, test/, package.json, README.md, SPEC.md, or
+.gitignore. No npm dependencies. No ~/.hermes install. No git push.
+
+### skills/concept-links/SKILL.md
+
+YAML frontmatter:
+
+```yaml
+---
+name: concept-links
+description: >
+  Mark dense technical terms in assistant replies with the ::term directive so
+  Hermes Desktop can show a hover definition and a Concepts pane. Use in any
+  technical or coding explanation that introduces specialised vocabulary.
+---
+```
+
+Body must tell the agent to emit mid-sentence directives of the form:
+
+```
+::term{name="monoid" def="A set with an associative operation and an identity element"}
+```
+
+Rules (all of these):
+
+- `name` is the term as the reader should see it. `def` is one plain sentence,
+  at most about 25 words, under about 150 characters.
+- Put a space or a line start before `::term`. Do not glue it to punctuation
+  such as `(` or `"`.
+- Only dense, specialised terms a reader may not know. Never everyday words.
+- First mention only, at most 8 terms per reply.
+- Never put a directive inside a code fence or inline code.
+- Keep `def` quote-safe: wrap values in double quotes; do not put `"`, `{` or
+  `}` inside the definition; no backslash escapes.
+- If a paragraph is already very long, skip it (the host drops directives in
+  paragraphs over 4800 characters).
+- Write the definition for a reader who is smart but new to the topic.
+- If you coined or introduced a term in this conversation, still tag the first
+  mention. Prefer a short gloss of how you used it, not a made-up formal
+  definition.
+
+### plugin.yaml
+
+Native Hermes plugin manifest:
+
+- name: concept-links
+- label: Concept Links
+- kind: standalone
+- version: 0.1.0
+- author: Rohan Malik
+- license: MIT
+- description: one short paragraph about hover definitions and the Concepts pane
+- provides_hooks: [transform_llm_output]
+- requires_hermes: ">=0.23"
+- no requires_env, no capabilities (do not request llm.* )
+
+### __init__.py
+
+`register(ctx)`:
+
+1. `ctx.register_hook("transform_llm_output", hook)` with no hold_stream.
+   The hook signature is `(response_text, session_id, model, platform, **kwargs) -> str | None`.
+   It runs a mechanical annotator: wrap first mentions of known glossary terms
+   (the same bundled terms as the static provider) in `::term{name= def=}`
+   using the same quote-safety, fence/inline-code/existing-directive skip,
+   longest-term-first, paragraph 4800 and body 2048 limits described in the
+   spike (whitespace-or-start only, so `(monoid)` is left alone). If nothing
+   changes, return None (not the original string). Never raise.
+2. If `ctx.register_skill` exists, register `concept-links` pointing at
+   `skills/concept-links/SKILL.md` with a short description.
+
+Export `annotate_terms(text, glossary=None) -> str | None` so it can be tested
+by importing the module.
+
+The glossary used by the hook must include at least the bundled term set from
+`src/static-glossary.js` (copy the terms and defs into a Python list in this
+file; do not try to import the JS).
+
+### dashboard/plugin_api.py
+
+FastAPI `router = APIRouter()`.
+
+- GET `/lookup?source={wikipedia|wiktionary|mdn}&term=...`
+  Proxies the same public REST URLs the JS providers use. Timeout 4 seconds.
+  User-Agent: `concept-links-hermes-plugin/0.1 (local Hermes Desktop plugin)`.
+  Accept: application/json. Map a successful payload into a Definition-shaped
+  JSON object (`short`, `long`, `source`, `kind`, `providerId`, `url`,
+  `firstUse: null`) using the same clipping and matching rules in spirit
+  (clip short to 25 words, long to 120; Wikipedia disambiguation → 404;
+  MDN unrelated first hit → 404; Wiktionary strip tags). 400 on a bad source
+  or empty term. 404 when there is no definition. Never follow this with an
+  invented definition.
+- GET `/glossary` — `{ "entries": [ { "term", "def" }, ... ] }` of the bundled
+  glossary.
+- POST `/define` — JSON body `{ term, sessionId?, surrounding? }`. Do **not**
+  call an LLM. Respond 501 with
+  `{ "ok": false, "reason": "not configured" }`.
+  The JS llm provider treats a non-Definition payload as a miss.
+
+Use only the Python standard library plus FastAPI/HTTPException (already
+available in the Hermes gateway). Use urllib or stdlib to fetch. No new
+dependencies. Do not log the term's surrounding text in a way that would
+ship conversation content off-box other than the lookup URL itself
+(Wikipedia/Wiktionary/MDN).
+
+### docs/providers.md
+
+A rich but accurate markdown document with a table of every provider
+considered, with columns:
+
+| Provider | Possible under the SDK? | Implemented? | Latency | Cost | Risks |
+
+Rows must include: inline, session glossary, static/user glossary,
+Wikipedia, Wiktionary, MDN, coined-term fallback, LLM backend, docs/codebase
+index, and the Python `transform_llm_output` annotator hook.
+
+Be honest:
+
+- Latency: sync providers are effectively 0 ms; network providers are one
+  HTTP request with a 4s timeout (do not invent benchmark numbers; say
+  "one HTTP request, 4s timeout").
+- Cost: all implemented providers are free except a future LLM route, which
+  would be one model call per unresolved term and is **not** live (POST
+  /define returns 501, and the llm provider is disabled by default).
+- Wikipedia/Wiktionary/MDN are implemented in JS via `ctx.fetch` with
+  `ctx.rest` fallback to this Python proxy, because direct renderer fetch
+  may be blocked by CORS or CSP. Mark that risk.
+- docs/codebase index is **possible only later**: there is no SDK docs
+  index; `ctx.files.requestFolder()` could grant a folder but we did not
+  build an indexer. Status: not implemented, with that reason.
+- LLM: possible via `ctx.rest` + `plugin_api` or `ctx.llm` (would need a
+  declared capability). Not implemented as a live completion.
+- Mention the 4800-character paragraph cap, 2048-character attribute body
+  cap, quote-unsafe attrs, raw `::term` text on CLI/TUI/messaging, mid-prose
+  docs vs live source disagreement, and that a skill-emitted directive is
+  what makes inline links appear (a desktop plugin cannot rewrite unmarked
+  chat). The hook is the automatic layer, without hold_stream, so users may
+  briefly see unlinked text then a rewrite.
+- Default chain order and that llm is disabled by default.
+- Cache is in-memory, per session.
+- Hover delay is 650 ms (Wikipedia page-preview convention).
+- Coined terms never get an invented definition; the pane shows the first-use
+  quote labelled "inferred from context".
+
+No market-research or product-comparison content beyond what is needed to
+explain these providers.
