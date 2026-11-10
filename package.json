@@ -1,0 +1,9 @@
+{
+  "name": "concept-links",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "assemble": "node scripts/assemble.mjs"
+  }
+}

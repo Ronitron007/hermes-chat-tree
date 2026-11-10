@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+*.log
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+state.db
+screenshots/
