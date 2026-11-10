@@ -277,6 +277,39 @@ test('static finds bundled terms case-insensitively, user glossary overrides', (
   assert.equal(p.resolve('ZZZ', rec).source, 'User glossary');
 });
 
+test('static resolves surface plurals and multiword phrases through known sub-terms', () => {
+  const p = createStaticProvider();
+  const monad = DEFAULT_GLOSSARY.find((e) => e.term === 'monad').def;
+  const flexbox = DEFAULT_GLOSSARY.find((e) => e.term === 'flexbox').def;
+  const grid = DEFAULT_GLOSSARY.find((e) => e.term === 'grid').def;
+  assert.equal(p.resolve('Monads', {}).long, monad);
+  assert.equal(p.resolve('closures', {}).providerId, 'static');
+  assert.equal(p.canResolve('Idempotencies', {}), true);
+  assert.equal(p.resolve('Race Conditions', {}).providerId, 'static');
+  assert.equal(p.resolve('CSS Flexbox', {}).long, flexbox);
+  assert.equal(p.resolve('CSS Grid', {}).long, grid);
+  assert.equal(p.canResolve('CSS', {}), false);
+  assert.equal(p.canResolve('flexbo', {}), false);
+  assert.equal(p.canResolve('classes', {}), false);
+});
+
+test('static stemming covers ies/y, es and s but not ss', () => {
+  const entries = [
+    { term: 'dependency', def: 'd' },
+    { term: 'box', def: 'b' },
+    { term: 'class', def: 'c' },
+    { term: 'effects', def: 'e' },
+  ];
+  const p = createStaticProvider(entries);
+  assert.equal(p.resolve('dependencies', {}).short, 'd');
+  assert.equal(p.resolve('Boxes', {}).short, 'b');
+  assert.equal(p.resolve('effect', {}).short, 'e');
+  assert.equal(p.resolve('class', {}).short, 'c');
+  assert.equal(p.canResolve('clas', {}), false);
+  assert.equal(p.canResolve('dependenc', {}), false);
+  assert.equal(p.resolve('monads', { userGlossary: { Monad: 'mine' } }).short, 'mine');
+});
+
 test('throwing canResolve / resolve never breaks lookup', async () => {
   const r = fullRegistry();
   r.register({ id: 'mdn', label: 'm', canResolve() { throw new Error('x'); }, resolve: () => null });

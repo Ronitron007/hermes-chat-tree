@@ -11,6 +11,8 @@ MONOID = "An associative binary operation together with an identity element, suc
 FUNCTOR = "A container type that supports mapping a function over its contents while keeping the container structure unchanged."
 MONAD = "A design pattern that wraps values in a context and chains operations on them, handling the context such as failure or state automatically."
 IDEMPOTENCY = "The property that repeating an operation has the same effect as doing it once, which makes retries safe."
+FLEXBOX = "A CSS layout model that arranges items along a row or column and distributes the space between them."
+GRID = "A CSS layout model that places items into rows and columns of a two-dimensional grid."
 SENTENCE = "A monoid lets you fold a list in any grouping, and a functor maps over it."
 HASKELL = "In Haskell, a **monad** sequences effects, and idempotency matters for retries."
 JS_GLOSSARY = Path(__file__).resolve().parent.parent / "src" / "static-glossary.js"
@@ -230,6 +232,96 @@ class AnnotatorTest(unittest.TestCase):
         out = cl.annotate_terms("A monoid\nfolds.\n")
         self.assertTrue(out.startswith('::termline{v="A monoid folds."'))
         self.assertTrue(out.endswith("}\n"))
+
+    def test_paragraph_leading_bold_plural_is_chipped_with_the_surface_form(self):
+        text = "**Monads** are a way to chain computations."
+        self.assertEqual(cl.annotate_terms(text), '::termline{v="%s" t="Monads=%s"}' % (text, MONAD))
+        self.assertEqual(self.requests, [])
+
+    def test_multiword_bold_phrases_chip_the_whole_phrase_with_the_sub_term_def(self):
+        text = "Use **CSS Flexbox** for one axis and **CSS Grid** for two."
+        self.assertEqual(
+            cl.annotate_terms(text),
+            '::termline{v="%s" t="CSS Flexbox=%s;;CSS Grid=%s"}' % (text, FLEXBOX, GRID),
+        )
+        self.assertEqual(self.requests, [])
+
+    def test_multiword_bold_phrase_is_not_looked_up_when_a_sub_term_is_known(self):
+        seen = []
+        out = cl.annotate_terms(
+            "Use **CSS Flexbox** here.", resolver=lambda names: seen.append(names) or {}
+        )
+        self.assertEqual(out, '::termline{v="Use **CSS Flexbox** here." t="CSS Flexbox=%s"}' % FLEXBOX)
+        self.assertEqual(seen, [])
+
+    def test_bold_phrase_without_a_known_sub_term_is_unchanged(self):
+        seen = []
+        self.assertIsNone(cl.annotate_terms("Use **Zebra Crossing** here.", resolver=lambda names: seen.append(names) or {}))
+        self.assertEqual(seen, [["Zebra Crossing"]])
+
+    def test_lead_in_stopwords_are_not_part_of_a_bold_phrase_chip(self):
+        out = cl.annotate_terms("See **the CSS Grid** now.")
+        self.assertEqual(out, '::termline{v="See **the CSS Grid** now." t="CSS Grid=%s"}' % GRID)
+
+    def test_stemming_is_conservative_and_only_accepts_glossary_hits(self):
+        glossary = [("closure", "c"), ("dependency", "d"), ("box", "b"), ("flexbox", "f"), ("race condition", "r")]
+        cases = {
+            "Some closures here.": "closures=c",
+            "Many dependencies here.": "dependencies=d",
+            "Two boxes here.": "boxes=b",
+            "A dependency here.": "dependency=d",
+            "Several race conditions here.": "race conditions=r",
+            "The flexbox here.": "flexbox=f",
+        }
+        for text, want in cases.items():
+            self.assertEqual(
+                cl.annotate_terms(text, glossary, resolver=lambda names: {}),
+                '::termline{v="%s" t="%s"}' % (text, want),
+                text,
+            )
+        # No glossary entry for the stem, so nothing is chipped and nothing is invented.
+        for text in ("Some classes here.", "Some flexbos here.", "A wide bus here.", "The process here."):
+            self.assertIsNone(cl.annotate_terms(text, glossary, resolver=lambda names: {}), text)
+
+    def test_inflection_helpers(self):
+        self.assertIn("monad", cl._inflections("Monads"))
+        self.assertIn("dependency", cl._inflections("dependencies"))
+        self.assertIn("box", cl._inflections("boxes"))
+        self.assertNotIn("clas", cl._inflections("class"))
+        self.assertNotIn("flexbo", cl._inflections("flexbox"))
+
+    def test_plural_and_singular_of_one_term_share_a_first_mention(self):
+        out = cl.annotate_terms("A monad.\n\nMany monads.\n\nA closure and closures.")
+        self.assertEqual(out.count("::termline{"), 2)
+        self.assertIn("\n\nMany monads.\n\n", out)
+        self.assertNotIn('t="monads', out)
+
+    def test_explicit_term_is_not_chipped_twice_by_stemming(self):
+        out = cl.annotate_terms('Many ::term{name="monads" def="x"} here.')
+        self.assertEqual(out, '::termline{v="Many monads here." t="monads=x"}')
+
+    def test_three_paragraph_reply_gets_one_termline_each(self):
+        text = (
+            "**Monads** are a way to chain computations.\n\n"
+            "**Closures** capture variables from their defining scope in JavaScript and Python.\n\n"
+            "**Idempotency** makes retries safe."
+        )
+        CLOSURE = "A function bundled with the variables from the scope where it was defined, so it can use them later."
+        for resolver in (lambda names: {}, None):
+            out = cl.annotate_terms(text, resolver=resolver)
+            self.assertEqual(
+                out,
+                '::termline{v="**Monads** are a way to chain computations." t="Monads=%s"}\n\n'
+                '::termline{v="**Closures** capture variables from their defining scope in JavaScript and Python." '
+                't="Closures=%s"}\n\n'
+                '::termline{v="**Idempotency** makes retries safe." t="Idempotency=%s"}' % (MONAD, CLOSURE, IDEMPOTENCY),
+            )
+
+    def test_three_paragraph_reply_uses_resolved_defs_for_the_rest(self):
+        text = "**Closures** capture variables in JavaScript and Python."
+        out = cl.annotate_terms(text, resolver=lambda names: {"javascript": "A language.", "python": "Another language."})
+        self.assertIn("Closures=A function bundled", out)
+        self.assertIn(";;JavaScript=A language.;;Python=Another language.", out)
 
     def test_hook_calls_annotator(self):
         self.assertEqual(cl._hook(SENTENCE), cl.annotate_terms(SENTENCE))

@@ -151,7 +151,7 @@ def _extras(sentence, defs, taken, skip):
     def add(start, name, kind):
         key = _key(name)
         end = start + len(name)
-        if key in defs or key in skip or any(start < b and a < end for a, b in taken):
+        if _known(name, defs) or key in skip or any(start < b and a < end for a, b in taken):
             return
         taken.append((start, end))
         found.setdefault(key, (start, key, name, kind))
@@ -184,6 +184,100 @@ def _extras(sentence, defs, taken, skip):
 
 def _key(s):
     return " ".join(s.split()).lower()
+
+
+def _inflections(word):
+    """Lowercase forms `word` may stand for: itself, then singular and plural variants.
+
+    A form only counts when it is a glossary key, so nothing is invented.
+    Mirrors wordForms in src/static-glossary.js.
+    """
+    w = word.lower()
+    out = [w]
+    if len(w) > 3 and w.endswith("ies"):
+        out.append(w[:-3] + "y")
+    if len(w) > 2 and w.endswith("s") and not w.endswith("ss"):
+        out.append(w[:-1])
+    if len(w) > 3 and w.endswith("es"):
+        out.append(w[:-2])
+    if len(w) > 2 and w.endswith("y") and w[-2] not in "aeiou":
+        out.append(w[:-1] + "ies")
+    if not w.endswith("s"):
+        out.append(w + "s")
+    if w.endswith(("s", "x", "z", "ch", "sh")):
+        out.append(w + "es")
+    return out
+
+
+def _gloss_key(words, defs):
+    """Glossary key for a phrase given as words, inflecting only its last word; None on a miss."""
+    head = [w.lower() for w in words[:-1]]
+    for form in _inflections(words[-1]):
+        key = " ".join(head + [form])
+        if key in defs:
+            return key
+    return None
+
+
+def _known(name, defs):
+    words = name.split()
+    return bool(words) and _gloss_key(words, defs) is not None
+
+
+def _bold_phrases(sentence, defs, taken):
+    """Multiword bold phrases that miss the glossary as a whole but contain a known sub-term.
+
+    Returns [(start, key, name, def)] for the visible phrase (edge stopwords trimmed) and
+    adds its span to `taken`, so the sub-term and its modifiers are not chipped on their own.
+    """
+    out = []
+    for start, phrase in _mask(sentence)[1]:
+        toks = list(re.finditer(r"\w[\w+#/-]*", phrase))
+        while toks and toks[0].group().lower() in _STOP:
+            toks.pop(0)
+        while toks and toks[-1].group().lower() in _STOP:
+            toks.pop()
+        if len(toks) < 2 or len(toks) > MAX_CAPS_WORDS or not _BOLD_PHRASE.fullmatch(" ".join(phrase.split())):
+            continue
+        a, b = start + toks[0].start(), start + toks[-1].end()
+        if any(a < y and x < b for x, y in taken):
+            continue
+        words = [t.group() for t in toks]
+        if _gloss_key(words, defs):
+            continue  # the whole phrase is a glossary term; the normal pass chips it
+        n = len(words)
+        windows = [words[n - k:] for k in range(n - 1, 0, -1)]
+        windows += [words[i:i + k] for k in range(n - 1, 0, -1) for i in range(n - k)]
+        for window in windows:
+            key = _gloss_key(window, defs)
+            if key:
+                taken.append((a, b))
+                out.append((a, key, sentence[a:b], defs[key][1]))
+                break
+    return out
+
+
+def _stem_matches(mask, defs, taken):
+    """Glossary terms written in an inflected form, as [(start, end, key)]; exact forms are left to the regex."""
+    words = list(re.finditer(r"(?<!\S)[\w-]+(?![\w-])", mask))
+    longest = max((k.count(" ") + 1 for k in defs), default=1)
+    out, i = [], 0
+    while i < len(words):
+        for n in range(min(longest, len(words) - i), 0, -1):
+            run = words[i:i + n]
+            if any(not mask[p.end():q.start()].isspace() for p, q in zip(run, run[1:])):
+                continue
+            a, b = run[0].start(), run[-1].end()
+            if any(a < y and x < b for x, y in taken):
+                continue
+            key = _gloss_key([m.group() for m in run], defs)
+            if key:
+                out.append((a, b, key))
+                taken.append((a, b))
+                i += n - 1
+                break
+        i += 1
+    return out
 
 
 def _esc(s):
@@ -316,12 +410,18 @@ def _termline(chunk, defs, pattern, seen, resolver=None):
     has_term = bool(cands)
     taken = [(c[0], c[0] + len(c[2])) for c in cands]
     mask = _mask(sentence)[0]
+    for start, key, name, definition in _bold_phrases(sentence, defs, taken):
+        if key not in explicit:
+            cands.append((start, key, name, definition))
     if pattern is not None:
         for m in pattern.finditer(mask):
             key = _key(m.group("term"))
-            if key not in explicit:
-                cands.append((m.start(), key) + defs[key])
+            if key not in explicit and not any(m.start() < b and a < m.end() for a, b in taken):
+                cands.append((m.start(), key, " ".join(m.group("term").split()), defs[key][1]))
                 taken.append(m.span())
+    for a, b, key in _stem_matches(mask, defs, taken):
+        if key not in explicit:
+            cands.append((a, key, sentence[a:b], defs[key][1]))
     cands.extend(_resolve_extras(sentence, defs, taken, explicit | seen, resolver))
     if not cands:
         return None

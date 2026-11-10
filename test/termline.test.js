@@ -203,3 +203,26 @@ test('materializeInline: plain v and t behave like materializeTermline', () => {
   assert.equal(rich.sentence, plain.sentence);
   assert.deepEqual(materializeInline({}), { nodes: [], sentence: '' });
 });
+
+test('materializeInline chips a surface plural and a multiword name inside bold text', () => {
+  const plural = materializeInline({ v: '**Monads** are a way to chain computations.', t: 'Monads=A pattern' });
+  assert.equal(plural.sentence, 'Monads are a way to chain computations.');
+  assert.deepEqual(plural.nodes[0], {
+    kind: 'strong',
+    children: [{ kind: 'term', name: 'Monads', def: 'A pattern' }],
+  });
+
+  const v = 'Use **CSS Flexbox** for one axis and **CSS Grid** for two.';
+  const multi = materializeInline({ v, t: 'CSS Flexbox=Rows or columns;;CSS Grid=Rows and columns' });
+  assert.equal(multi.sentence, 'Use CSS Flexbox for one axis and CSS Grid for two.');
+  assert.deepEqual(multi.nodes[1], { kind: 'strong', children: [{ kind: 'term', name: 'CSS Flexbox', def: 'Rows or columns' }] });
+  assert.deepEqual(multi.nodes[3], { kind: 'strong', children: [{ kind: 'term', name: 'CSS Grid', def: 'Rows and columns' }] });
+});
+
+test('materializeTermline finds a surface plural and a multiword name', () => {
+  const { pieces } = materializeTermline({ v: 'Use **CSS Flexbox** and Monads.', t: 'CSS Flexbox=a;;Monads=b' });
+  assert.deepEqual(
+    pieces.filter((p) => p.kind === 'term'),
+    [{ kind: 'term', name: 'CSS Flexbox', def: 'a' }, { kind: 'term', name: 'Monads', def: 'b' }],
+  );
+});
