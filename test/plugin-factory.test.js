@@ -465,6 +465,50 @@ test('renderTermline: legacy [[ markers in v still chip, also when host-escaped'
   }
 });
 
+const describeTree = (n) =>
+  typeof n === 'string' ? n
+    : n.type === Tip ? `<${n.props.children.props.children}>`
+    : `${n.type}(${[].concat(n.props.children).map(describeTree).join('')})`;
+
+test('renderTermline: **monad** is a chip inside strong with no literal ** around it', () => {
+  const { termline } = setup();
+  const tree = termline.data.render({
+    attrs: { v: 'In Haskell, a **monad** sequences effects.', t: 'monad=a wrapper' },
+    source: '::termline', streaming: false, sessionId: 's1',
+  });
+  assert.equal(describeTree(tree), 'span(In Haskell, a strong(<monad>) sequences effects.)');
+  assert.ok(!texts(tree).some((t) => t.includes('*')));
+});
+
+test('renderTermline: italic, code and a link render as em, code and a with safe link props', () => {
+  const { termline } = setup();
+  const tree = termline.data.render({
+    attrs: { v: 'An *idempotent* call to `fetch()` per [the docs](https://example.com/x).', t: 'idempotent=same result' },
+    source: '::termline', streaming: false, sessionId: 's1',
+  });
+  assert.equal(describeTree(tree), 'span(An em(<idempotent>) call to code(fetch()) per a(the docs).)');
+  const [link] = findAll(tree, 'a');
+  assert.equal(link.props.href, 'https://example.com/x');
+  assert.equal(link.props.target, '_blank');
+  assert.equal(link.props.rel, 'noreferrer noopener');
+  assert.equal(findAll(tree, 'em').length, 1);
+  assert.equal(findAll(tree, 'code').length, 1);
+  assert.ok(!walk(tree).some((n) => n && typeof n === 'object' && 'dangerouslySetInnerHTML' in (n.props ?? {})));
+});
+
+test('renderTermline: an unclosed ** stays literal and a chip in a link does not follow it', () => {
+  const { termline } = setup();
+  const tree = termline.data.render({
+    attrs: { v: 'A **unclosed monad and [monad docs](https://e.com).', t: 'monad=m' },
+    source: '::termline', streaming: false, sessionId: 's1',
+  });
+  assert.equal(describeTree(tree), 'span(A **unclosed <monad> and a(monad docs).)');
+  const chip = findAll(tree, Tip)[0].props.children;
+  let prevented = false;
+  chip.props.onClick({ preventDefault: () => { prevented = true; } });
+  assert.ok(prevented);
+});
+
 test('pane: the empty state shows a sample with monoid and functor chips that are not recorded', () => {
   const calls = [];
   const { plugin, pane } = setup({ host: { revealPane: (id) => calls.push(id) } });

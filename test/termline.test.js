@@ -12,6 +12,8 @@ import {
   escapeTermListPart,
   unescapeTermListPart,
   materializeTermline,
+  parseInlineMarkdown,
+  materializeInline,
 } from '../src/termline.js';
 
 test('marker constants', () => {
@@ -158,4 +160,46 @@ test('parseTermList: an escaped ;; does not split and unescaped t still parses',
 test('materialize: a def with = and ; reaches the chip intact', () => {
   const out = materializeTermline({ v: 'A monoid works.', t: 'monoid=x\\=y\\; z' });
   assert.deepEqual(out.pieces[1], { kind: 'term', name: 'monoid', def: 'x=y; z' });
+});
+
+const flat = (nodes) =>
+  nodes.map((n) => (n.kind === 'text' ? n.text : n.kind === 'term' ? `<${n.name}>` : `${n.kind}(${flat(n.children)})`)).join('');
+
+test('inline markdown: bold, italic, code and a link in one sentence', () => {
+  const nodes = parseInlineMarkdown('A **bold** and *it* or _al_ with `x*y` and [docs](https://example.com/a).');
+  assert.equal(flat(nodes), 'A strong(bold) and em(it) or em(al) with code(x*y) and link(docs).');
+  assert.equal(nodes.find((n) => n.kind === 'link').href, 'https://example.com/a');
+  assert.equal(flat(parseInlineMarkdown('__b__ and ***both***')), 'strong(b) and strong(em(both))');
+});
+
+test('inline markdown: unclosed or unsafe markers stay literal', () => {
+  for (const s of ['a **unclosed typo', '*lonely', 'snake_case_name here', '2 * 3 * 4', '`open', '[x](javascript:alert(1))', '![img](https://e.com/a.png)']) {
+    assert.deepEqual(parseInlineMarkdown(s), [{ kind: 'text', text: s }], s);
+  }
+  assert.equal(flat(parseInlineMarkdown('**unclosed and *ok*')), '**unclosed and em(ok)');
+  assert.equal(flat(parseInlineMarkdown('use <b>x</b>')), 'use <b>x</b>');
+});
+
+test('materializeInline: **monad** leaves a chip and no stray markers', () => {
+  const { nodes, sentence } = materializeInline({ v: 'In Haskell, a **monad** sequences effects.', t: 'monad=a wrapper' });
+  assert.equal(flat(nodes), 'In Haskell, a strong(<monad>) sequences effects.');
+  assert.equal(sentence, 'In Haskell, a monad sequences effects.');
+  assert.ok(!JSON.stringify(nodes).includes('**'));
+});
+
+test('materializeInline: terms inside em and link spans, and legacy markers inside bold', () => {
+  const a = materializeInline({ v: 'An *idempotent* call, see [monad docs](https://e.com) and `functor`.', t: 'idempotent=same result;;monad=m;;functor=f' });
+  assert.equal(flat(a.nodes), 'An em(<idempotent>) call, see link(<monad> docs) and code(<functor>).');
+  const b = materializeInline({ v: 'A **[[monoid|combines *values*]]** here.' });
+  assert.equal(flat(b.nodes), 'A strong(<monoid>) here.');
+  assert.equal(b.nodes[1].children[0].def, 'combines *values*');
+});
+
+test('materializeInline: plain v and t behave like materializeTermline', () => {
+  const attrs = { v: 'A monoid lets you fold, and a functor maps over it.', t: 'monoid=a;;functor=b' };
+  const plain = materializeTermline(attrs);
+  const rich = materializeInline(attrs);
+  assert.deepEqual(rich.nodes, plain.pieces);
+  assert.equal(rich.sentence, plain.sentence);
+  assert.deepEqual(materializeInline({}), { nodes: [], sentence: '' });
 });

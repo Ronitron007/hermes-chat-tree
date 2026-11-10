@@ -9,7 +9,7 @@ import { createMdnProvider } from './mdn-provider.js';
 import { createWikipediaProvider, createWiktionaryProvider } from './wiki-provider.js';
 import { createCoinedProvider } from './coined-provider.js';
 import { createLlmProvider } from './llm-provider.js';
-import { materializeTermline } from './termline.js';
+import { materializeInline } from './termline.js';
 
 export const PLUGIN_ID = 'concept-links';
 export const PANE_ID = 'glossary';
@@ -34,6 +34,8 @@ const CHIP_STYLE = {
   textDecoration: 'underline dotted',
   textUnderlineOffset: '2px',
 };
+
+const CODE_STYLE = { fontFamily: 'ui-monospace, monospace', fontSize: '0.9em' };
 
 const SAMPLE_TERMLINE = {
   v: 'A monoid lets you fold a list in any grouping, and a functor maps over it.',
@@ -102,7 +104,9 @@ export function createPlugin(deps) {
       ].filter(Boolean),
     });
 
-    const onClick = () => {
+    const onClick = (event) => {
+      // A chip inside a markdown link must not also follow the link.
+      event?.preventDefault?.();
       $selectedTerm.set({ name, sessionId: sid, definition: sync });
       if (typeof host?.revealPane === 'function') host.revealPane(`${PLUGIN_ID}:${PANE_ID}`);
       let pending;
@@ -139,25 +143,35 @@ export function createPlugin(deps) {
   }
 
   function renderTermline({ attrs, source, streaming, sessionId } = {}) {
-    const parsed = materializeTermline(attrs);
-    if (!parsed.pieces.length) return jsx('span', { children: source });
+    const parsed = materializeInline(attrs);
+    if (!parsed.nodes.length) return jsx('span', { children: source });
     const sid = sessionId ?? null;
-    const children = parsed.pieces.map((piece, i) => {
-      if (piece.kind === 'text') return piece.text;
-      const { name, def } = piece;
-      const termAttrs = { name, def };
-      if (!streaming) {
-        registry.recordUse({
-          name,
-          def: recordedDef(def),
-          sessionId: sid,
-          source,
-          attrs: termAttrs,
-          surrounding: parsed.sentence,
-        });
-      }
-      return makeChip({ name, def, sid, source, attrs: termAttrs, key: `t${i}` });
-    });
+    const build = (nodes, path) =>
+      nodes.map((node, i) => {
+        if (node.kind === 'text') return node.text;
+        const key = `${path}${i}`;
+        if (node.kind === 'term') {
+          const { name, def } = node;
+          const termAttrs = { name, def };
+          if (!streaming) {
+            registry.recordUse({
+              name,
+              def: recordedDef(def),
+              sessionId: sid,
+              source,
+              attrs: termAttrs,
+              surrounding: parsed.sentence,
+            });
+          }
+          return makeChip({ name, def, sid, source, attrs: termAttrs, key: `t${key}` });
+        }
+        const children = build(node.children, `${key}.`);
+        if (node.kind === 'strong') return jsxs('strong', { children }, `s${key}`);
+        if (node.kind === 'em') return jsxs('em', { children }, `s${key}`);
+        if (node.kind === 'code') return jsxs('code', { style: CODE_STYLE, children }, `s${key}`);
+        return jsxs('a', { href: node.href, target: '_blank', rel: 'noreferrer noopener', children }, `s${key}`);
+      });
+    const children = build(parsed.nodes, '');
     // Not a <p>: the host already gives a solo directive its own block.
     return jsxs('span', { className: PARAGRAPH_CLASS, style: { display: 'block' }, children });
   }
