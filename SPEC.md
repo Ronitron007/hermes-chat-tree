@@ -1288,3 +1288,104 @@ You may create or modify:
 - test/providers.test.js     (only if a glossary-length assertion must change)
 
 Do not modify package.json, README.md, SPEC.md, desktop/plugin.js, or other plugins. Do not install into ~/.hermes. Do not git push. After writing, run `npm test` and `python3 test/test_annotator.py` (and the new lookup tests if any) and do not finish until they are green. Also assert the exact Haskell/monad sentence as specified.
+
+## Desktop bugfix (task 10a) — hover tooltip stale after Inline toggle; termline spacing
+
+### Bug 3
+
+With the Inline provider toggled off, the hover tooltip can still say "Inline directive" while click resolves to Session glossary. `makeChip` calls `lookupSync` once when the chip first renders and bakes that result into the Tip `label`. Toggling or reordering providers updates `$prefsTick` (used by the providers list) but `renderTerm` / `renderTermline` do not subscribe, so already-mounted chips keep the old tooltip. Click runs `lookup()` at click time, so it sees the current chain.
+
+Fix:
+
+- `renderTerm` and `renderTermline` must subscribe to provider-state changes with `useValue($prefsTick)` (call it at the top of those render functions, not inside a map / `makeChip`, so hook order stays stable). After a toggle or reorder, chips re-render and build the tooltip from a fresh `lookupSync` over the enabled chain.
+- Hover and click still share that same enabled-chain resolution (no `attrs.def` fallback when inline is disabled). After Inline is turned off, a re-rendered tooltip must not say "Inline directive"; it should match what click would show from `lookupSync` (e.g. Session glossary if a session def exists, otherwise the next enabled sync provider, otherwise "No definition yet").
+- Do not put `useValue` inside `makeChip` (it is called from a list).
+
+Add tests in `test/plugin-factory.test.js`: render a term/termline with inline enabled (tooltip shows the inline def / "Inline directive"); disable inline; render again (this is what the subscription triggers) — the tooltip is no longer the inline def and does not say "Inline directive"; click still does not yield `providerId: 'inline'`. Also assert that `renderTerm` / `renderTermline` read `$prefsTick` (e.g. a `useValue` spy, or the behavioural re-render above after `setDisabled`).
+
+### Bug 4
+
+Consecutive `::termline` paragraphs have almost no vertical gap. The host styles prose `<p>` with `margin-block: var(--paragraph-gap) 0` (`--paragraph-gap: 0.7rem` in Desktop `styles.css`). A solo claimed directive is *not* wrapped in a host `<p>` (`MarkdownParagraph` renders `TranscriptDirectiveLeaf` instead), so termline's `display:block` span gets none of that spacing.
+
+Fix: give the termline wrapper the same vertical margin as a host paragraph via inline style, using the host knob: `marginBlock: 'var(--paragraph-gap) 0'` (keep `display: 'block'`). Do not use raw HTML. Mid-sentence `::term` chips stay inline and must not pick up this block margin.
+
+Add a test that the termline root element's style includes `display: 'block'` and `marginBlock: 'var(--paragraph-gap) 0'`.
+
+### Files (task 10a only)
+
+- src/plugin-factory.js
+- test/plugin-factory.test.js
+
+Do not modify other files. Do not install into ~/.hermes. Do not git push. After writing, run `npm test` and do not finish until it is green.
+
+## Desktop bugfix (task 10b) — annotator misses plurals, paragraph-lead bold, and multiword bold phrases
+
+Real replies like "Explain monads, closures, and idempotency in one short paragraph each." produced chips for network-resolved mid-sentence caps (JavaScript, Python) and sometimes Closures, but not for paragraph-leading bold `**Monads**` and `**Idempotency**`. "What is CSS flexbox and grid?" rendered `**CSS Flexbox**` / `**CSS Grid**` without a useful chip on the phrase. Causes:
+
+- Glossary matching is exact-form only (`monads` does not hit `monad`; `closures` does not hit `closure`). Case-insensitive matching already exists.
+- Paragraph-initial capitalised phrases are skipped; bold must always be a candidate even when it is the first thing in the paragraph (bold extras already exist — keep that, and add a test; do not skip a bold phrase just because it is paragraph-initial).
+- Multiword bold phrases (`CSS Flexbox`) are not matched to a known sub-term (`flexbox`). (A word-level glossary hit may already write `t="flexbox=..."`; the `t` name should be the visible phrase so the chip covers `CSS Flexbox`, not only the head noun.)
+
+Fix the Python annotator (`annotate_terms` / `_termline` / candidate selection) and keep the bundled glossary in sync only if you must (prefer matching/stemming, not adding every plural as a separate entry).
+
+1. Case-insensitive matching plus simple plural/inflection stemming. At least: trailing `s` (not `ss`), trailing `es`, and `ies` ↔ `y`. Apply when matching glossary terms and when deciding that a candidate is a known glossary word. Only accept a stem when it actually matches a glossary entry (or a lookup hit) — do not invent defs, and do not over-stem unrelated words (`flexbox` must not become `flexbo`). Emit the *surface form* as the `t` name (e.g. `Monads=`, `closures=` or `Closures=`) with the glossary (or lookup) definition, so the JS renderer can chip the word as written. `v` keeps the original inline markdown.
+
+2. Bold phrases (`**...**` / `__...__`) are always candidates, including at the start of a paragraph.
+
+3. For a multiword candidate (especially bold), try in order: the full phrase, then the head noun (last word), then other known sub-terms (glossary hits among the words). If the full phrase does not resolve but a sub-term does, still chip the *full visible candidate* (e.g. name `CSS Flexbox` with the flexbox definition; name `CSS Grid` with the grid definition). Do not also emit a second chip for the same span. Do not chip a leftover modifier like `CSS` alone when it was only part of a resolved phrase.
+
+4. Keep existing guards: max 8 terms, first mention only, 1.5s lookup budget, no fabricated defs, skip stopwords, skip paragraph-initial caps when they are *not* bold, mid-sentence `::term` still rewritten, fences/headings/lists untouched.
+
+Exact annotated outputs (no extra trailing newline if the input has none), using the bundled glossary defs (network must not be required):
+
+Input:
+
+```
+**Monads** are a way to chain computations.
+```
+
+must be:
+
+```
+::termline{v="**Monads** are a way to chain computations." t="Monads=<the bundled monad definition>"}
+```
+
+Input:
+
+```
+Use **CSS Flexbox** for one axis and **CSS Grid** for two.
+```
+
+must be:
+
+```
+::termline{v="Use **CSS Flexbox** for one axis and **CSS Grid** for two." t="CSS Flexbox=<the bundled flexbox definition>;;CSS Grid=<the bundled grid definition>"}
+```
+
+Also add a Python test for a realistic three-paragraph model reply, for example:
+
+```
+**Monads** are a way to chain computations.
+
+**Closures** capture variables from their defining scope in JavaScript and Python.
+
+**Idempotency** makes retries safe.
+```
+
+Each prose paragraph becomes its own `::termline`. The first chips `Monads` with the monad def, the second chips `Closures` with the closure def (JavaScript / Python may be looked up only if the resolver returns defs; with an offline/empty resolver they must not get fabricated defs), the third chips `Idempotency` with the idempotency def. Put the exact two one-line strings above in unittests.
+
+If the JS static glossary or termline locator would fail to resolve or find a surface plural (`Monads`) or a multiword `t` name (`CSS Flexbox`), update `src/static-glossary.js` and/or `src/termline.js` (and their tests) so hover/lookup and materialize work for those names. Keep the stemming rules equivalent and conservative. A small shared-shaped helper in JS is fine; do not add npm dependencies.
+
+### Files (task 10b only)
+
+You may create or modify:
+
+- __init__.py
+- src/static-glossary.js
+- src/termline.js
+- src/providers.js          (only if a shared normalize/stem helper belongs there)
+- test/test_annotator.py
+- test/termline.test.js
+- test/providers.test.js
+
+Do not modify package.json, README.md, SPEC.md, desktop/plugin.js, dashboard/, lookup_sources.py, or other plugins. Do not install into ~/.hermes. Do not git push. After writing, run `npm test` and `python3 test/test_annotator.py` (and `python3 test/test_lookup_sources.py`) and do not finish until they are green.
