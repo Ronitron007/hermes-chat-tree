@@ -971,3 +971,107 @@ that is only `::termline{v=...}`; the Concepts pane now shows the surrounding
 sentence (once) rather than the definition, and provider settings live in
 the Concepts pane as well as the standalone providers pane and a palette
 command. Do not invent other behaviour. Do not add market-research content.
+
+## Desktop bugfix (task 7) — termline rendered as a plain un-chipped sentence
+
+### Diagnosis (already established; do not re-investigate, do not patch Desktop)
+
+A Desktop retest of `::termline` in session "Reproduce exact paragraph with termline syntax" (id `local-ef3a22774c654e6c639784a3b5ad87428b8d82a05febffabd48e776e8c29121d`, ~13:58 IST on 2026-11-10) showed the assistant reply as one plain line:
+
+> A monoid lets you fold a list in any grouping, and a functor maps over it.
+
+No dotted chips, no 650 ms tooltip, and a click did nothing (Concepts stayed on "No concept selected"). The Providers section and both palette commands still worked.
+
+Layer check, all read-only against `~/.hermes/state.db` and logs:
+
+- **(a) Model stripped the markup: no.** The stored assistant `content` is still the full 212-character string `::termline{v="A [[monoid|A set with an associative operation and an identity element]] lets you fold a list in any grouping, and a [[functor|A mapping between categories that preserves structure]] maps over it."}` (ASCII `[[`, `|`, `]]`, `v="..."`). Model was Opus 4.6, `finish_reason=stop`.
+- **(b) `transform_llm_output` stripped or rewrote it: no.** The hook runs before persist. The stored row still has the markup, so the annotator did not drop it.
+- **(c) Host `segmentTranscriptDirectives` / `parseAttrs` cannot parse `[[`, `|`, or the quoting, on the stored raw string: no.** Run on that exact string, the host regex yields `name=termline` and `attrs.v` with the markers intact. No concept-links or termline errors in `desktop.log` / `gateway.log` / `errors.log` around 13:58 (the 13:57:52 svg `height="auto"` lines are the Board Smoke widget; earlier 500s are `home-dashboard`).
+- **(d) Our render produced the visible sentence without chips.** The on-screen text is exactly `parseTermline(v).sentence`. Given that same `v`, `renderTermline` *does* build Tip/button chips in unit tests and in a `renderToStaticMarkup` check. So the live path either handed our render a `v` that no longer contained `[[name|def]]` (a chip-less `<p>` of the sentence), or the chips did not present as clickable dotted terms.
+
+The host's directive restore (markdown-preprocess.ts `liftDirectives`) backslash-escapes every inline markdown metachar in a directive body, including `[` and `]`. The parser therefore receives `\[\[monoid|def\]\]`. That is the same byte pattern as LaTeX display math `\[...\]`. `[[` / `]]` inside `v` is a fragile encoding on this host: if escapes are left in place, `parseTermline` looks for literal `[[` and will not match (`\[\[` has no consecutive `[[`); if some later stage collapses the span, `v` becomes the bare sentence and we render no chips. Do not patch Desktop. Change our encoding and harden the renderer.
+
+Also: `decoration-dotted` is not present in the shipped Desktop `main-*.css` (while `underline` and `underline-offset-2` are). Chip appearance must not depend on that missing utility.
+
+### What to implement
+
+#### 1. Bracket-free termline encoding (`src/termline.js`)
+
+Keep `parseTermline` / `formatTermline` / `sanitizeTermlinePart` working for the legacy `[[name|def]]` form, but:
+
+- Export `unescapeTermlineValue(s)` that applies the same unescape the host's markdown parser is supposed to: replace `\\` followed by one of `` \`*_~[]<>$& `` with that character. (`MARKDOWN_INLINE_META_RE` in the host is `/[\\`*_~[\]<>$&]/g` with a `\\` prefix.)
+- `parseTermline` must run that unescape on its input *before* scanning for markers, so a value like `A \[\[monoid|def\]\] works` still yields a monoid term chip and the sentence `A monoid works`.
+- Add a second, preferred encoding that never puts `[`, `]`, or `|` in `v`:
+  - `v` (or `text`) is the plain visible sentence, e.g. `A monoid lets you fold a list in any grouping, and a functor maps over it.`
+  - `t` is a list of `name=def` pairs separated by `;;`, e.g. `monoid=A set with an associative operation and an identity element;;functor=A mapping between categories that preserves structure`. Split on `;;`, then on the first `=` in each pair. Trim. Skip empty names.
+  - Export `parseTermList(t)` and `materializeTermline(attrs)` (names can vary slightly if documented in tests, but these two are preferred).
+  - `materializeTermline({ v, text, t })` unescapes `v`/`text`, then: if `parseTermline` finds any term pieces, return that result (legacy messages). Otherwise walk the plain sentence and, for each `t` pair in order, chip the first remaining whole-word occurrence of `name` (case-insensitive match, chip label is the sentence's original spelling). If a name is not found, skip it. The returned `sentence` is the plain visible sentence.
+
+`sanitizeTermlinePart` should still strip characters that would break a directive body (`{`, `}`, `"`, backslash, newlines) and, for safety, the legacy markers.
+
+#### 2. `renderTermline` (`src/plugin-factory.js`)
+
+- Build pieces with `materializeTermline(attrs)` (so both encodings work).
+- If there is no `v`/`text` and no materializable content, keep today's fallback: a `span` of `source`.
+- Do **not** wrap the line in a `<p>` (the host already treats a solo claimed directive as the card alone; a nested `<p>` is invalid in some wrappers). Use a `span` with `className` `PARAGRAPH_CLASS` and `style: { display: 'block' }` (or equivalent). Use `jsxs`, not `jsx`, because there are multiple children.
+- Chip `<button>` style must include **inline** CSS so appearance does not depend on Tailwind utilities that may be missing from the Desktop bundle:
+
+  `display: 'inline', padding: 0, margin: 0, border: 'none', background: 'none', font: 'inherit', color: 'inherit', cursor: 'pointer', textDecoration: 'underline dotted', textUnderlineOffset: '2px'`
+
+  You may keep `CHIP_CLASS` in addition, not instead.
+- Click, 650 ms `Tip`, `recordUse` with `surrounding: parsed.sentence`, streaming skip, and `attrs.text` remain as today.
+
+#### 3. Sample sentence in the Concepts empty state
+
+When no concept is selected, below the existing EmptyState (and above the Providers section), render a short heading or paragraph "Sample" and a `renderTermline` of this known-good payload, with `streaming: true` (so the sample is not recorded as a session use) and a stable `sessionId` such as `'sample'`:
+
+- `v="A monoid lets you fold a list in any grouping, and a functor maps over it."`
+- `t="monoid=A set with an associative operation and an identity element;;functor=A mapping between categories that preserves structure"`
+
+Hover and click on those chips must work the same as chat chips (tooltip, `revealPane`, select the term). This is the model-independent retest surface.
+
+#### 4. Annotator and skill
+
+`__init__.py`: for a prose paragraph that mentions glossary terms, emit the new encoding, not `[[name|def]]` inside `v`. Example:
+
+```
+::termline{v="A monoid lets you fold a list in any grouping." t="monoid=An associative binary operation together with an identity element, such as addition with zero."}
+```
+
+Same rules as today (first mention only, max 8 terms, skip fences / inline code / existing directives / block markdown, 2048 body cap, 4800 paragraph cap, never raise, return None if nothing changes). The sentence in `v` must stay plain (no `[[` markers). `t` pairs use glossary names and definitions, `;;`-separated, in mention order. Reject a rewrite if `v` or `t` would include `"`, `{`, `}`, backslash, or newlines. Export `annotate_terms` as today.
+
+`skills/concept-links/SKILL.md`: document `v` + `t` as the required form. Tell the model **not** to put `[[name|def]]` (or `{`, `}`, `"` ) in `v`. Keep `::termline` as a whole paragraph. You may mention mid-sentence `::term` only as a fallback the plugin still understands for old chats. Update the example to the monoid/functor sentence using `v` and `t`.
+
+### Tests
+
+In `test/termline.test.js` and/or `test/plugin-factory.test.js`:
+
+- `unescapeTermlineValue` / `parseTermline` on `A \\[\\[monoid|def\\]\\] works` yields a monoid term and sentence `A monoid works`.
+- Legacy `[[name|def]]` (unescaped) still parses as today.
+- `materializeTermline` on `{ v: 'A monoid lets you fold, and a functor maps over it.', t: 'monoid=combines values;;functor=maps over a box' }` yields two term chips in order and that sentence.
+- `renderTermline` with the `t` encoding: wrapper is a `span` (not `p`), two Tips/buttons, inline `textDecoration` includes `underline`, click still reveals `concept-links:glossary`.
+- `renderTermline` with legacy `[[` in `v` still chips.
+- Empty state of the Concepts pane includes the sample monoid and functor chips.
+
+After writing, run `npm test` and this check, and do not finish until they pass:
+
+```
+python3 -m py_compile __init__.py
+python3 -c "from pathlib import Path; import importlib.util; s=importlib.util.spec_from_file_location('cl', Path('__init__.py')); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); out=m.annotate_terms('A monoid lets you fold a list.'); assert out and '::termline{' in out and 'v=\"A monoid lets you fold a list.\"' in out and 't=\"monoid=' in out and '[[monoid|' not in out and '::term{' not in out.replace('::termline',''); assert m.annotate_terms('Here is code:\\n```\\nmonoid\\n```\\nDone.') is None; print('annotate-ok', out)"
+```
+
+### Files
+
+Create or modify ONLY these files:
+
+- src/termline.js
+- src/plugin-factory.js
+- test/termline.test.js
+- test/plugin-factory.test.js
+- __init__.py
+- skills/concept-links/SKILL.md
+
+Do not modify package.json, README.md, SPEC.md, .gitignore, docs, desktop/plugin.js, plugin.yaml, or dashboard/.
+Do not add npm dependencies. Do not install into ~/.hermes. Do not git push or add a remote. Local commits are unnecessary.
+Do not import @hermes/plugin-sdk, react, or Node built-ins from src/ (tests may import node:test and node:assert/strict).
+Do not patch Hermes Desktop or write to ~/.hermes/state.db.
