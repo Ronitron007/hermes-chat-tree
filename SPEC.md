@@ -1075,3 +1075,109 @@ Do not modify package.json, README.md, SPEC.md, .gitignore, docs, desktop/plugin
 Do not add npm dependencies. Do not install into ~/.hermes. Do not git push or add a remote. Local commits are unnecessary.
 Do not import @hermes/plugin-sdk, react, or Node built-ins from src/ (tests may import node:test and node:assert/strict).
 Do not patch Hermes Desktop or write to ~/.hermes/state.db.
+
+## Desktop bugfix (task 8) — annotator still leaves or emits mid-sentence `::term`
+
+### Diagnosis (already established; do not re-investigate Desktop, do not patch it)
+
+Desktop test 3: the Concepts pane **Sample** line (JS `::termline`) passes — chips, 650 ms tooltip, click-to-pane all work. The real-reply path fails: the assistant message is split into block siblings `'A' / 'monoid' / 'lets you fold a list...'`, which is the host `MarkdownParagraph` layout for mid-sentence `::term`.
+
+Two cooperating causes, both in the Python annotator / hook, not in the JS renderer:
+
+1. The first shipped annotator (still sitting in `~/.hermes/plugins/concept-links/__pycache__/__init__.cpython-314.pyc`, mtime 13:41 IST) wrapped glossary hits as mid-sentence `::term{name= def=}`. The long-running gateway may still be holding that module. The source in `__init__.py` was later changed to `::termline`, but that is not sufficient on its own.
+2. Today's `_termline` returns `None` as soon as the paragraph contains `::`. So even with the new source loaded, a model that still emits mid-sentence `::term` (skill not followed) is left untouched, and the host splits the sentence.
+
+### What to implement
+
+#### `__init__.py` (the `transform_llm_output` annotator)
+
+`annotate_terms` must rewrite every **prose** paragraph that contains linked terms into **one** paragraph-level directive, and leave everything else untouched.
+
+Output encoding (same as the JS side parses via `materializeTermline` / `parseTermList`):
+
+```
+::termline{v="<plain paragraph text>" t="name=def;;name=def"}
+```
+
+`v` is the visible sentence with no `::term`, no `::termline`, and no `[[name|def]]` markers. `t` lists first-mention terms in appearance order, at most 8 across the whole reply.
+
+Linked terms come from either or both of:
+
+- Mid-sentence (or whole-paragraph) `::term{...}` already in the text. Strip each `::term{...}` out of the sentence, putting the `name` attr back as the visible word, and take `name` / `def` from the directive attrs (`name="..."` / `def="..."` or single quotes; missing `def` is fine). Do not treat `::termline` as a term to strip — a paragraph that is already a `::termline` is left unchanged.
+- First whole-word mentions of bundled (or caller-supplied) glossary terms in the recovered plain sentence, skipping names already collected from `::term` in this reply.
+
+Leave **untouched** (do not wrap, do not return a rewrite for that chunk):
+
+- Fenced code blocks
+- Headings, lists, block quotes, tables (same `_BLOCK` rule as today)
+- Paragraphs with no glossary terms and no `::term`
+- Paragraphs that are already a `::termline`
+- Inline code (`...` in the paragraph): skip the paragraph rather than corrupting it
+- Paragraphs over 4800 characters, or a resulting directive body over 2048 characters
+
+Do **not** skip a prose paragraph merely because it contains `::term`. That is the bug.
+
+**Escaping, consistent with `src/termline.js`** (add the JS helpers in the same task):
+
+- In `t` parts, escape `\`, `;`, and `=` as `\\`, `\;`, `\=` so a definition may contain those characters; join pairs with `;;`; split on unescaped `;;` and the first unescaped `=`.
+- Attribute quoting: prefer `v="..." t="..."`. If `v` or `t` contains `"`, use single quotes for both attrs if neither contains `'`. If both `"` and `'` would appear, strip `"` from the values rather than producing a body the host `parseAttrs` cannot read (the host has no escape inside quoted attrs). Never emit `{`, `}`, or raw newlines inside the body. If after sanitising there is nothing safe to emit, leave the paragraph unmarked.
+
+`annotate_terms` still returns the rewritten full text, or `None` when nothing changed, and must never raise. Keep `register`, `_hook`, and `GLOSSARY`. `_hook` still calls `annotate_terms(response_text)`.
+
+The exact annotated output for this input (no trailing extra newline if the input has none):
+
+```
+A monoid lets you fold a list in any grouping, and a functor maps over it.
+```
+
+must be (functor is not in the bundled glossary, so only monoid is in `t`):
+
+```
+::termline{v="A monoid lets you fold a list in any grouping, and a functor maps over it." t="monoid=An associative binary operation together with an identity element, such as addition with zero."}
+```
+
+A paragraph that already has mid-sentence `::term` for monoid and functor must become one `::termline` whose `v` is the plain sentence (the names in place of the directives) and whose `t` includes both terms, using the `def` from the directives when present.
+
+#### `src/termline.js` and its tests
+
+Export `escapeTermListPart` / `unescapeTermListPart` (or equivalent documented names) and teach `parseTermList` to split on unescaped `;;` and the first unescaped `=`, then unescape each part. Existing unescaped `t="monoid=def;;functor=def"` must still parse as today. Add tests for a def that contains `=` and `;`.
+
+#### Skill
+
+`skills/concept-links/SKILL.md` must instruct the agent to emit **only** paragraph-level `::termline{v= t=}`, never mid-sentence `::term`. Keep the monoid/functor example in the `v` + `t` form. State clearly that inline `::term` splits the sentence into blocks on Desktop.
+
+#### Python tests
+
+Add `test/test_annotator.py` (unittest, stdlib only). Cover at least:
+
+- The exact monoid/functor sentence above equals the exact `::termline` string above.
+- Mid-sentence `::term` for two terms is rewritten to one `::termline` with a plain `v` and both names in `t`.
+- A fenced code block containing `monoid` returns `None`.
+- A heading and a markdown list containing `monoid` are left unmarked (`None`).
+- A paragraph with no glossary terms and no `::term` returns `None`.
+- An already-wrapped `::termline` paragraph is left unchanged (`None`).
+- Custom glossary: a def containing `=` and `;` is escaped in `t`, and the body stays within the host attr rules.
+
+Run them with `python3 -m unittest test.test_annotator` or `python3 test/test_annotator.py`. Do not add pytest or any dependency.
+
+### Files
+
+Create or modify ONLY these files:
+
+- __init__.py
+- test/test_annotator.py          (new)
+- skills/concept-links/SKILL.md
+- src/termline.js
+- test/termline.test.js
+- plugin.yaml                     (optional: if you touch it, change the description so it talks about `::termline`, not mid-sentence `::term`)
+
+Do not modify package.json, README.md, SPEC.md, .gitignore, docs, desktop/plugin.js, dashboard/, or other plugins.
+Do not add npm or Python dependencies. Do not install into ~/.hermes. Do not git push or add a remote. Local commits are unnecessary.
+Do not import @hermes/plugin-sdk, react, or Node built-ins from src/ (JS tests may import node:test and node:assert/strict).
+Do not patch Hermes Desktop or write to ~/.hermes/state.db.
+
+After writing, run `npm test` and the unittest file, and do not finish until both are green. Also run:
+
+```
+python3 -c "from pathlib import Path; import importlib.util; s=importlib.util.spec_from_file_location('cl', Path('__init__.py')); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); src='A monoid lets you fold a list in any grouping, and a functor maps over it.'; out=m.annotate_terms(src); print(out); assert out == '::termline{v=\"A monoid lets you fold a list in any grouping, and a functor maps over it.\" t=\"monoid=An associative binary operation together with an identity element, such as addition with zero.\"}'"
+```
