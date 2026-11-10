@@ -192,12 +192,12 @@ test('session records first use and later uses, first def wins, session scoped',
   assert.equal(uses.length, 3);
   assert.deepEqual(uses.map((u) => u.at), [...uses.map((u) => u.at)].sort((a, b) => a - b));
   assert.equal(uses[0].quote, 'Foo appears here');
-  assert.equal(uses[1].quote, 'first def');
+  assert.equal(uses[1].quote, null);
   assert.equal(r.firstUse('foo', 's1'), uses[0]);
   assert.equal(r.usesFor('foo', 's2').length, 1);
   assert.equal(r.firstUse('bar', 's1'), null);
   r.recordUse({ name: 'bare', sessionId: 's1' });
-  assert.equal(r.firstUse('bare', 's1').quote, 'bare');
+  assert.equal(r.firstUse('bare', 's1').quote, null);
 
   const d = await r.lookup('foo', { sessionId: 's1' });
   assert.equal(d.short, 'first def');
@@ -206,6 +206,44 @@ test('session records first use and later uses, first def wins, session scoped',
   assert.deepEqual(d.firstUse, { quote: 'Foo appears here', sessionId: 's1' });
   assert.equal((await r.lookup('foo', { sessionId: 's2' })).short, 'other session');
   assert.equal(await r.lookup('foo', { sessionId: 's3' }), null);
+});
+
+test('recordUse: quote is the surrounding sentence, never the definition', () => {
+  const r = createRegistry();
+  assert.equal(r.recordUse({ name: 'a', def: 'the def', sessionId: 's' }).quote, null);
+  assert.equal(r.recordUse({ name: 'b', def: 'the def', sessionId: 's', surrounding: 'A real sentence.' }).quote, 'A real sentence.');
+  assert.equal(r.recordUse({ name: 'c', def: 'the def', sessionId: 's', surrounding: '   ' }).quote, null);
+});
+
+test('recordUse: same source or a streaming prefix is one use; no source always adds', () => {
+  const r = createRegistry();
+  const first = r.recordUse({ name: 'Foo', sessionId: 's', source: '::term{name="Foo"' });
+  const again = r.recordUse({ name: 'foo', def: 'grown', sessionId: 's', source: '::term{name="Foo" def="grown"}' });
+  assert.equal(again, first);
+  assert.equal(r.usesFor('foo', 's').length, 1);
+  assert.equal(first.source, '::term{name="Foo" def="grown"}');
+  assert.equal(first.def, 'grown');
+
+  // Shorter prefix arriving later does not shrink the stored source.
+  r.recordUse({ name: 'foo', sessionId: 's', source: '::term{name="Foo"' });
+  assert.equal(r.usesFor('foo', 's').length, 1);
+  assert.equal(first.source, '::term{name="Foo" def="grown"}');
+
+  // Same source gains a quote it lacked.
+  r.recordUse({ name: 'foo', sessionId: 's', source: '::term{name="Foo" def="grown"}', surrounding: 'Foo is here.' });
+  assert.equal(r.usesFor('foo', 's').length, 1);
+  assert.equal(first.quote, 'Foo is here.');
+  assert.equal(first.surrounding, 'Foo is here.');
+  assert.equal(r.firstUse('foo', 's'), first);
+
+  // Different source, other session, and missing source are separate uses.
+  r.recordUse({ name: 'foo', sessionId: 's', source: 'unrelated' });
+  r.recordUse({ name: 'foo', sessionId: 't', source: '::term{name="Foo"' });
+  assert.equal(r.usesFor('foo', 's').length, 2);
+  assert.equal(r.usesFor('foo', 't').length, 1);
+  r.recordUse({ name: 'foo', sessionId: 's' });
+  r.recordUse({ name: 'foo', sessionId: 's' });
+  assert.equal(r.usesFor('foo', 's').length, 4);
 });
 
 test('session provider can be bound to a registry directly', () => {

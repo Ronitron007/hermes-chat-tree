@@ -9,15 +9,18 @@ import { createMdnProvider } from './mdn-provider.js';
 import { createWikipediaProvider, createWiktionaryProvider } from './wiki-provider.js';
 import { createCoinedProvider } from './coined-provider.js';
 import { createLlmProvider } from './llm-provider.js';
+import { parseTermline } from './termline.js';
 
 export const PLUGIN_ID = 'concept-links';
 export const PANE_ID = 'glossary';
 export const SETTINGS_PANE_ID = 'providers';
 export const DIRECTIVE_NAME = 'term';
+export const TERMLINE_DIRECTIVE_NAME = 'termline';
 export const HOVER_DELAY_MS = 650;
 
 const NO_DEF = 'No definition yet';
-const CHIP_CLASS = 'cursor-pointer underline decoration-dotted underline-offset-2';
+const CHIP_CLASS = 'inline cursor-pointer underline decoration-dotted underline-offset-2';
+const PARAGRAPH_CLASS = 'leading-relaxed break-words';
 
 // attrs are untrusted model output: only trimmed strings are used.
 const str = (v) => (typeof v === 'string' ? v.trim() : '');
@@ -64,12 +67,7 @@ export function createPlugin(deps) {
     $prefsTick.set(++tick);
   }
 
-  function renderTerm({ attrs, source, sessionId } = {}) {
-    const name = str(attrs?.name);
-    if (!name) return jsx('span', { children: source });
-    const def = str(attrs?.def);
-    const sid = sessionId ?? null;
-    registry.recordUse({ name, def: def || undefined, sessionId: sid, source, attrs });
+  function makeChip({ name, def, sid, source, attrs, key }) {
     const lookupCtx = { sessionId: sid, attrs, source, userGlossary, fetch: fetchFn, rest };
     const sync = registry.lookupSync(name, lookupCtx);
 
@@ -102,47 +100,49 @@ export function createPlugin(deps) {
     };
 
     const chip = jsx('button', { type: 'button', onClick, className: CHIP_CLASS, children: name });
-    return jsx(Tip, { delayDuration: HOVER_DELAY_MS, label, children: chip });
+    return jsx(Tip, { delayDuration: HOVER_DELAY_MS, label, children: chip }, key);
   }
 
-  function renderPane() {
-    const selected = useValue($selectedTerm);
-    if (!selected) {
-      return jsx(EmptyState, {
-        title: 'No concept selected',
-        description: 'Click a dotted term in the chat to see it here.',
-      });
-    }
-    const { name, sessionId, definition } = selected;
-    const first = definition?.firstUse?.quote ?? registry.firstUse(name, sessionId)?.quote ?? null;
-    const uses = registry.usesFor(name, sessionId);
-    const kind = definition?.kind;
-    const children = [
-      jsx('h2', { className: 'text-base font-semibold', children: name }),
-      kind === 'coined' || kind === 'uncertain' ? jsx(Badge, { children: kind }) : null,
-      jsx('p', { className: 'text-sm', children: definition?.long || definition?.short || NO_DEF }),
-      definition?.source ? jsx('p', { className: 'text-xs opacity-70', children: `Source: ${definition.source}` }) : null,
-      definition?.providerId
-        ? jsx('p', { className: 'text-xs opacity-70', children: `Provider: ${definition.providerId}` })
-        : null,
-      first ? jsx('p', { className: 'text-sm', children: `First use in this session: ${first}` }) : null,
-      uses.length
-        ? jsxs('div', {
-            children: [
-              jsx('h3', { className: 'text-sm font-semibold', children: 'Uses in this session' }),
-              jsx('ul', {
-                className: 'text-sm',
-                children: uses.map((u) => jsx('li', { children: u.quote || u.def || u.name }, u.at)),
-              }),
-            ],
-          })
-        : null,
-      jsx(Button, { type: 'button', onClick: () => $selectedTerm.set(null), children: 'Clear' }),
-    ].filter(Boolean);
-    return jsx(ScrollArea, { children: jsxs('div', { className: 'flex flex-col gap-3 p-4', children }) });
+  // Mid-sentence use still works for old chats and models that ignore the skill,
+  // but the Desktop host splits a paragraph around every claimed directive
+  // (markdown-text.tsx, MarkdownParagraph), so the chip lands in its own block.
+  // Whole sentences go through `termline` instead.
+  function renderTerm({ attrs, source, streaming, sessionId } = {}) {
+    const name = str(attrs?.name);
+    if (!name) return jsx('span', { children: source });
+    const def = str(attrs?.def);
+    const sid = sessionId ?? null;
+    if (!streaming) registry.recordUse({ name, def: def || undefined, sessionId: sid, source, attrs });
+    return makeChip({ name, def, sid, source, attrs });
   }
 
-  function renderSettings() {
+  function renderTermline({ attrs, source, streaming, sessionId } = {}) {
+    const value = str(attrs?.v) || str(attrs?.text);
+    if (!value) return jsx('span', { children: source });
+    const parsed = parseTermline(value);
+    const sid = sessionId ?? null;
+    const children = parsed.pieces.map((piece, i) => {
+      if (piece.kind === 'text') return piece.text;
+      const { name, def } = piece;
+      const termAttrs = { name, def };
+      if (!streaming) {
+        registry.recordUse({
+          name,
+          def: def || undefined,
+          sessionId: sid,
+          source,
+          attrs: termAttrs,
+          surrounding: parsed.sentence,
+        });
+      }
+      return makeChip({ name, def, sid, source, attrs: termAttrs, key: `t${i}` });
+    });
+    return jsx('p', { className: PARAGRAPH_CLASS, children });
+  }
+
+  // Rows for the provider list. Shared by the Concepts pane and the standalone
+  // settings pane because the host may never tab the second pane.
+  function providerRows() {
     useValue($prefsTick);
     const list = registry.list();
     const setDisabledFor = (id, off) => {
@@ -183,7 +183,73 @@ export function createPlugin(deps) {
         ),
       );
     });
-    return jsx(ScrollArea, { children: jsxs('div', { className: 'flex flex-col gap-2 p-4', children: rows }) });
+    return rows;
+  }
+
+  function providersSection() {
+    return jsxs('div', {
+      className: 'flex flex-col gap-2',
+      children: [jsx('h3', { className: 'text-sm font-semibold', children: 'Providers' }), ...providerRows()],
+    });
+  }
+
+  function renderPane() {
+    const selected = useValue($selectedTerm);
+    const section = providersSection();
+    const wrap = (children) =>
+      jsx(ScrollArea, { children: jsxs('div', { className: 'flex flex-col gap-3 p-4', children }) });
+    if (!selected) {
+      return wrap([
+        jsx(EmptyState, {
+          title: 'No concept selected',
+          description: 'Click a dotted term in the chat to see it here.',
+        }),
+        jsx(Separator, {}),
+        section,
+      ]);
+    }
+    const { name, sessionId, definition } = selected;
+    const hasQuote = (v) => typeof v === 'string' && v.trim() !== '';
+    const defTexts = [definition?.short, definition?.long].filter(hasQuote).map((t) => t.trim());
+    const quotes = registry
+      .usesFor(name, sessionId)
+      .map((u) => u.quote)
+      .filter(hasQuote);
+    const fromDefinition = definition?.firstUse?.quote;
+    const first =
+      quotes[0] ?? (hasQuote(fromDefinition) && !defTexts.includes(fromDefinition.trim()) ? fromDefinition : null);
+    const uniqueQuotes = [...new Set(quotes)];
+    const kind = definition?.kind;
+    return wrap(
+      [
+        jsx('h2', { className: 'text-base font-semibold', children: name }),
+        kind === 'coined' || kind === 'uncertain' ? jsx(Badge, { children: kind }) : null,
+        jsx('p', { className: 'text-sm', children: definition?.long || definition?.short || NO_DEF }),
+        definition?.source ? jsx('p', { className: 'text-xs opacity-70', children: `Source: ${definition.source}` }) : null,
+        definition?.providerId
+          ? jsx('p', { className: 'text-xs opacity-70', children: `Provider: ${definition.providerId}` })
+          : null,
+        first ? jsx('p', { className: 'text-sm', children: `First use in this session: ${first}` }) : null,
+        uniqueQuotes.length
+          ? jsxs('div', {
+              children: [
+                jsx('h3', { className: 'text-sm font-semibold', children: 'Uses in this session' }),
+                jsx('ul', {
+                  className: 'text-sm',
+                  children: uniqueQuotes.map((q, i) => jsx('li', { children: q }, i)),
+                }),
+              ],
+            })
+          : null,
+        jsx(Button, { type: 'button', onClick: () => $selectedTerm.set(null), children: 'Clear' }),
+        jsx(Separator, {}),
+        section,
+      ].filter(Boolean),
+    );
+  }
+
+  function renderSettings() {
+    return jsx(ScrollArea, { children: jsxs('div', { className: 'flex flex-col gap-2 p-4', children: providerRows() }) });
   }
 
   function applyPrefs(prefs) {
@@ -215,6 +281,11 @@ export function createPlugin(deps) {
     storage = ctx?.storage ?? null;
     ctx.register({ id: DIRECTIVE_NAME, area: 'transcript.directives', data: { name: DIRECTIVE_NAME, render: renderTerm } });
     ctx.register({
+      id: TERMLINE_DIRECTIVE_NAME,
+      area: 'transcript.directives',
+      data: { name: TERMLINE_DIRECTIVE_NAME, render: renderTermline },
+    });
+    ctx.register({
       id: PANE_ID,
       area: 'panes',
       title: 'Concepts',
@@ -229,6 +300,7 @@ export function createPlugin(deps) {
       render: renderSettings,
     });
     ctx.register({
+      id: 'open-concepts',
       area: 'palette',
       data: {
         id: 'open-concepts',
@@ -236,6 +308,20 @@ export function createPlugin(deps) {
         keywords: ['concept', 'term', 'glossary', 'definition'],
         run: () => {
           if (typeof host?.revealPane === 'function') host.revealPane(`${PLUGIN_ID}:${PANE_ID}`);
+        },
+      },
+    });
+    ctx.register({
+      id: 'open-provider-settings',
+      area: 'palette',
+      data: {
+        id: 'open-provider-settings',
+        label: 'Concept provider settings',
+        keywords: ['provider', 'settings', 'glossary', 'concept'],
+        run: () => {
+          if (typeof host?.revealPane === 'function') host.revealPane(`${PLUGIN_ID}:${PANE_ID}`);
+          if (typeof host?.undismissPane === 'function') host.undismissPane(`${PLUGIN_ID}:${SETTINGS_PANE_ID}`);
+          if (typeof host?.revealPane === 'function') host.revealPane(`${PLUGIN_ID}:${SETTINGS_PANE_ID}`);
         },
       },
     });
@@ -251,12 +337,14 @@ export function createPlugin(deps) {
     $selectedTerm,
     $prefsTick,
     renderTerm,
+    renderTermline,
     renderPane,
     renderSettings,
     PLUGIN_ID,
     PANE_ID,
     SETTINGS_PANE_ID,
     DIRECTIVE_NAME,
+    TERMLINE_DIRECTIVE_NAME,
     HOVER_DELAY_MS,
   };
 }

@@ -10,6 +10,7 @@ import {
   HOVER_DELAY_MS,
 } from '../src/plugin-factory.js';
 
+const byTermline = (registered) => registered.find((c) => c.id === 'termline');
 const el = (type, props) => ({ type, props });
 const Tip = function Tip() {};
 const Button = function Button() {};
@@ -54,9 +55,11 @@ function setup({ host = {}, registry, storage, fetch = offline } = {}) {
   return {
     plugin, registered, storage,
     directive: byId('term'),
+    termline: byId('termline'),
     pane: byId('glossary'),
     settings: byId('providers'),
     palette: registered.find((c) => c.area === 'palette'),
+    palettes: registered.filter((c) => c.area === 'palette'),
   };
 }
 
@@ -76,6 +79,9 @@ const findAll = (tree, type) => walk(tree).filter((n) => n && n.type === type);
 const buttonNamed = (tree, label) => findAll(tree, Button).find((b) => b.props.children === label);
 const render = (directive, attrs, extra = {}) =>
   directive.data.render({ attrs, source: '::term', streaming: false, sessionId: 's1', ...extra });
+const renderLine = (termline, v, extra = {}) =>
+  termline.data.render({ attrs: { v }, source: `::termline{v="${v}"}`, streaming: false, sessionId: 's1', ...extra });
+const SENTENCE = 'A [[monoid|combines values]] lets you fold, and a [[functor|maps over a box]] maps over it.';
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
 test('constants are exported and returned by the plugin', () => {
@@ -96,13 +102,15 @@ test('createDefaultRegistry lists eight providers in chain order, llm disabled, 
   assert.equal(def.providerId, 'static');
 });
 
-test('register contributes directive, two right panes and the palette command', () => {
+test('register contributes two directives, two right panes and two palette commands', () => {
   const calls = [];
   const { registered, directive, pane, settings, palette } = setup({ host: { revealPane: (id) => calls.push(id) } });
-  assert.equal(registered.length, 4);
+  assert.equal(registered.length, 6);
   assert.equal(directive.area, 'transcript.directives');
   assert.equal(directive.data.name, 'term');
   assert.equal(typeof directive.data.render, 'function');
+  assert.equal(registered.filter((c) => c.area === 'transcript.directives').length, 2);
+  assert.equal(byTermline(registered).data.name, 'termline');
   const panes = registered.filter((c) => c.area === 'panes');
   assert.equal(panes.length, 2);
   for (const p of panes) assert.deepEqual(p.data, { placement: 'right', width: '340px' });
@@ -113,6 +121,31 @@ test('register contributes directive, two right panes and the palette command', 
   assert.deepEqual(palette.data.keywords, ['concept', 'term', 'glossary', 'definition']);
   palette.data.run();
   assert.deepEqual(calls, ['concept-links:glossary']);
+});
+
+test('two palette commands with top-level ids; settings one reveals glossary and providers', () => {
+  const calls = [];
+  const host = { revealPane: (id) => calls.push(['reveal', id]), undismissPane: (id) => calls.push(['undismiss', id]) };
+  const { palettes } = setup({ host });
+  assert.equal(palettes.length, 2);
+  for (const p of palettes) assert.equal(p.id, p.data.id);
+  const settings = palettes.find((p) => p.id === 'open-provider-settings');
+  assert.equal(settings.data.label, 'Concept provider settings');
+  for (const k of ['provider', 'settings', 'glossary']) assert.ok(settings.data.keywords.includes(k), k);
+  settings.data.run();
+  assert.deepEqual(calls[0], ['reveal', 'concept-links:glossary']);
+  assert.ok(calls.some((c) => c[0] === 'reveal' && c[1] === 'concept-links:providers'));
+  assert.ok(calls.some((c) => c[0] === 'undismiss' && c[1] === 'concept-links:providers'));
+});
+
+test('settings palette command feature-detects host methods', () => {
+  const calls = [];
+  const only = setup({ host: { revealPane: (id) => calls.push(id) } }).palettes[1];
+  only.data.run();
+  assert.deepEqual(calls, ['concept-links:glossary', 'concept-links:providers']);
+  for (const host of [{}, undefined, { undismissPane() {} }]) {
+    assert.doesNotThrow(() => setup({ host }).palettes[1].data.run());
+  }
 });
 
 test('palette run without revealPane does not throw', () => {
@@ -190,25 +223,27 @@ test('tooltip shows a coined badge when the sync result is coined', () => {
 test('coined fallback end to end: only coined enabled, first-use quote, wikis miss', async () => {
   const registry = createDefaultRegistry();
   registry.setDisabled(registry.list().map((p) => p.id).filter((id) => id !== 'coined'));
-  const { plugin, directive, pane } = setup({ registry });
-  const tip = render(directive, { name: 'blorp' });
+  const { plugin, termline, pane } = setup({ registry });
+  const line = renderLine(termline, 'We [[blorp]] the queue before every deploy.');
+  const tip = line.props.children.find((c) => c.type === Tip);
   assert.ok(hasText(tip.props.label, 'No definition yet'));
   tip.props.children.props.onClick();
   await tick();
   const def = plugin.$selectedTerm.get().definition;
   assert.equal(def.kind, 'coined');
   assert.ok(def.long.includes('inferred from context'));
+  assert.ok(def.long.includes('We blorp the queue before every deploy.'));
   const tree = pane.render();
   assert.equal(findAll(tree, Badge)[0].props.children, 'coined');
 });
 
 test('pane: empty state, then name, long text, source, provider, uses and Clear', () => {
-  const { plugin, directive, pane } = setup();
-  assert.equal(pane.render().type, EmptyState);
-  assert.equal(pane.render().props.title, 'No concept selected');
+  const { plugin, termline, pane } = setup();
+  const empty = pane.render();
+  assert.equal(empty.type, ScrollArea);
+  assert.equal(findAll(empty, EmptyState)[0].props.title, 'No concept selected');
 
-  render(directive, { name: 'widget', def: 'A small gadget' });
-  render(directive, { name: 'widget', def: 'A small gadget' });
+  renderLine(termline, 'A [[widget|A small gadget]] is handy.');
   plugin.$selectedTerm.set({
     name: 'widget',
     sessionId: 's1',
@@ -220,13 +255,151 @@ test('pane: empty state, then name, long text, source, provider, uses and Clear'
   assert.ok(hasText(tree, 'The long text'));
   assert.ok(hasText(tree, 'Some Source'));
   assert.ok(hasText(tree, 'prov'));
-  assert.ok(hasText(tree, 'First use'));
-  assert.equal(walk(tree).filter((n) => n?.type === 'li').length, 2);
+  assert.ok(hasText(tree, 'First use in this session: A widget is handy.'));
+  assert.equal(walk(tree).filter((n) => n?.type === 'li').length, 1);
   assert.equal(findAll(tree, Badge).length, 0);
 
   buttonNamed(tree, 'Clear').props.onClick();
   assert.equal(plugin.$selectedTerm.get(), null);
-  assert.equal(pane.render().type, EmptyState);
+  assert.equal(findAll(pane.render(), EmptyState).length, 1);
+});
+
+test('pane: shows the sentence once, never the definition, and nothing when the quote is null', () => {
+  const { plugin, directive, termline, pane } = setup();
+  const select = (name, definition) => plugin.$selectedTerm.set({ name, sessionId: 's1', definition });
+  const defn = { short: 'A small gadget', long: 'A small gadget', kind: 'standard', firstUse: { quote: 'A small gadget', sessionId: 's1' } };
+
+  // ::term has no sentence, rendered three times: one use, quote null.
+  for (let i = 0; i < 3; i++) render(directive, { name: 'widget', def: 'A small gadget' });
+  select('widget', defn);
+  let tree = pane.render();
+  assert.equal(plugin.registry.usesFor('widget', 's1').length, 1);
+  assert.ok(!hasText(tree, 'First use'));
+  assert.ok(!hasText(tree, 'Uses in this session'));
+  assert.equal(walk(tree).filter((n) => n?.type === 'li').length, 0);
+  assert.equal(texts(tree).filter((t) => t.includes('A small gadget')).length, 1);
+
+  // termline settled render three times: the sentence shows once under each heading.
+  for (let i = 0; i < 3; i++) renderLine(termline, 'A [[gizmo|A small gadget]] helps.');
+  select('gizmo', { ...defn, firstUse: { quote: 'A small gadget', sessionId: 's1' } });
+  tree = pane.render();
+  assert.equal(plugin.registry.usesFor('gizmo', 's1').length, 1);
+  assert.equal(texts(tree).filter((t) => t.includes('First use in this session: A gizmo helps.')).length, 1);
+  assert.equal(walk(tree).filter((n) => n?.type === 'li').length, 1);
+
+  // A stored definition.firstUse.quote equal to the definition text is not shown.
+  select('unseen', defn);
+  assert.ok(!hasText(pane.render(), 'First use'));
+  select('unseen', { ...defn, firstUse: { quote: 'It was said here.', sessionId: 's1' } });
+  assert.ok(hasText(pane.render(), 'First use in this session: It was said here.'));
+});
+
+test('pane: Providers section is present with and without a selected term', () => {
+  const storage = memoryStorage();
+  const registry = createDefaultRegistry();
+  const { plugin, pane } = setup({ registry, storage });
+  const check = (tree) => {
+    assert.ok(hasText(tree, 'Providers'));
+    assert.ok(hasText(tree, 'Inline directive (inline)'));
+    assert.equal(findAll(tree, Switch).length, 8);
+    assert.equal(findAll(tree, Button).filter((b) => b.props.children === 'Up').length, 8);
+    assert.equal(findAll(tree, Button).filter((b) => b.props.children === 'Down').length, 8);
+  };
+  let tree = pane.render();
+  check(tree);
+  const nodes = walk(tree);
+  assert.ok(nodes.indexOf(findAll(tree, EmptyState)[0]) < nodes.indexOf(findAll(tree, Separator)[0]));
+  assert.ok(nodes.indexOf(findAll(tree, Separator)[0]) < nodes.indexOf(findAll(tree, Switch)[0]));
+
+  plugin.$selectedTerm.set({ name: 'widget', sessionId: 's1', definition: { short: 'x', long: 'x' } });
+  tree = pane.render();
+  check(tree);
+  const sel = walk(tree);
+  assert.ok(sel.indexOf(buttonNamed(tree, 'Clear')) < sel.indexOf(findAll(tree, Separator)[0]));
+
+  // The in-pane controls toggle and reorder, and persist.
+  findAll(tree, Switch)[2].props.onCheckedChange(false);
+  assert.equal(registry.isDisabled('static'), true);
+  assert.deepEqual(storage.data.providerPrefs.disabled.sort(), ['llm', 'static']);
+  findAll(pane.render(), Button).filter((b) => b.props.children === 'Down')[0].props.onClick();
+  assert.deepEqual(registry.list().slice(0, 2).map((p) => p.id), ['session', 'inline']);
+  assert.deepEqual(storage.data.providerPrefs.order.slice(0, 2), ['session', 'inline']);
+});
+
+test('standalone providers pane is still registered', () => {
+  const { settings } = setup();
+  assert.equal(settings.area, 'panes');
+  assert.equal(settings.title, 'Concept providers');
+  assert.equal(findAll(settings.render(), Switch).length, 8);
+});
+
+test('renderTerm: no use while streaming, one when settled, none added by a third render', () => {
+  const registry = createDefaultRegistry();
+  const { directive } = setup({ registry });
+  const source = '::term{name="widget" def="A small gadget"}';
+  const attrs = { name: 'widget', def: 'A small gadget' };
+  render(directive, attrs, { source, streaming: true });
+  render(directive, attrs, { source: source.slice(0, -3), streaming: true });
+  assert.equal(registry.usesFor('widget', 's1').length, 0);
+  render(directive, attrs, { source, streaming: false });
+  assert.equal(registry.usesFor('widget', 's1').length, 1);
+  assert.equal(registry.usesFor('widget', 's1')[0].quote, null);
+  render(directive, attrs, { source, streaming: false });
+  assert.equal(registry.usesFor('widget', 's1').length, 1);
+});
+
+test('renderTermline: one p with prose and two inline chips in order', () => {
+  const calls = [];
+  const registry = createDefaultRegistry();
+  const { plugin, termline } = setup({ host: { revealPane: (id) => calls.push(id) }, registry });
+  const tree = renderLine(termline, SENTENCE);
+  assert.equal(tree.type, 'p');
+  const kids = tree.props.children;
+  assert.deepEqual(kids.map((k) => (typeof k === 'string' ? k : k.type === Tip ? `<${k.props.children.props.children}>` : '?')),
+    ['A ', '<monoid>', ' lets you fold, and a ', '<functor>', ' maps over it.']);
+  assert.ok(kids.every((k) => typeof k === 'string' || k.type === Tip));
+  const tips = kids.filter((k) => k.type === Tip);
+  for (const tip of tips) {
+    assert.equal(tip.props.delayDuration, 650);
+    assert.equal(tip.props.children.type, 'button');
+    assert.ok(tip.props.children.props.className.includes('inline'));
+    assert.ok(tip.props.children.props.className.includes('underline'));
+  }
+  assert.ok(hasText(tips[0].props.label, 'combines values'));
+
+  assert.equal(registry.usesFor('monoid', 's1').length, 1);
+  assert.equal(registry.usesFor('monoid', 's1')[0].quote, 'A monoid lets you fold, and a functor maps over it.');
+  assert.equal(registry.usesFor('functor', 's1').length, 1);
+
+  tips[1].props.children.props.onClick();
+  const sel = plugin.$selectedTerm.get();
+  assert.equal(sel.name, 'functor');
+  assert.equal(sel.sessionId, 's1');
+  assert.equal(sel.definition.short, 'maps over a box');
+  assert.deepEqual(calls, ['concept-links:glossary']);
+});
+
+test('renderTermline: no uses while streaming, dedupes settled re-renders, accepts attrs.text', () => {
+  const registry = createDefaultRegistry();
+  const { termline } = setup({ registry });
+  renderLine(termline, SENTENCE, { streaming: true });
+  assert.equal(registry.usesFor('monoid', 's1').length, 0);
+  renderLine(termline, SENTENCE);
+  renderLine(termline, SENTENCE);
+  assert.equal(registry.usesFor('monoid', 's1').length, 1);
+  assert.equal(registry.usesFor('functor', 's1').length, 1);
+
+  const viaText = termline.data.render({ attrs: { text: 'x [[y|z]]' }, source: 's', streaming: true, sessionId: 's1' });
+  assert.equal(viaText.type, 'p');
+});
+
+test('renderTermline: without a value returns a span with the source', () => {
+  const { termline } = setup();
+  for (const attrs of [{}, { v: '  ' }, null]) {
+    const tree = termline.data.render({ attrs, source: '::termline', streaming: false, sessionId: 's1' });
+    assert.equal(tree.type, 'span');
+    assert.equal(tree.props.children, '::termline');
+  }
 });
 
 test('pane shows uncertain badge', () => {

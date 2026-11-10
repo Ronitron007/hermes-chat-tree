@@ -74,7 +74,34 @@ export function createRegistry(options = {}) {
     },
     recordUse({ name, def, sessionId, source, attrs, surrounding } = {}) {
       if (!hasText(name)) return null;
-      const quote = hasText(surrounding) ? surrounding : hasText(def) ? def : name;
+      // The quote is only ever a real surrounding sentence, never the definition.
+      const quote = hasText(surrounding) ? surrounding : null;
+      const key = termKey(name, sessionId);
+      if (!uses.has(key)) uses.set(key, []);
+      const list = uses.get(key);
+
+      // Render is a side effect that repeats (streaming growth, settle flip), so
+      // an identical or prefix-related source is the same occurrence.
+      if (hasText(source)) {
+        const existing = list.find(
+          (u) => hasText(u.source) && (u.source.startsWith(source) || source.startsWith(u.source)),
+        );
+        if (existing) {
+          const longer = source.length > existing.source.length;
+          const gainsQuote = quote !== null && existing.quote === null;
+          if (longer || gainsQuote) {
+            if (longer) existing.source = source;
+            if (hasText(def)) existing.def = def;
+            if (quote !== null) {
+              existing.surrounding = surrounding;
+              existing.quote = quote;
+            }
+            if (attrs != null) existing.attrs = attrs;
+          }
+          return existing;
+        }
+      }
+
       const use = {
         name,
         def: def ?? null,
@@ -85,9 +112,7 @@ export function createRegistry(options = {}) {
         at: useCounter++,
         quote,
       };
-      const key = termKey(name, sessionId);
-      if (!uses.has(key)) uses.set(key, []);
-      uses.get(key).push(use);
+      list.push(use);
       return use;
     },
     usesFor(name, sessionId) {
