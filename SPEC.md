@@ -1389,3 +1389,60 @@ You may create or modify:
 - test/providers.test.js
 
 Do not modify package.json, README.md, SPEC.md, desktop/plugin.js, dashboard/, lookup_sources.py, or other plugins. Do not install into ~/.hermes. Do not git push. After writing, run `npm test` and `python3 test/test_annotator.py` (and `python3 test/test_lookup_sources.py`) and do not finish until they are green.
+
+## Desktop bugfix (task 11) — annotate prose that contains inline code (real replies)
+
+### Ground truth (already captured; do not rewrite the fixtures)
+
+Read-only inspection of `~/.hermes/state.db` (`file:...?mode=ro`) after the 72f5569 retest confirmed the cause. Fixtures (model prose only, no secrets) are in `test/fixtures/real-replies/`:
+
+- `monads-closures-idempotency.txt` — assistant reply at 2026-11-10 16:59:25 IST to "Explain monads, closures, and idempotency in one short paragraph each."
+- `css-flexbox-grid.txt` — assistant reply at 2026-11-10 17:01:16 IST to "What is CSS flexbox and grid? One paragraph."
+- `diagnosis-before.txt` — pre-fix skip reasons
+
+Current annotator results (network offline):
+
+- Monads paragraph: SKIPPED because `_termline` bails out when the paragraph contains a backtick (`Maybe`, `Optional`, `Result`, `Either`, `IO`, `bind`, `flatMap`).
+- Closures paragraph: already a `::termline` (no inline code in that paragraph) — left unchanged.
+- Idempotency paragraph: SKIPPED because of inline code (`PUT`, `POST`). That paragraph also has an em-dash, typographic/ASCII quotes, an apostrophe (`user's`), and an email (`a@b.com`).
+- CSS paragraph: SKIPPED because of inline code (`display: flex`, `display: grid`). It also has em-dashes, italics (`*and*`), and bold **Flexbox** / **Grid**.
+
+The termline JS renderer already paints `code`, links, and emphasis inside `v`. The annotator must stop dropping those paragraphs.
+
+### Fix
+
+1. Annotate ordinary prose paragraphs that contain inline code, markdown links, emphasis, em-dashes, quotes, apostrophes, and emails. Still leave untouched: fenced code blocks, headings, tables, block quotes, and existing `::termline` paragraphs.
+
+2. Lists: if it is straightforward, annotate each list *item's* body while keeping the list marker (`- ` / `* ` / `1. `) so the markdown list stays a list (e.g. `- ::termline{v="..." t="..."}`). If that cannot be done safely without breaking list markdown, leave lists unmarked and note that choice in a comment next to `_BLOCK` or in the test docstring. Do not turn a whole list into one termline.
+
+3. When locating terms, mask inline code spans (backtick runs, the same conservative rules as the JS parser) so a name that appears only inside `` `...` `` is never added to `t`. Keep the backticks in `v` so the renderer can show them as code. Glossary/stem/bold/multiword matching still runs on the unmasked text outside those spans. (A term that also appears outside code, like **Monads** in the first fixture paragraph, is still chipped.)
+
+4. Attribute quoting must survive backticks, `@`, and quotes. Host attrs are `key="value"` or `key='value'` with **no escapes** (`"` cannot appear inside `"..."`; `'` cannot appear inside `'...'`).
+   - Prefer double-quoted attrs when `v` and `t` contain no `"`.
+   - If they contain `"` but no `'`, use single-quoted attrs (this is the Monads paragraph: it has `"might be null"` etc. and no apostrophe).
+   - If they contain both `"` and `'` (the Idempotency paragraph has `"a@b.com"` and `user's`), do **not** strip punctuation and do **not** skip the paragraph. Normalize enough ASCII quotes so one outer quote style is legal: e.g. replace apostrophes in contractions with U+2019 (`'`) and/or turn ASCII `"` into typographic “ ”, then wrap with the remaining quote character. Backticks and `@` stay as-is. `{`, `}`, `\`, and raw newlines in the sentence still make the paragraph unsafe (existing `_BODY_UNSAFE` rule).
+
+5. Debug log, one line per `transform_llm_output` turn, to the normal Hermes log (Python `logging`, logger name `hermes_plugins.concept_links` or `concept-links`). Even when nothing is rewritten. The line must include: candidates considered, terms resolved into `t`, and each skipped paragraph's reason (e.g. `inline-code` should no longer appear as a skip; use `existing-termline`, `heading`, `fence`, `table`, `unsafe-chars`, `no-terms`, `too-long`, …). Keep it one line. Do not log the full reply if you can log short previews + reasons. Tests may use `self.assertLogs`.
+
+### Tests (required)
+
+- Fixture-based: load `test/fixtures/real-replies/monads-closures-idempotency.txt` and `css-flexbox-grid.txt`. After `annotate_terms` (resolver may be empty/offline; bundled glossary is enough):
+  - The Monads paragraph becomes a `::termline` whose `v` still contains the original inline code (`` `Maybe` ``, `` `bind` ``, etc.) and whose `t` includes `Monads=` with the bundled monad definition. Do not chip `Maybe`, `Optional`, `bind`, etc. (they appear only inside code).
+  - The Closures `::termline` is still present with `Closures=`.
+  - The Idempotency paragraph becomes a `::termline` whose `v` still contains `` `PUT` ``, `` `POST` ``, `@` (the email), and readable quotes/apostrophes, and whose `t` includes `Idempotency=` with the bundled idempotency definition. Do not chip `PUT`/`POST`.
+  - The CSS fixture becomes a `::termline` whose `v` still contains `` `display: flex` `` and `` `display: grid` ``, and whose `t` includes Flexbox and Grid (surface forms, bundled flexbox/grid defs). Do not chip the contents of those code spans.
+- Put the **exact** `annotate_terms` output for the stored Monads paragraph (first paragraph of the monads fixture, no extra trailing newline if the input has none) in a unittest.
+- Renderer round-trip: JS tests (`materializeInline` and/or `renderTermline`) that a `v` containing inline code and a markdown link (you may use a slice of the real Monads/CSS `v`, or a short sentence with `` `Maybe` `` and a link) keeps the code/link and does not show literal backticks as raw leftover around a chip; terms inside code are not chipped even if listed in `t`.
+- Existing tests stay green, including the Haskell/CSS Flexbox exact strings from task 10b and the mid-sentence `::term` rewrite.
+
+### Files (task 11 only)
+
+You may create or modify:
+
+- __init__.py
+- test/test_annotator.py
+- src/termline.js
+- test/termline.test.js
+- test/plugin-factory.test.js   (only if a renderTermline fixture round-trip belongs there)
+
+Do not modify package.json, README.md, SPEC.md, desktop/plugin.js, dashboard/, lookup_sources.py, src/plugin-factory.js (unless a tiny render test file needs no src change — prefer not to touch it), or the fixture files under `test/fixtures/real-replies/`. Do not install into ~/.hermes. Do not git push. After writing, run `npm test`, `python3 test/test_annotator.py`, and `python3 test/test_lookup_sources.py`, and do not finish until they are green.

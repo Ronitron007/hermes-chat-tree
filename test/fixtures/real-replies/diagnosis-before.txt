@@ -1,0 +1,17 @@
+Pre-fix diagnosis of current annotator (commit 72f5569) on real stored replies.
+Source: read-only sqlite file:/home/box/.hermes/state.db?mode=ro (PRAGMA query_only=ON).
+Network stubbed offline. Asia/Calcutta times.
+
+monads-closures-idempotency.txt
+  (assistant message id=32, session local-f419161a67a01941cc011f4f40d119c2bd9531519ccd642e111cdfc31467f20c, 2026-11-10 16:59:25 IST)
+  annotate_terms: no change (None)
+  paragraph 1 **Monads**...  SKIPPED  reason=inline-code (`Maybe`, `Optional`, `Result`, `Either`, `IO`, `bind`, `flatMap`, `bind`)
+  paragraph 2 **Closures**...  UNCHANGED  reason=existing-termline (already annotated; no inline code in this paragraph)
+  paragraph 3 **Idempotency**...  SKIPPED  reason=inline-code (`PUT`, `POST`)
+
+css-flexbox-grid.txt
+  (assistant message id=34, session local-f22b0fb59239e5efd7cb57c8abd2aba7911c51a91ae61cc387b81e3e0bb12392, 2026-11-10 17:01:16 IST)
+  annotate_terms: no change (None)
+  single paragraph  SKIPPED  reason=inline-code (`display: flex`, `display: grid`)
+
+Root cause: _termline returns None when "`" is in the paragraph (`if ... or "`" in raw or ...`), so any prose paragraph with inline code is left unmarked even when it contains glossary terms. The termline JS renderer already supports `code` in v.
