@@ -1,9 +1,12 @@
 """Concept Links: mechanical ::termline annotator for Hermes (transform_llm_output)."""
 
 import importlib.util
+import logging
 import re
 import sys
 from pathlib import Path
+
+LOGGER = logging.getLogger("hermes_plugins.concept_links")
 
 # Mirrors DEFAULT_GLOSSARY in src/static-glossary.js.
 GLOSSARY = [
@@ -61,7 +64,13 @@ MAX_TERMS = 8
 _BODY_UNSAFE = re.compile(r"[{}\\\r\n]")
 _BRACES = re.compile(r"[{}]")
 # Paragraphs that open with block markdown (lists, headings, quotes, tables) are not plain prose.
+# Lists stay unmarked on purpose: a paragraph is rewritten as one line, and joining the items
+# into a single termline (or re-emitting each item with its marker across wrapped lines) would
+# risk breaking the list markdown.
 _BLOCK = re.compile(r"^\s*(#|[-*+]\s|>|\||\d+[.)]\s)")
+# Stands in for inline code while locating terms: not a word char and not whitespace, so a
+# term, stem or multiword phrase can neither match inside a span nor straddle one.
+_CODE_FILL = "\ue000"
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _TERM = re.compile(r"::term\{([^}\n]*)\}")
 _TERMLINE = re.compile(r"^\s*::termline\{[^}\n]*\}\s*$")
@@ -285,6 +294,74 @@ def _esc(s):
     return _T_ESCAPE.sub(r"\\\1", s)
 
 
+def _code_spans(s):
+    """[(start, end)] of inline code spans, using the same rules as parseInlineMarkdown in src/termline.js."""
+    spans, i = [], 0
+    while i < len(s):
+        if s[i] != "`":
+            i += 1
+            continue
+        run = 1
+        while s[i + run:i + run + 1] == "`":
+            run += 1
+        end = s.find("`" * run, i + run)
+        if end > i + run and s[end + run:end + run + 1] != "`":
+            spans.append((i, end + run))
+            i = end + run
+        else:
+            i += run
+    return spans
+
+
+def _blank_code(s, spans):
+    chars = list(s)
+    for a, b in spans:
+        chars[a:b] = _CODE_FILL * (b - a)
+    return "".join(chars)
+
+
+def _retype(s, spans, pick):
+    """Replace quote characters outside code spans; pick(s, i) returns the new char or None."""
+    chars, inside = list(s), set()
+    for a, b in spans:
+        inside.update(range(a, b))
+    for i, ch in enumerate(s):
+        if i not in inside:
+            new = pick(s, i)
+            if new:
+                chars[i] = new
+    return "".join(chars)
+
+
+def _curl_apostrophe(s, i):
+    if s[i] == "'" and 0 < i < len(s) - 1 and re.match(r"\w", s[i - 1]) and re.match(r"\w", s[i + 1]):
+        return "\u2019"
+
+
+def _curl_double(s, i):
+    if s[i] == '"':
+        return "\u201c" if i == 0 or s[i - 1].isspace() or s[i - 1] in "([\u2014" else "\u201d"
+
+
+def _fit_quotes(v, t):
+    """Pick the attr quote and tweak quote characters so neither value can end it early.
+
+    Host attrs have no escapes. Double quotes are preferred; single quotes are used when only
+    `"` occurs; when both occur, contraction apostrophes become U+2019, then any remaining
+    `"` becomes typographic. Code spans are never altered. Returns (quote, v, t) or None.
+    """
+    vs, ts = _code_spans(v), _code_spans(t)
+    for step in (None, _curl_apostrophe, _curl_double):
+        if step:
+            v, t = _retype(v, vs, step), _retype(t, ts, step)
+        both = v + t
+        if '"' not in both:
+            return '"', v, t
+        if "'" not in both:
+            return "'", v, t
+    return None
+
+
 def _build(glossary):
     defs = {}
     for term, definition in glossary:
@@ -344,6 +421,7 @@ def annotate_terms(text, glossary=None, resolver=None):
     across the call. A definition is never made up: a term no source knows is
     dropped, or kept with an empty def when it is bold or technical.
     """
+    stats = {"paragraphs": 0, "candidates": 0, "terms": 0, "rewritten": 0, "skipped": []}
     try:
         if not isinstance(text, str) or not text:
             return None
@@ -354,17 +432,45 @@ def annotate_terms(text, glossary=None, resolver=None):
         seen = set()
         parts, changed = [], False
         for prose, chunk in _paragraphs(text):
-            if prose and len(chunk) <= MAX_PARAGRAPH:
-                if _TERMLINE.match(chunk):
-                    _note_termline(chunk, seen)
-                else:
-                    new = _termline(chunk, defs, pattern, seen, resolver)
-                    if new is not None:
-                        changed, chunk = True, new
+            skip = None
+            if not prose:
+                if chunk.strip():
+                    skip = "fence"
+            elif len(chunk) > MAX_PARAGRAPH:
+                skip = "too-long"
+            elif _TERMLINE.match(chunk):
+                _note_termline(chunk, seen)
+                skip = "existing-termline"
+            else:
+                new, skip, found, used = _termline(chunk, defs, pattern, seen, resolver)
+                stats["candidates"] += found
+                stats["terms"] += used
+                if new is not None:
+                    changed, chunk = True, new
+                    stats["rewritten"] += 1
+            stats["paragraphs"] += bool(prose)
+            if skip:
+                stats["skipped"].append((skip, chunk))
             parts.append(chunk)
         return "".join(parts) if changed else None
     except Exception:
+        stats["skipped"].append(("error", ""))
         return None
+    finally:
+        _log_turn(stats)
+
+
+def _log_turn(stats):
+    try:
+        skipped = " ".join(
+            "%s:%r" % (reason, " ".join(chunk.split())[:24]) for reason, chunk in stats["skipped"]
+        )
+        LOGGER.info(
+            "concept-links turn: paragraphs=%d candidates=%d terms=%d rewritten=%d skipped=[%s]",
+            stats["paragraphs"], stats["candidates"], stats["terms"], stats["rewritten"], skipped,
+        )
+    except Exception:
+        pass
 
 
 def _note_termline(chunk, seen):
@@ -379,22 +485,27 @@ def _note_termline(chunk, seen):
 
 
 def _termline(chunk, defs, pattern, seen, resolver=None):
-    """Return chunk rewritten as one ::termline directive, or None to leave it alone.
+    """Rewrite chunk as one ::termline directive: (directive or None, skip reason, candidates, terms).
 
-    `seen` is updated only when the paragraph is rewritten.
+    `seen` is updated only when the paragraph is rewritten. Inline code stays in `v`
+    verbatim but is hidden from term matching, so a name only used inside backticks is never chipped.
     """
     body = chunk.rstrip("\r\n")
     tail = chunk[len(body):]
     raw = " ".join(body.split())
-    if not raw or _BLOCK.match(body) or "`" in raw or "[[" in raw or "]]" in raw:
-        return None
+    if not raw:
+        return None, "empty", 0, 0
+    if _BLOCK.match(body):
+        return None, {"#": "heading", ">": "block-quote", "|": "table"}.get(raw.lstrip()[0], "list"), 0, 0
+    if "[[" in raw or "]]" in raw:
+        return None, "legacy-marker", 0, 0
 
     plain, cands, last, size = [], [], 0, 0
     for m in _TERM.finditer(raw):
         attrs = {k: a or b for k, a, b in _ATTR.findall(m.group(1))}
         name = " ".join((attrs.get("name") or "").split())
         if not name:
-            return None
+            return None, "bad-term", 0, 0
         lead = raw[last:m.start()]
         plain.append(lead)
         size += len(lead)
@@ -405,12 +516,13 @@ def _termline(chunk, defs, pattern, seen, resolver=None):
     plain.append(raw[last:])
     sentence = "".join(plain)
     if _ANY_DIRECTIVE.search(sentence) or _BODY_UNSAFE.search(sentence):
-        return None
+        return None, "unsafe-chars", 0, 0
+    view = _blank_code(sentence, _code_spans(sentence))
     explicit = {c[1] for c in cands}
     has_term = bool(cands)
     taken = [(c[0], c[0] + len(c[2])) for c in cands]
-    mask = _mask(sentence)[0]
-    for start, key, name, definition in _bold_phrases(sentence, defs, taken):
+    mask = _mask(view)[0]
+    for start, key, name, definition in _bold_phrases(view, defs, taken):
         if key not in explicit:
             cands.append((start, key, name, definition))
     if pattern is not None:
@@ -421,10 +533,10 @@ def _termline(chunk, defs, pattern, seen, resolver=None):
                 taken.append(m.span())
     for a, b, key in _stem_matches(mask, defs, taken):
         if key not in explicit:
-            cands.append((a, key, sentence[a:b], defs[key][1]))
-    cands.extend(_resolve_extras(sentence, defs, taken, explicit | seen, resolver))
+            cands.append((a, key, view[a:b], defs[key][1]))
+    cands.extend(_resolve_extras(view, defs, taken, explicit | seen, resolver))
     if not cands:
-        return None
+        return None, "no-terms", 0, 0
 
     pending, used = set(seen), []
     for _, key, name, definition in sorted(cands, key=lambda c: c[0]):
@@ -433,22 +545,20 @@ def _termline(chunk, defs, pattern, seen, resolver=None):
         pending.add(key)
         used.append((key, name, definition))
     if not used and not has_term:
-        return None
+        return None, "no-terms", len(cands), 0
 
     pairs = ";;".join("%s=%s" % (_esc(name), _esc(definition)) for _, name, definition in used)
-    v, t, quote = sentence, pairs, '"'
-    if '"' in v + t:
-        if "'" in v + t:
-            v, t = v.replace('"', ""), t.replace('"', "")
-        else:
-            quote = "'"
-    if not v.strip():
-        return None
+    if not sentence.strip():
+        return None, "empty", len(cands), len(used)
+    fitted = _fit_quotes(sentence, pairs)
+    if fitted is None:
+        return None, "unsafe-chars", len(cands), len(used)
+    quote, v, t = fitted
     directive = "::termline{v=%s%s%s t=%s%s%s}" % (quote, v, quote, quote, t, quote)
     if len(directive) - len("::termline{}") > MAX_BODY:
-        return None
+        return None, "too-long", len(cands), len(used)
     seen.update(key for key, _, _ in used)
-    return directive + tail
+    return directive + tail, None, len(cands), len(used)
 
 
 def _resolve_extras(sentence, defs, taken, skip, resolver):

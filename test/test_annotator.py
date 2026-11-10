@@ -16,6 +16,28 @@ GRID = "A CSS layout model that places items into rows and columns of a two-dime
 SENTENCE = "A monoid lets you fold a list in any grouping, and a functor maps over it."
 HASKELL = "In Haskell, a **monad** sequences effects, and idempotency matters for retries."
 JS_GLOSSARY = Path(__file__).resolve().parent.parent / "src" / "static-glossary.js"
+REAL = Path(__file__).resolve().parent / "fixtures" / "real-replies"
+SIDE_EFFECT = "Any observable change an operation makes beyond returning a value, such as writing to disk or mutating state."
+IDEMPOTENT = "Describes an operation that gives the same result whether it is applied once or many times."
+CLOSURE = "A function bundled with the variables from the scope where it was defined, so it can use them later."
+MONADS_PARAGRAPH = (
+    '**Monads** are a design pattern (originating in category theory) that wrap values in a context \u2014 like '
+    '"might be null" (`Maybe`/`Optional`), "might fail" (`Result`/`Either`), or "has side effects" (`IO`) \u2014 '
+    "and provide a `bind`/`flatMap` operation to chain computations that produce wrapped values without nesting "
+    "the wrappers. The key contract: `bind` takes a wrapped value and a function that returns a new wrapped value, "
+    "handling the unwrapping and re-wrapping (including short-circuiting on errors or nulls) so the programmer "
+    "writes straight-line logic while the monad manages the plumbing."
+)
+
+
+def fixture(name):
+    return (REAL / name).read_text(encoding="utf-8")
+
+
+def t_names(directive):
+    """Names in the t attr of a single ::termline directive."""
+    t = re.search(r"\bt=(?:\"([^\"]*)\"|'([^']*)')", directive)
+    return [pair.split("=", 1)[0] for pair in re.split(r"(?<!\\);;", t.group(1) or t.group(2))]
 
 
 class AnnotatorTest(unittest.TestCase):
@@ -102,8 +124,11 @@ class AnnotatorTest(unittest.TestCase):
         self.assertIsNone(cl.annotate_terms("# The monoid"))
         self.assertIsNone(cl.annotate_terms("- a monoid\n- a thing"))
 
-    def test_inline_code_paragraph_is_untouched(self):
-        self.assertIsNone(cl.annotate_terms("A monoid built from `x`."))
+    def test_inline_code_paragraph_is_annotated_and_keeps_its_code(self):
+        self.assertEqual(
+            cl.annotate_terms("A monoid built from `x`."),
+            '::termline{v="A monoid built from `x`." t="monoid=%s"}' % MONOID,
+        )
 
     def test_no_terms_returns_none(self):
         self.assertIsNone(cl.annotate_terms("Nothing special in this sentence."))
@@ -121,12 +146,11 @@ class AnnotatorTest(unittest.TestCase):
         body = out[len("::termline{"):-1]
         self.assertNotRegex(body, r"[{}\n]")
 
-    def test_quotes_use_single_quote_attrs_or_are_stripped(self):
+    def test_quotes_pick_a_legal_attr_quote_without_stripping(self):
         out = cl.annotate_terms('Say "hi" to a monoid.')
         self.assertTrue(out.startswith("::termline{v='Say \"hi\" to a monoid.' t='monoid="))
         both = cl.annotate_terms("Say \"hi\" to a monoid isn't it.")
-        self.assertNotIn('"hi"', both)
-        self.assertTrue(both.startswith('::termline{v="Say hi to a monoid isn\'t it." t="monoid='))
+        self.assertTrue(both.startswith("::termline{v='Say \"hi\" to a monoid isn\u2019t it.' t='monoid="))
 
     def test_unsafe_sentence_is_left_alone(self):
         self.assertIsNone(cl.annotate_terms("A monoid {x} here."))
@@ -322,6 +346,114 @@ class AnnotatorTest(unittest.TestCase):
         out = cl.annotate_terms(text, resolver=lambda names: {"javascript": "A language.", "python": "Another language."})
         self.assertIn("Closures=A function bundled", out)
         self.assertIn(";;JavaScript=A language.;;Python=Another language.", out)
+
+    # Inline code (task 11): prose with backticks is annotated, code is kept in v and never chipped.
+    # Lists are still left unmarked: see the note beside _BLOCK in __init__.py.
+
+    def test_exact_output_for_the_stored_monads_paragraph(self):
+        monads = fixture("monads-closures-idempotency.txt").split("\n\n")[0]
+        self.assertEqual(monads, MONADS_PARAGRAPH)
+        self.assertEqual(
+            cl.annotate_terms(monads, resolver=lambda names: {}),
+            "::termline{v='%s' t='Monads=%s;;side effects=%s'}" % (MONADS_PARAGRAPH, MONAD, SIDE_EFFECT),
+        )
+        self.assertEqual(cl.annotate_terms(monads), cl.annotate_terms(monads, resolver=lambda names: {}))
+        self.assertEqual(self.requests, [])
+
+    def test_monads_closures_idempotency_reply_gets_a_termline_each(self):
+        out = cl.annotate_terms(fixture("monads-closures-idempotency.txt"))
+        paragraphs = out.split("\n\n")
+        self.assertEqual(len(paragraphs), 3)
+        self.assertTrue(all(p.startswith("::termline{") and p.endswith("}") for p in paragraphs))
+        monads, closures, idem = paragraphs
+        self.assertEqual(t_names(monads), ["Monads", "side effects"])
+        self.assertEqual(t_names(closures), ["Closures"])
+        self.assertIn("Closures=" + CLOSURE, closures)
+        self.assertEqual(closures, fixture("monads-closures-idempotency.txt").split("\n\n")[1])
+        for code in ("`Maybe`", "`Optional`", "`Result`", "`Either`", "`IO`", "`bind`", "`flatMap`"):
+            self.assertIn(code, monads)
+        for name in ("Maybe", "Optional", "bind", "flatMap", "IO"):
+            self.assertNotIn(name, t_names(monads))
+        self.assertEqual(self.requests, [])
+
+    def test_idempotency_paragraph_survives_mixed_quotes_email_and_code(self):
+        idem = fixture("monads-closures-idempotency.txt").split("\n\n")[2]
+        out = cl.annotate_terms(idem, resolver=lambda names: {})
+        self.assertTrue(out.startswith("::termline{v='**Idempotency** means"))
+        for want in ("`PUT`", "`POST`", "a@b.com", '"a@b.com"', "user\u2019s email", "\u2014 doing it ten times"):
+            self.assertIn(want, out)
+        self.assertEqual(t_names(out), ["Idempotency", "idempotent"])
+        self.assertIn("Idempotency=" + IDEMPOTENCY, out)
+        self.assertIn("idempotent=" + IDEMPOTENT, out)
+        body = out[len("::termline{"):-1]
+        self.assertNotRegex(body, r"[{}\n\\]")
+        self.assertEqual(self.requests, [])
+
+    def test_css_flexbox_grid_reply_keeps_code_emphasis_and_dashes(self):
+        out = cl.annotate_terms(fixture("css-flexbox-grid.txt"))
+        self.assertTrue(out.startswith('::termline{v="CSS Flexbox and Grid are'))
+        for want in ("`display: flex`", "`display: grid`", "**Flexbox**", "**Grid**", "*and*", "one-dimensional\u2014it"):
+            self.assertIn(want, out)
+        self.assertEqual(t_names(out), ["Flexbox", "Grid"])
+        self.assertIn("Flexbox=" + FLEXBOX, out)
+        self.assertIn("Grid=" + GRID, out)
+        self.assertEqual(self.requests, [])
+
+    def test_terms_only_inside_inline_code_are_never_chipped(self):
+        self.assertIsNone(cl.annotate_terms("Call `monoid` and `functor` here."))
+        self.assertIsNone(cl.annotate_terms("Call ``a ` monad`` here."))
+        out = cl.annotate_terms("A monoid is not `functor` or `side effect`.")
+        self.assertEqual(out, '::termline{v="A monoid is not `functor` or `side effect`." t="monoid=%s"}' % MONOID)
+        # A term cannot straddle a code span, and a lone backtick is plain text.
+        self.assertIsNone(cl.annotate_terms("A side `x` effect and a race `y` condition."))
+        out = cl.annotate_terms("A monoid and a stray ` tick.")
+        self.assertTrue(out.startswith('::termline{v="A monoid and a stray ` tick."'))
+
+    def test_both_quote_kinds_are_made_legal_without_stripping(self):
+        out = cl.annotate_terms("A monoid's \"value\" is `x`.")
+        self.assertEqual(out, "::termline{v='A monoid\u2019s \"value\" is `x`.' t='monoid=%s'}" % MONOID)
+        # Quote-like single quotes that are not contractions: the double quotes turn typographic.
+        out = cl.annotate_terms("A monoid 'x' and \"y\" and (\"z\").")
+        self.assertEqual(
+            out, '::termline{v="A monoid \'x\' and \u201cy\u201d and (\u201cz\u201d)." t="monoid=%s"}' % MONOID
+        )
+        # Code is never rewritten, so quotes of both kinds inside it make the paragraph unsafe.
+        self.assertIsNone(cl.annotate_terms("A monoid with `say \"it's\"` inside."))
+
+    def test_unsafe_chars_inside_inline_code_still_skip_the_paragraph(self):
+        self.assertIsNone(cl.annotate_terms("A monoid with `{x}` inside."))
+        self.assertIsNone(cl.annotate_terms("A monoid with `a\\b` inside."))
+
+    def test_lists_and_block_markdown_stay_unmarked_even_with_code(self):
+        for text in ("- a monoid and `x`\n- b", "1. a monoid\n2. b `y`", "> a monoid `x`", "| monoid | `x` |", "# monoid `x`"):
+            self.assertIsNone(cl.annotate_terms(text), text)
+        self.assertIsNone(cl.annotate_terms("```\nA monoid `x`\n```"))
+
+    def test_one_debug_log_line_per_turn_with_counts_and_skip_reasons(self):
+        text = (
+            "# monoid heading\n\n"
+            "A monoid with `bind` here.\n\n"
+            "```\nmonoid\n```\n\n"
+            '::termline{v="Done." t="x=y"}\n\n'
+            "> quoted\n\n"
+            "Nothing special.\n\n"
+            "A monoid {x}."
+        )
+        with self.assertLogs("hermes_plugins.concept_links", level="DEBUG") as cm:
+            self.assertIsNotNone(cl._hook(text))
+        self.assertEqual(len(cm.records), 1)
+        line = cm.records[0].getMessage()
+        self.assertNotIn("\n", line)
+        self.assertRegex(line, r"candidates=1 terms=1 rewritten=1")
+        for reason in ("heading", "fence", "existing-termline", "block-quote", "no-terms", "unsafe-chars"):
+            self.assertIn(reason + ":", line)
+        self.assertNotIn("inline-code", line)
+
+    def test_a_turn_that_rewrites_nothing_still_logs_one_line(self):
+        with self.assertLogs("hermes_plugins.concept_links", level="DEBUG") as cm:
+            self.assertIsNone(cl.annotate_terms("Nothing special in this sentence."))
+        self.assertEqual(len(cm.records), 1)
+        self.assertRegex(cm.records[0].getMessage(), r"candidates=0 terms=0 rewritten=0 skipped=\[no-terms:")
 
     def test_hook_calls_annotator(self):
         self.assertEqual(cl._hook(SENTENCE), cl.annotate_terms(SENTENCE))

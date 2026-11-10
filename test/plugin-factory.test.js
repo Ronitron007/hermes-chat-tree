@@ -568,6 +568,20 @@ test('renderTermline: italic, code and a link render as em, code and a with safe
   assert.ok(!walk(tree).some((n) => n && typeof n === 'object' && 'dangerouslySetInnerHTML' in (n.props ?? {})));
 });
 
+test('renderTermline: inline code and a link stay intact and a term inside code is not a chip', () => {
+  const { termline } = setup();
+  const tree = termline.data.render({
+    attrs: {
+      v: '**Monads** wrap values like `Maybe`, see [the docs](https://example.com/m); `bind` chains them.',
+      t: 'Monads=A pattern;;bind=chains',
+    },
+    source: '::termline', streaming: false, sessionId: 's1',
+  });
+  assert.equal(describeTree(tree), 'span(strong(<Monads>) wrap values like code(Maybe), see a(the docs); code(bind) chains them.)');
+  assert.equal(findAll(tree, Tip).length, 1);
+  assert.ok(!texts(tree).some((t) => t.includes('`')));
+});
+
 test('renderTermline: an unclosed ** stays literal and a chip in a link does not follow it', () => {
   const { termline } = setup();
   const tree = termline.data.render({

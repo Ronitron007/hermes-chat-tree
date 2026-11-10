@@ -189,7 +189,7 @@ test('materializeInline: **monad** leaves a chip and no stray markers', () => {
 
 test('materializeInline: terms inside em and link spans, and legacy markers inside bold', () => {
   const a = materializeInline({ v: 'An *idempotent* call, see [monad docs](https://e.com) and `functor`.', t: 'idempotent=same result;;monad=m;;functor=f' });
-  assert.equal(flat(a.nodes), 'An em(<idempotent>) call, see link(<monad> docs) and code(<functor>).');
+  assert.equal(flat(a.nodes), 'An em(<idempotent>) call, see link(<monad> docs) and code(functor).');
   const b = materializeInline({ v: 'A **[[monoid|combines *values*]]** here.' });
   assert.equal(flat(b.nodes), 'A strong(<monoid>) here.');
   assert.equal(b.nodes[1].children[0].def, 'combines *values*');
@@ -225,4 +225,36 @@ test('materializeTermline finds a surface plural and a multiword name', () => {
     pieces.filter((p) => p.kind === 'term'),
     [{ kind: 'term', name: 'CSS Flexbox', def: 'a' }, { kind: 'term', name: 'Monads', def: 'b' }],
   );
+});
+
+test('materializeInline: inline code and a link in v survive, with no raw backticks around a chip', () => {
+  const v = 'A **Monads** wrap values like `Maybe`/`Optional`, see [the docs](https://e.com/m) for `bind` and monads.';
+  const { nodes, sentence } = materializeInline({ v, t: 'Monads=A pattern' });
+  assert.equal(
+    flat(nodes),
+    'A strong(<Monads>) wrap values like code(Maybe)/code(Optional), see link(the docs) for code(bind) and monads.',
+  );
+  assert.equal(nodes.find((n) => n.kind === 'link').href, 'https://e.com/m');
+  assert.equal(sentence, 'A Monads wrap values like Maybe/Optional, see the docs for bind and monads.');
+  assert.ok(!JSON.stringify(nodes).includes('`'));
+});
+
+test('materializeInline: a name listed in t that only appears in code is not chipped; a later plain use is', () => {
+  const only = materializeInline({ v: 'Call `bind` and `flatMap`.', t: 'bind=b;;flatMap=f' });
+  assert.equal(flat(only.nodes), 'Call code(bind) and code(flatMap).');
+  assert.ok(!only.nodes.some((n) => n.kind === 'term'));
+
+  const both = materializeInline({ v: 'The `bind` call: bind takes a value.', t: 'bind=b' });
+  assert.equal(flat(both.nodes), 'The code(bind) call: <bind> takes a value.');
+  assert.deepEqual(both.nodes[1], { kind: 'code', children: [{ kind: 'text', text: 'bind' }] });
+});
+
+test('materializeInline: a slice of the real CSS reply keeps its code, emphasis and dashes', () => {
+  const v = '**Flexbox** (`display: flex`) is one-dimensional\u2014it rows *and* columns; **Grid** (`display: grid`) is two-dimensional.';
+  const { nodes, sentence } = materializeInline({ v, t: 'Flexbox=Rows or columns;;Grid=Rows and columns' });
+  assert.equal(
+    flat(nodes),
+    'strong(<Flexbox>) (code(display: flex)) is one-dimensional\u2014it rows em(and) columns; strong(<Grid>) (code(display: grid)) is two-dimensional.',
+  );
+  assert.equal(sentence.includes('`'), false);
 });
