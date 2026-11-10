@@ -608,8 +608,10 @@ function createLlmProvider() {
 }
 
 // ---- src/termline.js ----
-// Encoding for a whole sentence carried by one paragraph-level directive:
-// "A [[monoid|combines values]] lets you fold a list."
+// Encodings for a whole sentence carried by one paragraph-level directive.
+// Preferred: a plain sentence `v` plus `t="name=def;;name=def"`, which never
+// puts `[`, `]` or `|` in the attribute (the host backslash-escapes those).
+// Legacy: "A [[monoid|combines values]] lets you fold a list." inside `v`.
 // Plain ESM with no imports so it can be concatenated into plugin.js.
 
 const MARKER_OPEN = '[[';
@@ -623,8 +625,20 @@ function sanitizeTermlinePart(s) {
   return String(s ?? '').replace(UNSAFE, '').trim();
 }
 
+const ESCAPED = /\\([\\`*_~[\]<>$&])/g;
+const TERM_PAIR_SEP = ';;';
+
+// Undoes the backslash escaping the host applies to inline markdown metachars
+// in a directive body (`\[\[` arrives for `[[`).
+function unescapeTermlineValue(s) {
+  return typeof s === 'string' ? s.replace(ESCAPED, '$1') : '';
+}
+
 function parseTermline(value) {
-  const input = typeof value === 'string' ? value : '';
+  return scanMarkers(unescapeTermlineValue(value));
+}
+
+function scanMarkers(input) {
   const pieces = [];
   let text = '';
   const flush = () => {
@@ -661,6 +675,55 @@ function parseTermline(value) {
   return { pieces, sentence };
 }
 
+// "monoid=def;;functor=def" -> [{ name, def }]. Splits on the first `=` per pair.
+function parseTermList(t) {
+  const out = [];
+  for (const pair of unescapeTermlineValue(t).split(TERM_PAIR_SEP)) {
+    const eq = pair.indexOf('=');
+    const name = (eq === -1 ? pair : pair.slice(0, eq)).trim();
+    if (name === '') continue;
+    out.push({ name, def: eq === -1 ? '' : pair.slice(eq + 1).trim() });
+  }
+  return out;
+}
+
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Builds pieces from `{ v | text, t }`. Legacy `[[name|def]]` markers in the
+// sentence win; otherwise each `t` name chips its first whole-word occurrence.
+function materializeTermline(attrs) {
+  const pick = (x) => (typeof x === 'string' ? unescapeTermlineValue(x).trim() : '');
+  const sentenceText = pick(attrs?.v) || pick(attrs?.text);
+  if (sentenceText === '') return { pieces: [], sentence: '' };
+  const legacy = scanMarkers(sentenceText);
+  if (legacy.pieces.some((p) => p.kind === 'term')) return legacy;
+
+  let pieces = [{ kind: 'text', text: sentenceText }];
+  const done = new Set();
+  for (const { name, def } of parseTermList(attrs?.t)) {
+    const key = name.toLowerCase();
+    if (done.has(key)) continue;
+    const re = new RegExp(
+      `(?<![\\p{L}\\p{N}_])${escapeRe(name).replace(/\s+/g, '\\s+')}(?![\\p{L}\\p{N}_])`,
+      'iu',
+    );
+    for (let i = 0; i < pieces.length; i++) {
+      if (pieces[i].kind !== 'text') continue;
+      const m = re.exec(pieces[i].text);
+      if (!m) continue;
+      const { text } = pieces[i];
+      const next = [];
+      if (m.index > 0) next.push({ kind: 'text', text: text.slice(0, m.index) });
+      next.push({ kind: 'term', name: m[0], def });
+      if (m.index + m[0].length < text.length) next.push({ kind: 'text', text: text.slice(m.index + m[0].length) });
+      pieces = [...pieces.slice(0, i), ...next, ...pieces.slice(i + 1)];
+      done.add(key);
+      break;
+    }
+  }
+  return { pieces, sentence: sentenceText };
+}
+
 function formatTermline(pieces) {
   return (Array.isArray(pieces) ? pieces : [])
     .map((p) =>
@@ -686,6 +749,24 @@ const HOVER_DELAY_MS = 650;
 const NO_DEF = 'No definition yet';
 const CHIP_CLASS = 'inline cursor-pointer underline decoration-dotted underline-offset-2';
 const PARAGRAPH_CLASS = 'leading-relaxed break-words';
+// Inline so the chip does not depend on utilities missing from the Desktop CSS bundle (decoration-dotted).
+const CHIP_STYLE = {
+  display: 'inline',
+  padding: 0,
+  margin: 0,
+  border: 'none',
+  background: 'none',
+  font: 'inherit',
+  color: 'inherit',
+  cursor: 'pointer',
+  textDecoration: 'underline dotted',
+  textUnderlineOffset: '2px',
+};
+
+const SAMPLE_TERMLINE = {
+  v: 'A monoid lets you fold a list in any grouping, and a functor maps over it.',
+  t: 'monoid=A set with an associative operation and an identity element;;functor=A mapping between categories that preserves structure',
+};
 
 // attrs are untrusted model output: only trimmed strings are used.
 const str = (v) => (typeof v === 'string' ? v.trim() : '');
@@ -764,7 +845,7 @@ function createPlugin(deps) {
       );
     };
 
-    const chip = jsx('button', { type: 'button', onClick, className: CHIP_CLASS, children: name });
+    const chip = jsx('button', { type: 'button', onClick, className: CHIP_CLASS, style: CHIP_STYLE, children: name });
     return jsx(Tip, { delayDuration: HOVER_DELAY_MS, label, children: chip }, key);
   }
 
@@ -782,9 +863,8 @@ function createPlugin(deps) {
   }
 
   function renderTermline({ attrs, source, streaming, sessionId } = {}) {
-    const value = str(attrs?.v) || str(attrs?.text);
-    if (!value) return jsx('span', { children: source });
-    const parsed = parseTermline(value);
+    const parsed = materializeTermline(attrs);
+    if (!parsed.pieces.length) return jsx('span', { children: source });
     const sid = sessionId ?? null;
     const children = parsed.pieces.map((piece, i) => {
       if (piece.kind === 'text') return piece.text;
@@ -802,7 +882,8 @@ function createPlugin(deps) {
       }
       return makeChip({ name, def, sid, source, attrs: termAttrs, key: `t${i}` });
     });
-    return jsx('p', { className: PARAGRAPH_CLASS, children });
+    // Not a <p>: the host already gives a solo directive its own block.
+    return jsxs('span', { className: PARAGRAPH_CLASS, style: { display: 'block' }, children });
   }
 
   // Rows for the provider list. Shared by the Concepts pane and the standalone
@@ -868,6 +949,19 @@ function createPlugin(deps) {
         jsx(EmptyState, {
           title: 'No concept selected',
           description: 'Click a dotted term in the chat to see it here.',
+        }),
+        jsx(Separator, {}),
+        jsxs('div', {
+          className: 'flex flex-col gap-2',
+          children: [
+            jsx('h3', { className: 'text-sm font-semibold', children: 'Sample' }),
+            renderTermline({
+              attrs: SAMPLE_TERMLINE,
+              source: '::termline',
+              streaming: true,
+              sessionId: 'sample',
+            }),
+          ],
         }),
         jsx(Separator, {}),
         section,
