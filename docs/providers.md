@@ -1,8 +1,8 @@
 # Definition providers
 
-Concept Links turns `::term{name="..." def="..."}` directives into hover
-definitions and a Concepts pane entry. A *provider* answers "what does this term
-mean?". This page lists every provider we considered, what is built, and what
+Concept Links turns `::termline{v="..."}` paragraphs (and the older
+`::term{name="..." def="..."}` directive) into hover definitions and a Concepts
+pane entry. A *provider* answers "what does this term mean?". This page lists every provider we considered, what is built, and what
 each one costs or risks. Provider interface and registry rules are in `SPEC.md`.
 
 ## Table
@@ -53,22 +53,38 @@ disabled set, so enabling `llm` there is possible but has no effect while
 - **Two panes.** Concepts and Concept providers are separate panes, so closing
   Concepts does not disable the plugin.
 
+## Desktop layout
+
+- **Mid-sentence `::term` is split.** The host (`markdown-text.tsx`,
+  `MarkdownParagraph`) lifts a `::term` out of its paragraph, so the sentence
+  becomes separate block siblings.
+- **Workaround: `::termline`.** A paragraph that is only
+  `::termline{v="... [[name|def]] ..."}` renders as one sentence with inline
+  chips. The skill tells the assistant to emit this form, and the Python
+  annotator hook rewrites whole paragraphs into it. `::term` still works for
+  older messages.
+- **Pane shows the sentence.** The Concepts pane shows the surrounding
+  sentence, once, as the first use, rather than the definition.
+- **Provider settings.** They live in the Concepts pane, in the standalone
+  Concept providers pane, and in a palette command.
+
 ## Limits and caveats
 
 - **Paragraph cap.** The host drops directives in paragraphs over 4800
   characters. The annotator and the skill both skip those paragraphs.
 - **Attribute body cap.** The directive attribute body is limited to 2048
-  characters. The annotator skips a term whose body would be longer.
+  characters. The annotator leaves a paragraph unmarked when its directive body
+  would be longer.
 - **Quote-unsafe attributes.** Values are wrapped in double quotes with no
   escapes. A `"`, `{`, `}` or backslash in a name or definition breaks the
   directive, so the annotator and the skill avoid them.
 - **Other surfaces.** The CLI, TUI and messaging platforms do not render the
-  directive. Users there see the raw `::term{...}` text.
+  directive. Users there see the raw `::termline{...}` or `::term{...}` text.
 - **Docs versus source.** The official SDK docs still say a transcript directive
   must be an entire paragraph, but the installed Desktop source and its tests
   allow `::term` in the middle of a sentence. Confirm that on a live Desktop
   session. Treat a definition as a reading aid, not as the authority.
 - **Who makes inline links appear.** A desktop plugin cannot rewrite unmarked
-  chat. Links appear because the skill makes the assistant emit `::term`
+  chat. Links appear because the skill makes the assistant emit `::termline`
   directives. The Python hook is the automatic layer on top, for the bundled
   terms only.

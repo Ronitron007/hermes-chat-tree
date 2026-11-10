@@ -1,4 +1,4 @@
-"""Concept Links: mechanical ::term annotator for Hermes (transform_llm_output)."""
+"""Concept Links: mechanical ::termline annotator for Hermes (transform_llm_output)."""
 
 import re
 from pathlib import Path
@@ -40,7 +40,10 @@ GLOSSARY = [
 MAX_PARAGRAPH = 4800  # the host drops directives in longer paragraphs
 MAX_BODY = 2048  # cap on the directive attribute body
 MAX_TERMS = 8
-_UNSAFE = re.compile(r'["{}\\\r\n]')
+# Characters that would break the directive attribute body or the [[name|def]] markers.
+_UNSAFE = re.compile(r'["{}\\\r\n\[\]|]')
+# Paragraphs that open with block markdown (lists, headings, quotes, tables) are not plain prose.
+_BLOCK = re.compile(r"^\s*(#|[-*+]\s|>|\||\d+[.)]\s)")
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _EXISTING = re.compile(r"::\w+\{[^}\n]*\}")
 _NAME = re.compile(r'name="([^"]*)"')
@@ -96,9 +99,10 @@ def _paragraphs(text):
 
 
 def annotate_terms(text, glossary=None):
-    """Wrap first mentions of glossary terms in ::term directives.
+    """Rewrite each prose paragraph that mentions glossary terms as one ::termline.
 
-    Returns the new text, or None when nothing changed.
+    Terms become [[name|def]] markers, first mention only. Returns the new text,
+    or None when nothing changed.
     """
     try:
         if not isinstance(text, str) or not text:
@@ -112,29 +116,49 @@ def annotate_terms(text, glossary=None):
             if n:
                 seen.add(" ".join(n.group(1).split()).lower())
 
-        def sub(m):
-            if m.group("skip") is not None or len(seen) >= MAX_TERMS:
-                return m.group(0)
-            key = " ".join(m.group("term").split()).lower()
-            if key in seen:
-                return m.group(0)
-            name = " ".join(m.group("term").split())
-            body = 'name="%s" def="%s"' % (name, defs[key][1])
-            if len(body) > MAX_BODY:
-                return m.group(0)
-            seen.add(key)
-            return "::term{%s}" % body
-
         parts, changed = [], False
         for prose, chunk in _paragraphs(text):
             if prose and len(chunk) <= MAX_PARAGRAPH:
-                new = pattern.sub(sub, chunk)
-                changed = changed or new != chunk
-                chunk = new
+                new = _termline(chunk, defs, pattern, seen)
+                if new is not None:
+                    changed, chunk = True, new
             parts.append(chunk)
         return "".join(parts) if changed else None
     except Exception:
         return None
+
+
+def _termline(chunk, defs, pattern, seen):
+    """Return chunk rewritten as one ::termline directive, or None to leave it alone.
+
+    `seen` is updated only when the paragraph is rewritten.
+    """
+    body = chunk.rstrip("\r\n")
+    tail = chunk[len(body):]
+    sentence = " ".join(body.split())
+    if not sentence or _BLOCK.match(body) or "`" in sentence or "::" in sentence or _UNSAFE.search(sentence):
+        return None
+    pending = set(seen)
+    used = []
+
+    def sub(m):
+        if len(pending) >= MAX_TERMS:
+            return m.group(0)
+        key = " ".join(m.group("term").split()).lower()
+        if key in pending:
+            return m.group(0)
+        pending.add(key)
+        used.append(key)
+        return "[[%s|%s]]" % (" ".join(m.group("term").split()), defs[key][1])
+
+    marked = pattern.sub(sub, sentence)
+    if not used:
+        return None
+    directive = '::termline{v="%s"}' % marked
+    if len(directive) - len("::termline{}") > MAX_BODY:
+        return None
+    seen.update(used)
+    return directive + tail
 
 
 def _hook(response_text, session_id=None, model=None, platform=None, **kwargs):
@@ -149,7 +173,7 @@ def register(ctx):
             register_skill(
                 "concept-links",
                 Path(__file__).parent / "skills" / "concept-links" / "SKILL.md",
-                "Mark dense technical terms with ::term directives for hover definitions.",
+                "Mark dense technical terms with ::termline paragraphs for hover definitions.",
             )
         except Exception:
             pass
