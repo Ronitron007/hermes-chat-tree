@@ -1,6 +1,8 @@
 """Concept Links: mechanical ::termline annotator for Hermes (transform_llm_output)."""
 
+import importlib.util
 import re
+import sys
 from pathlib import Path
 
 # Mirrors DEFAULT_GLOSSARY in src/static-glossary.js.
@@ -35,6 +37,21 @@ GLOSSARY = [
     ("effect system", "A type system feature that tracks which side effects a function may perform in its signature."),
     ("orthogonal persistence", "A design where data lives beyond program runs without code treating persistent and temporary data differently."),
     ("nonce", "A number used once, supplied to an operation so that old messages cannot be replayed or reused."),
+    ("monad", "A design pattern that wraps values in a context and chains operations on them, handling the context such as failure or state automatically."),
+    ("functor", "A container type that supports mapping a function over its contents while keeping the container structure unchanged."),
+    ("hoisting", "JavaScript behavior where declarations are processed before code runs, so they can be used earlier in their scope than where they are written."),
+    ("idempotency", "The property that repeating an operation has the same effect as doing it once, which makes retries safe."),
+    ("flexbox", "A CSS layout model that arranges items along a row or column and distributes the space between them."),
+    ("grid", "A CSS layout model that places items into rows and columns of a two-dimensional grid."),
+    ("polyfill", "Code that adds a modern feature to an older environment that does not support it natively."),
+    ("mutex", "A lock that lets only one thread at a time enter a critical section of code."),
+    ("deadlock", "A state where two or more tasks each wait for the other to release a resource, so none can proceed."),
+    ("race condition", "A bug where the result depends on the unpredictable timing or ordering of concurrent operations."),
+    ("immutability", "The property of data that cannot be changed after creation, so updates produce new values instead."),
+    ("lazy evaluation", "Delaying the computation of a value until it is actually needed, and then reusing the result."),
+    ("event loop", "A loop that waits for events or queued tasks and runs their handlers one at a time."),
+    ("middleware", "Code that sits between a request and its handler and can inspect, change, or short-circuit the exchange."),
+    ("tail call", "A function call made as the very last step of another function, which can reuse the current stack frame."),
 ]
 
 MAX_PARAGRAPH = 4800  # the host drops directives in longer paragraphs
@@ -52,6 +69,117 @@ _ANY_DIRECTIVE = re.compile(r"::\w+\{")
 _ATTR = re.compile(r"""(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 _T_ATTR = re.compile(r"""\bt\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 _T_ESCAPE = re.compile(r"([\\;=])")
+
+
+# Function words plus everyday verbs and nouns that must never become lookup candidates.
+_STOP = frozenset("""
+a about above across after again against all almost also although always am among an and another any anyone
+anything are around as at away back be because been before being below best between both but by can cannot
+case cases come comes could course data day days did do does doing done down during each either else enough
+even ever every example examples fact few first for from get gets getting give given gives go goes going
+good got great had has have having he her here hers him his how however i idea if important in into is it
+its itself just keep kind know last least less let like list lists little long look looks lot made make makes
+many may maybe me might more most much must my near need needs never new next no nor not note nothing now of
+off often on once one only onto or other our out over own part parts people per perhaps place point put
+quite rather really result results same see seem seems set several she should show shows side since so some
+something sometimes still such take takes than that the their them then there these they thing things this
+those though through thus time times tip to together too try tries turn two under until up upon us use used
+uses using very want warning was way ways we well were what when where whether which while who whom whose
+why will with within without work works would yes yet you your
+effect effects matter matters retry retries sequence sequences step steps value values item items
+""".split())
+
+_BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*|(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)")
+_BOLD_PHRASE = re.compile(r"[A-Za-z0-9][\w .'/+#-]{0,58}")
+_TOKEN = re.compile(r"(?<![\w./:@#$-])[A-Za-z]\w*(?:[.-]\w+)*(?![\w/@-]|\.\w)")
+_CAMEL = re.compile(r"[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*|[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*")
+_SNAKE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+")
+_DOTTED = re.compile(r"[A-Za-z][A-Za-z0-9_]+(?:\.[A-Za-z][A-Za-z0-9_]+)+")
+_HYPHENATED = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+")
+_CAPS = re.compile(r"(?<![\w.'/-])[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?![\w-]|\.\w)")
+_CAP_WORD = re.compile(r"[A-Z][a-z]+")
+_SENTENCE_END = re.compile(r"[.!?][\"')\]]*$")
+_FILE_EXT = frozenset("md txt json yaml yml py ts tsx jsx html css png jpg svg csv toml lock sh pdf com org net io".split())
+MAX_CAPS_WORDS = 4
+
+
+def _lookup_module():
+    """Load lookup_sources by path (the plugin root is not an importable package); None if unavailable."""
+    name = "_concept_links_lookup_sources"
+    mod = sys.modules.get(name)
+    if mod is None:
+        try:
+            spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / "lookup_sources.py")
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop(name, None)
+            return None
+    return mod
+
+
+def _is_tech(tok):
+    if "-" in tok:
+        return "." not in tok and "_" not in tok and bool(_HYPHENATED.fullmatch(tok)) and bool(re.search(r"\d|(?<=.)[A-Z]", tok))
+    if "." in tok:
+        return bool(_DOTTED.fullmatch(tok)) and tok.rsplit(".", 1)[1].lower() not in _FILE_EXT
+    if "_" in tok:
+        return bool(_SNAKE.fullmatch(tok))
+    return bool(_CAMEL.fullmatch(tok))
+
+
+def _mask(sentence):
+    """Return (sentence with bold markers blanked out, [(start, phrase)] bold spans); same length."""
+    chars, bold = list(sentence), []
+    for m in _BOLD.finditer(sentence):
+        g = 1 if m.group(1) is not None else 2
+        for i in (m.start(), m.start() + 1, m.end() - 2, m.end() - 1):
+            chars[i] = " "
+        bold.append((m.start(g), m.group(g)))
+    return "".join(chars), bold
+
+
+def _extras(sentence, defs, taken, skip):
+    """Non-glossary candidates as [(pos, key, name, kind)]; kind is bold, tech or caps.
+
+    `taken` holds (start, end) spans already claimed; `skip` holds keys not to look up.
+    """
+    mask, bold = _mask(sentence)
+    found = {}
+
+    def add(start, name, kind):
+        key = _key(name)
+        end = start + len(name)
+        if key in defs or key in skip or any(start < b and a < end for a, b in taken):
+            return
+        taken.append((start, end))
+        found.setdefault(key, (start, key, name, kind))
+
+    def plain(phrase):
+        words = re.findall(r"[a-z]+", phrase.lower())
+        return not words or all(w in _STOP for w in words)
+
+    for start, phrase in bold:
+        name = " ".join(phrase.split())
+        if _BOLD_PHRASE.fullmatch(name) and len(name.split()) <= MAX_CAPS_WORDS and len(name) > 1 and not plain(name):
+            add(start, name, "bold")
+    for m in _TOKEN.finditer(mask):
+        if _is_tech(m.group()):
+            add(m.start(), m.group(), "tech")
+    for m in _CAPS.finditer(mask):
+        before = mask[:m.start()].rstrip()
+        if not before or _SENTENCE_END.search(before):
+            continue
+        words = list(_CAP_WORD.finditer(m.group()))
+        while words and words[0].group().lower() in _STOP:
+            words.pop(0)
+        while words and words[-1].group().lower() in _STOP:
+            words.pop()
+        if words and len(words) <= MAX_CAPS_WORDS:
+            start = m.start() + words[0].start()
+            add(start, sentence[start:m.start() + words[-1].end()], "caps")
+    return sorted(found.values())
 
 
 def _key(s):
@@ -108,18 +236,27 @@ def _paragraphs(text):
     return out
 
 
-def annotate_terms(text, glossary=None):
+def annotate_terms(text, glossary=None, resolver=None):
     """Rewrite each prose paragraph that has linked terms as one ::termline.
 
     Linked terms are mid-sentence ::term directives (stripped back to the plain
     word) and first mentions of glossary terms. The plain sentence goes in v and
     the terms in t as "name=def;;name=def". Returns the new text, or None when
     nothing changed.
+
+    Bold phrases, mid-sentence capitalised phrases and technical tokens are also
+    looked up in public sources through `resolver` (a callable taking names and
+    returning {lowercased name: def or None}); the default shares one 1.5s budget
+    across the call. A definition is never made up: a term no source knows is
+    dropped, or kept with an empty def when it is bold or technical.
     """
     try:
         if not isinstance(text, str) or not text:
             return None
         defs, pattern = _build(GLOSSARY if glossary is None else glossary)
+        if resolver is None:
+            mod = _lookup_module()
+            resolver = mod.Resolver() if mod else None
         seen = set()
         parts, changed = [], False
         for prose, chunk in _paragraphs(text):
@@ -127,7 +264,7 @@ def annotate_terms(text, glossary=None):
                 if _TERMLINE.match(chunk):
                     _note_termline(chunk, seen)
                 else:
-                    new = _termline(chunk, defs, pattern, seen)
+                    new = _termline(chunk, defs, pattern, seen, resolver)
                     if new is not None:
                         changed, chunk = True, new
             parts.append(chunk)
@@ -147,7 +284,7 @@ def _note_termline(chunk, seen):
             seen.add(_key(name))
 
 
-def _termline(chunk, defs, pattern, seen):
+def _termline(chunk, defs, pattern, seen, resolver=None):
     """Return chunk rewritten as one ::termline directive, or None to leave it alone.
 
     `seen` is updated only when the paragraph is rewritten.
@@ -177,11 +314,15 @@ def _termline(chunk, defs, pattern, seen):
         return None
     explicit = {c[1] for c in cands}
     has_term = bool(cands)
+    taken = [(c[0], c[0] + len(c[2])) for c in cands]
+    mask = _mask(sentence)[0]
     if pattern is not None:
-        for m in pattern.finditer(sentence):
+        for m in pattern.finditer(mask):
             key = _key(m.group("term"))
             if key not in explicit:
                 cands.append((m.start(), key) + defs[key])
+                taken.append(m.span())
+    cands.extend(_resolve_extras(sentence, defs, taken, explicit | seen, resolver))
     if not cands:
         return None
 
@@ -208,6 +349,26 @@ def _termline(chunk, defs, pattern, seen):
         return None
     seen.update(key for key, _, _ in used)
     return directive + tail
+
+
+def _resolve_extras(sentence, defs, taken, skip, resolver):
+    extras = _extras(sentence, defs, taken, skip)
+    if not extras or resolver is None:
+        return []
+    try:
+        found = resolver([name for _, _, name, _ in extras[:MAX_TERMS]])
+    except Exception:
+        return []
+    out = []
+    for pos, key, name, kind in extras:
+        if key not in found:
+            continue
+        text = found[key]
+        if isinstance(text, str) and text.strip():
+            out.append((pos, key, name, " ".join(_BRACES.sub("", text).replace('"', "").replace("'", "\u2019").split())))
+        elif text is None and kind != "caps":
+            out.append((pos, key, name, ""))
+    return out
 
 
 def _hook(response_text, session_id=None, model=None, platform=None, **kwargs):

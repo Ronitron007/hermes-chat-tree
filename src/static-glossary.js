@@ -31,6 +31,21 @@ export const DEFAULT_GLOSSARY = [
   { term: 'effect system', def: 'A type system feature that tracks which side effects a function may perform in its signature.' },
   { term: 'orthogonal persistence', def: 'A design where data lives beyond program runs without code treating persistent and temporary data differently.' },
   { term: 'nonce', def: 'A number used once, supplied to an operation so that old messages cannot be replayed or reused.' },
+  { term: 'monad', def: 'A design pattern that wraps values in a context and chains operations on them, handling the context such as failure or state automatically.' },
+  { term: 'functor', def: 'A container type that supports mapping a function over its contents while keeping the container structure unchanged.' },
+  { term: 'hoisting', def: 'JavaScript behavior where declarations are processed before code runs, so they can be used earlier in their scope than where they are written.' },
+  { term: 'idempotency', def: 'The property that repeating an operation has the same effect as doing it once, which makes retries safe.' },
+  { term: 'flexbox', def: 'A CSS layout model that arranges items along a row or column and distributes the space between them.' },
+  { term: 'grid', def: 'A CSS layout model that places items into rows and columns of a two-dimensional grid.' },
+  { term: 'polyfill', def: 'Code that adds a modern feature to an older environment that does not support it natively.' },
+  { term: 'mutex', def: 'A lock that lets only one thread at a time enter a critical section of code.' },
+  { term: 'deadlock', def: 'A state where two or more tasks each wait for the other to release a resource, so none can proceed.' },
+  { term: 'race condition', def: 'A bug where the result depends on the unpredictable timing or ordering of concurrent operations.' },
+  { term: 'immutability', def: 'The property of data that cannot be changed after creation, so updates produce new values instead.' },
+  { term: 'lazy evaluation', def: 'Delaying the computation of a value until it is actually needed, and then reusing the result.' },
+  { term: 'event loop', def: 'A loop that waits for events or queued tasks and runs their handlers one at a time.' },
+  { term: 'middleware', def: 'Code that sits between a request and its handler and can inspect, change, or short-circuit the exchange.' },
+  { term: 'tail call', def: 'A function call made as the very last step of another function, which can reuse the current stack frame.' },
 ];
 
 function toMap(entries) {

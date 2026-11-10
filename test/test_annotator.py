@@ -8,14 +8,58 @@ cl = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cl)
 
 MONOID = "An associative binary operation together with an identity element, such as addition with zero."
+FUNCTOR = "A container type that supports mapping a function over its contents while keeping the container structure unchanged."
+MONAD = "A design pattern that wraps values in a context and chains operations on them, handling the context such as failure or state automatically."
+IDEMPOTENCY = "The property that repeating an operation has the same effect as doing it once, which makes retries safe."
 SENTENCE = "A monoid lets you fold a list in any grouping, and a functor maps over it."
+HASKELL = "In Haskell, a **monad** sequences effects, and idempotency matters for retries."
+JS_GLOSSARY = Path(__file__).resolve().parent.parent / "src" / "static-glossary.js"
 
 
 class AnnotatorTest(unittest.TestCase):
+    def setUp(self):
+        # No test may reach the network: any request is recorded and fails like an outage.
+        lookup = cl._lookup_module()
+        lookup.CACHE.clear()
+        self.requests = []
+
+        def offline(url, timeout=None):
+            self.requests.append(url)
+            raise lookup.UpstreamError("offline")
+
+        original = lookup.get_json
+        lookup.get_json = offline
+        self.addCleanup(setattr, lookup, "get_json", original)
+        self.addCleanup(lookup.CACHE.clear)
+
+    def test_exact_haskell_monad_sentence(self):
+        self.assertEqual(
+            cl.annotate_terms(HASKELL),
+            '::termline{v="%s" t="monad=%s;;idempotency=%s"}' % (HASKELL, MONAD, IDEMPOTENCY),
+        )
+        self.assertEqual(self.requests, [])
+
+    def test_haskell_sentence_with_trailing_newline_keeps_it(self):
+        self.assertTrue(cl.annotate_terms(HASKELL + "\n").endswith("}\n"))
+
+    def test_bundled_glossary_has_the_common_terms(self):
+        names = {t for t, _ in cl.GLOSSARY}
+        for term in ("monad", "functor", "hoisting", "idempotency", "flexbox", "grid"):
+            self.assertIn(term, names)
+        out = cl.annotate_terms("Use flexbox for rows, and grid for tables, since hoisting surprises people.")
+        self.assertEqual(len(re.findall(r";;", out)), 2)
+
+    def test_python_and_js_glossaries_stay_in_sync(self):
+        js = JS_GLOSSARY.read_text(encoding="utf-8")
+        pairs = re.findall(r"\{ term: '([^']*)', def: '([^']*)' \}", js)
+        self.assertEqual(pairs, [tuple(p) for p in cl.GLOSSARY])
+        for term, definition in cl.GLOSSARY:
+            self.assertNotRegex(term + definition, r'["{}\n]')
+
     def test_exact_monoid_functor_sentence(self):
         self.assertEqual(
             cl.annotate_terms(SENTENCE),
-            '::termline{v="%s" t="monoid=%s"}' % (SENTENCE, MONOID),
+            '::termline{v="%s" t="monoid=%s;;functor=%s"}' % (SENTENCE, MONOID, FUNCTOR),
         )
 
     def test_mid_sentence_terms_become_one_termline(self):
@@ -85,6 +129,96 @@ class AnnotatorTest(unittest.TestCase):
     def test_unsafe_sentence_is_left_alone(self):
         self.assertIsNone(cl.annotate_terms("A monoid {x} here."))
         self.assertIsNone(cl.annotate_terms("A monoid \\ here."))
+
+    def test_new_terms_are_untouched_in_fences_headings_and_lists(self):
+        self.assertIsNone(cl.annotate_terms("```\nA monad and idempotency\n```"))
+        self.assertIsNone(cl.annotate_terms("# Idempotency and the monad"))
+        self.assertIsNone(cl.annotate_terms("- a **monad** here\n- a flexbox"))
+        self.assertEqual(self.requests, [])
+
+    def test_first_word_of_a_paragraph_is_not_a_candidate(self):
+        seen = []
+        out = cl.annotate_terms("Haskell is nice, and Erlang too.", resolver=lambda names: seen.append(names) or {})
+        self.assertIsNone(out)
+        self.assertEqual(seen, [["Erlang"]])
+
+    def test_stopwords_and_plain_words_are_never_looked_up(self):
+        seen = []
+        out = cl.annotate_terms(
+            "It sequences effects; see **list** and **matters** for retries.",
+            resolver=lambda names: seen.append(names) or {},
+        )
+        self.assertIsNone(out)
+        self.assertEqual(seen, [])
+
+    def test_candidates_from_bold_caps_and_technical_tokens(self):
+        seen = []
+        cl.annotate_terms(
+            "Call fooBar or snake_case on **Zebra Crossing** via os.path and Content-Type, with Erlang.",
+            resolver=lambda names: seen.append(names) or {},
+        )
+        self.assertEqual(seen, [["fooBar", "snake_case", "Zebra Crossing", "os.path", "Content-Type", "Erlang"]])
+
+    def test_resolved_definition_is_used_and_markup_stays_in_v(self):
+        text = "Then a **zebra crossing** helps."
+        out = cl.annotate_terms(text, resolver=lambda names: {"zebra crossing": "A place to cross."})
+        self.assertEqual(out, '::termline{v="Then a **zebra crossing** helps." t="zebra crossing=A place to cross."}')
+
+    def test_candidate_all_sources_miss_gets_no_fabricated_def(self):
+        miss = lambda names: {n.lower(): None for n in names}
+        # Bold and technical candidates become name= with an empty def.
+        self.assertEqual(
+            cl.annotate_terms("Then call fooBar here.", resolver=miss),
+            '::termline{v="Then call fooBar here." t="fooBar="}',
+        )
+        self.assertEqual(
+            cl.annotate_terms("Then a **blorp** here.", resolver=miss),
+            '::termline{v="Then a **blorp** here." t="blorp="}',
+        )
+        # A capitalised phrase is dropped, so ordinary English never gets a chip.
+        self.assertIsNone(cl.annotate_terms("We met Alice there.", resolver=miss))
+
+    def test_unfinished_lookups_are_dropped_but_glossary_hits_stay(self):
+        out = cl.annotate_terms("A monad with fooBar.", resolver=lambda names: {})
+        self.assertEqual(out, '::termline{v="A monad with fooBar." t="monad=%s"}' % MONAD)
+
+    def test_default_resolver_misses_over_stubbed_sources(self):
+        lookup = cl._lookup_module()
+
+        def missing(url, timeout=None):
+            self.requests.append(url)
+            raise lookup.NoDefinition("no definition")
+
+        lookup.get_json = missing
+        out = cl.annotate_terms("Then call fooBar here.")
+        self.assertEqual(out, '::termline{v="Then call fooBar here." t="fooBar="}')
+        self.assertEqual(len(self.requests), 3)
+
+    def test_default_resolver_uses_a_source_definition(self):
+        lookup = cl._lookup_module()
+        lookup.get_json = lambda url, timeout=None: {
+            "documents": [{"title": "Promise", "summary": "An object for a future value.", "mdn_url": "/x"}]
+        }
+        out = cl.annotate_terms("Then a Promise returns.")
+        self.assertEqual(out, '::termline{v="Then a Promise returns." t="Promise=An object for a future value."}')
+
+    def test_fetched_definitions_are_sanitised(self):
+        out = cl.annotate_terms(
+            'Then a **blorp** here.',
+            resolver=lambda names: {"blorp": 'A "thing" {with} it\'s braces; and = signs'},
+        )
+        self.assertEqual(
+            out,
+            '::termline{v="Then a **blorp** here." t="blorp=A thing with it\u2019s braces\\; and \\= signs"}',
+        )
+
+    def test_term_cap_counts_resolved_terms_too(self):
+        words = ["aaA", "bbB", "ccC", "ddD", "eeE", "ffF", "ggG", "hhH", "iiI", "jjJ"]
+        out = cl.annotate_terms(
+            "Then " + " ".join(words) + ".",
+            resolver=lambda names: {n.lower(): "d" for n in names},
+        )
+        self.assertEqual(len(re.findall(r";;", out)), 7)
 
     def test_term_cap_and_size_caps(self):
         words = ["monoid", "semigroup", "idempotent", "CRDT", "backpressure", "closure", "currying", "memoization", "debounce", "throttle"]
