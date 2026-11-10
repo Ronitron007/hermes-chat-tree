@@ -1,0 +1,14 @@
+name: concept-links
+label: Concept Links
+kind: standalone
+version: 0.1.0
+author: Rohan Malik
+license: MIT
+description: >
+  Hover definitions for dense technical terms in chat. Replies tagged with the
+  ::term directive get a dotted-underline chip with a short definition on hover
+  and a Concepts pane on click, backed by inline, session, static, Wikipedia,
+  Wiktionary and MDN lookups.
+provides_hooks:
+  - transform_llm_output
+requires_hermes: ">=0.23"
