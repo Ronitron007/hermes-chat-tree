@@ -1181,3 +1181,110 @@ After writing, run `npm test` and the unittest file, and do not finish until bot
 ```
 python3 -c "from pathlib import Path; import importlib.util; s=importlib.util.spec_from_file_location('cl', Path('__init__.py')); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); src='A monoid lets you fold a list in any grouping, and a functor maps over it.'; out=m.annotate_terms(src); print(out); assert out == '::termline{v=\"A monoid lets you fold a list in any grouping, and a functor maps over it.\" t=\"monoid=An associative binary operation together with an identity element, such as addition with zero.\"}'"
 ```
+
+## Desktop bugfix (task 9a) — pane Uses duplicates first use; click ignores disabled Inline
+
+### Bug 3
+
+The Concepts pane lists the same sentence under "First use in this session" and "Uses in this session". In `renderPane`, `first` is `quotes[0]` (or a `definition.firstUse` fallback) and `uniqueQuotes` is every distinct quote, including that first one.
+
+Fix: after deduping quotes by exact trimmed text, the first-use quote is shown only under "First use in this session". "Uses in this session" lists the remaining unique quotes (later occurrences), and the Uses heading/list is omitted when that list is empty. Do not show the definition text as a use. Update the existing plugin-factory pane test that currently expects the gizmo sentence under both headings (it should appear once, under First use, with no Uses list). Add a test where two different sentences were recorded: first under First use, the second only under Uses.
+
+### Bug 4
+
+With the Inline provider toggled off, the hover tooltip no longer comes from the enabled chain, but click can still open the Inline entry. Two holes:
+
+- `makeChip` builds the tooltip from `lookupSync(...)?.short || def`. The `def` fallback is the inline attribute and is used even when `inline` is disabled.
+- `registry.lookup` returns a cache hit without checking that the cached `providerId` is still enabled. Click then `lookup()` can resurrect a stale Inline result. `lookupSync` does not use that cache, so hover and click disagree.
+
+Fix:
+
+- Hover label and the click's initial `definition` both come from the same resolution: `lookupSync` over the **enabled** chain only. Do not fall back to `attrs.def` unless the inline provider is enabled and would have produced that def (i.e. let the inline provider be the only source of `attrs.def`).
+- `lookup` must not return a cached def whose `providerId` is currently disabled. `setDisabled` (and `setOrder` if it could change outcomes) must evict stale cache entries, or `lookup`/`peekCache` must skip them.
+- Click still runs async `lookup` and upgrades the pane when the same term is selected; that lookup also honors enabled/order.
+
+Add tests:
+
+- Disable `inline`, render a termline/term whose only def is the inline attr and that misses later sync providers: the tooltip label is not the inline def (e.g. "No definition yet" or a later enabled sync provider), and click + `lookup()` must not yield `providerId: 'inline'`.
+- With inline enabled, lookupSync/tooltip still show the inline def (existing behaviour).
+- Cache: lookup succeeds via inline, then disable inline, then lookup again must not return the cached inline def.
+
+### Files (task 9a only)
+
+- src/providers.js
+- src/plugin-factory.js
+- test/providers.test.js
+- test/plugin-factory.test.js
+
+Do not modify other files. Do not install into ~/.hermes. Do not git push. After writing, run `npm test` and do not finish until it is green.
+
+## Desktop bugfix (task 9b) — termline drops inline markdown
+
+`v` is stored as the paragraph text, which may contain `**bold**`, `*italic*` / `_italic_`, `` `code` ``, and `[label](url)`. Today `renderTermline` paints text pieces as raw strings, so the user sees literal `**`.
+
+Prefer rendering, not stripping. In the termline path only (not the mid-sentence `::term` chip):
+
+- Parse a conservative inline-markdown subset: `**bold**` or `__bold__`, `*italic*` or `_italic_` (not mid-word underscores in identifiers), backtick code spans, and `[label](url)` links. No images, no raw HTML, no nested arbitrary markdown. Parse markers around a term so `**monad**` does not leave stray `**` in a neighbouring text piece.
+- Render through `jsx`/`jsxs` only: `strong`, `em`, `code`, and `a` (for links: `href` from the markdown, `target: '_blank'`, `rel: 'noreferrer noopener'`). Never `dangerouslySetInnerHTML` or HTML strings.
+- Term chips still appear for names in `t` / legacy `[[ ]]`. A term inside a bold/italic/link span should remain a chip (the chip may sit inside that `strong`/`em`/`a`, or the chip may wrap the styled name — either is fine if the name is chipped and the markers are not visible).
+- Export the parser from `src/termline.js` so tests can cover it without the factory. Existing termline tests stay green (plain `v` / `t` still works).
+
+Add tests for: `**monad**` renders as a chip not preceded/followed by literal `**`; italic, code, and a link in the same sentence; a typo like `**unclosed` stays literal.
+
+### Files (task 9b only)
+
+- src/termline.js
+- src/plugin-factory.js
+- test/termline.test.js
+- test/plugin-factory.test.js
+
+Do not modify other files. Do not install into ~/.hermes. Do not git push. After writing, run `npm test` and do not finish until it is green.
+
+## Desktop bugfix (task 9c) — annotator misses common technical terms
+
+The Python annotator only chips first mentions that already sit in the 30-term bundled glossary. Real replies therefore get no chips for common CS terms such as monad, hoisting, idempotency, flexbox, and grid (closure and eventual consistency are already in the glossary as exact phrases; "idempotency" is not the same string as "idempotent").
+
+Fix:
+
+1. Expand `DEFAULT_GLOSSARY` in `src/static-glossary.js` and `GLOSSARY` in `__init__.py` so they stay in sync. Add at least: monad, functor, hoisting, idempotency, flexbox, grid, plus a few other cheap, short, standard CS/web terms if you like. Keep definitions to one plain sentence, no `"`, `{`, `}`, or raw newlines.
+
+2. Also resolve **candidate terms** through the existing public lookup sources (MDN, then Wiktionary, then Wikipedia — same matching rules as `dashboard/plugin_api.py`). Extract the shared lookup helpers into a new module (e.g. `lookup_sources.py`) and have `plugin_api.py` import them so behaviour cannot drift. Never invent a definition string. If no source returns a def, either omit the term or add it as `name=` with an empty def (JS coined fallback). Prefer empty def only for marked-up or clearly technical candidates (bolded, camelCase, etc.), never for ordinary English.
+
+3. Candidate selection, tight budget:
+   - Always consider bundled-glossary hits (including the new terms).
+   - Also consider: `**bold**` / `__bold__` phrases, mid-sentence capitalised noun phrases (do not treat the first word of a paragraph as a candidate just because it is capitalised), and technical tokens (camelCase, snake_case, dotted or hyphenated API-like words).
+   - Skip a stopword / very-common-English list (include function words and everyday verbs/nouns like "matters", "retries", "sequences", "effects", "list"). "grid" may be in the glossary and can still match as a glossary hit.
+   - Max 8 terms per turn (same cap as today, first mention only, across the whole reply).
+   - Total wall time for network lookups ≤ 1.5s per `annotate_terms` call. Use a process-wide small cache (term+source). Per-request timeouts must fit the remaining budget (do not use a 4s timeout). If time runs out, keep glossary hits and any lookups already finished; do not block the hook.
+
+4. `v` must keep the original inline markdown (e.g. `**monad**` stays in `v` so the JS renderer from task 9b can style it). `t` names are the visible words (e.g. `monad`).
+
+The exact annotated output for this input (no extra trailing newline if the input has none), using the bundled glossary defs you add (network must not be required for this string):
+
+```
+In Haskell, a **monad** sequences effects, and idempotency matters for retries.
+```
+
+must be of the form:
+
+```
+::termline{v="In Haskell, a **monad** sequences effects, and idempotency matters for retries." t="monad=<your monad def>;;idempotency=<your idempotency def>"}
+```
+
+Do not chip "Haskell" (sentence-leading capital), nor "sequences", "effects", "matters", or "retries". Order in `t` is appearance order (monad then idempotency). Put the exact string (with your defs) in a unittest.
+
+Add Python tests (stdlib unittest, no new deps) for: the exact sentence above; a mid-sentence `::term` still rewritten; fences/headings/lists untouched; a candidate that all sources miss is not given a fabricated def; a lookup helper with a fake/stubbed transport (do not hit the network in CI) for MDN/Wiktionary/Wikipedia hit and miss; the time budget / cap (can stub clock and transport). JS tests that mention the 30-term list must be updated if they assert the exact previous set.
+
+### Files (task 9c only)
+
+You may create or modify:
+
+- __init__.py
+- lookup_sources.py          (new, or a similar name)
+- dashboard/plugin_api.py
+- src/static-glossary.js
+- test/test_annotator.py
+- test/test_lookup_sources.py  (new, if you add it)
+- test/providers.test.js     (only if a glossary-length assertion must change)
+
+Do not modify package.json, README.md, SPEC.md, desktop/plugin.js, or other plugins. Do not install into ~/.hermes. Do not git push. After writing, run `npm test` and `python3 test/test_annotator.py` (and the new lookup tests if any) and do not finish until they are green. Also assert the exact Haskell/monad sentence as specified.
