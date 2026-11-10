@@ -9,7 +9,7 @@ import { createMdnProvider } from './mdn-provider.js';
 import { createWikipediaProvider, createWiktionaryProvider } from './wiki-provider.js';
 import { createCoinedProvider } from './coined-provider.js';
 import { createLlmProvider } from './llm-provider.js';
-import { parseTermline } from './termline.js';
+import { materializeTermline } from './termline.js';
 
 export const PLUGIN_ID = 'concept-links';
 export const PANE_ID = 'glossary';
@@ -21,6 +21,24 @@ export const HOVER_DELAY_MS = 650;
 const NO_DEF = 'No definition yet';
 const CHIP_CLASS = 'inline cursor-pointer underline decoration-dotted underline-offset-2';
 const PARAGRAPH_CLASS = 'leading-relaxed break-words';
+// Inline so the chip does not depend on utilities missing from the Desktop CSS bundle (decoration-dotted).
+const CHIP_STYLE = {
+  display: 'inline',
+  padding: 0,
+  margin: 0,
+  border: 'none',
+  background: 'none',
+  font: 'inherit',
+  color: 'inherit',
+  cursor: 'pointer',
+  textDecoration: 'underline dotted',
+  textUnderlineOffset: '2px',
+};
+
+const SAMPLE_TERMLINE = {
+  v: 'A monoid lets you fold a list in any grouping, and a functor maps over it.',
+  t: 'monoid=A set with an associative operation and an identity element;;functor=A mapping between categories that preserves structure',
+};
 
 // attrs are untrusted model output: only trimmed strings are used.
 const str = (v) => (typeof v === 'string' ? v.trim() : '');
@@ -99,7 +117,7 @@ export function createPlugin(deps) {
       );
     };
 
-    const chip = jsx('button', { type: 'button', onClick, className: CHIP_CLASS, children: name });
+    const chip = jsx('button', { type: 'button', onClick, className: CHIP_CLASS, style: CHIP_STYLE, children: name });
     return jsx(Tip, { delayDuration: HOVER_DELAY_MS, label, children: chip }, key);
   }
 
@@ -117,9 +135,8 @@ export function createPlugin(deps) {
   }
 
   function renderTermline({ attrs, source, streaming, sessionId } = {}) {
-    const value = str(attrs?.v) || str(attrs?.text);
-    if (!value) return jsx('span', { children: source });
-    const parsed = parseTermline(value);
+    const parsed = materializeTermline(attrs);
+    if (!parsed.pieces.length) return jsx('span', { children: source });
     const sid = sessionId ?? null;
     const children = parsed.pieces.map((piece, i) => {
       if (piece.kind === 'text') return piece.text;
@@ -137,7 +154,8 @@ export function createPlugin(deps) {
       }
       return makeChip({ name, def, sid, source, attrs: termAttrs, key: `t${i}` });
     });
-    return jsx('p', { className: PARAGRAPH_CLASS, children });
+    // Not a <p>: the host already gives a solo directive its own block.
+    return jsxs('span', { className: PARAGRAPH_CLASS, style: { display: 'block' }, children });
   }
 
   // Rows for the provider list. Shared by the Concepts pane and the standalone
@@ -203,6 +221,19 @@ export function createPlugin(deps) {
         jsx(EmptyState, {
           title: 'No concept selected',
           description: 'Click a dotted term in the chat to see it here.',
+        }),
+        jsx(Separator, {}),
+        jsxs('div', {
+          className: 'flex flex-col gap-2',
+          children: [
+            jsx('h3', { className: 'text-sm font-semibold', children: 'Sample' }),
+            renderTermline({
+              attrs: SAMPLE_TERMLINE,
+              source: '::termline',
+              streaming: true,
+              sessionId: 'sample',
+            }),
+          ],
         }),
         jsx(Separator, {}),
         section,

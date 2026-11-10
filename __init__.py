@@ -40,8 +40,10 @@ GLOSSARY = [
 MAX_PARAGRAPH = 4800  # the host drops directives in longer paragraphs
 MAX_BODY = 2048  # cap on the directive attribute body
 MAX_TERMS = 8
-# Characters that would break the directive attribute body or the [[name|def]] markers.
-_UNSAFE = re.compile(r'["{}\\\r\n\[\]|]')
+# Characters that would break the directive attribute body.
+_UNSAFE = re.compile(r'["{}\\\r\n]')
+# `t` is "name=def;;name=def": names cannot hold `=`, and neither part can hold `;;`.
+_PAIR_SEP = ";;"
 # Paragraphs that open with block markdown (lists, headings, quotes, tables) are not plain prose.
 _BLOCK = re.compile(r"^\s*(#|[-*+]\s|>|\||\d+[.)]\s)")
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
@@ -57,7 +59,7 @@ def _build(glossary):
     defs = {}
     for term, definition in glossary:
         term, definition = " ".join(term.split()), " ".join(definition.split())
-        if _safe(term) and _safe(definition):
+        if _safe(term) and _safe(definition) and "=" not in term and _PAIR_SEP not in term + definition:
             defs.setdefault(term.lower(), (term, definition))
     names = sorted(defs, key=len, reverse=True)
     if not names:
@@ -101,8 +103,8 @@ def _paragraphs(text):
 def annotate_terms(text, glossary=None):
     """Rewrite each prose paragraph that mentions glossary terms as one ::termline.
 
-    Terms become [[name|def]] markers, first mention only. Returns the new text,
-    or None when nothing changed.
+    The plain sentence goes in v and the first-mentioned terms in t as
+    "name=def;;name=def". Returns the new text, or None when nothing changed.
     """
     try:
         if not isinstance(text, str) or not text:
@@ -136,7 +138,7 @@ def _termline(chunk, defs, pattern, seen):
     body = chunk.rstrip("\r\n")
     tail = chunk[len(body):]
     sentence = " ".join(body.split())
-    if not sentence or _BLOCK.match(body) or "`" in sentence or "::" in sentence or _UNSAFE.search(sentence):
+    if not sentence or _BLOCK.match(body) or "`" in sentence or "::" in sentence or "[[" in sentence or "]]" in sentence or _UNSAFE.search(sentence):
         return None
     pending = set(seen)
     used = []
@@ -149,12 +151,13 @@ def _termline(chunk, defs, pattern, seen):
             return m.group(0)
         pending.add(key)
         used.append(key)
-        return "[[%s|%s]]" % (" ".join(m.group("term").split()), defs[key][1])
+        return m.group(0)
 
-    marked = pattern.sub(sub, sentence)
+    pattern.sub(sub, sentence)
     if not used:
         return None
-    directive = '::termline{v="%s"}' % marked
+    pairs = ";;".join("%s=%s" % defs[key] for key in used)
+    directive = '::termline{v="%s" t="%s"}' % (sentence, pairs)
     if len(directive) - len("::termline{}") > MAX_BODY:
         return None
     seen.update(used)

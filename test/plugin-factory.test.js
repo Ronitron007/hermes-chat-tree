@@ -348,12 +348,13 @@ test('renderTerm: no use while streaming, one when settled, none added by a thir
   assert.equal(registry.usesFor('widget', 's1').length, 1);
 });
 
-test('renderTermline: one p with prose and two inline chips in order', () => {
+test('renderTermline: one block span with prose and two inline chips in order', () => {
   const calls = [];
   const registry = createDefaultRegistry();
   const { plugin, termline } = setup({ host: { revealPane: (id) => calls.push(id) }, registry });
   const tree = renderLine(termline, SENTENCE);
-  assert.equal(tree.type, 'p');
+  assert.equal(tree.type, 'span');
+  assert.deepEqual(tree.props.style, { display: 'block' });
   const kids = tree.props.children;
   assert.deepEqual(kids.map((k) => (typeof k === 'string' ? k : k.type === Tip ? `<${k.props.children.props.children}>` : '?')),
     ['A ', '<monoid>', ' lets you fold, and a ', '<functor>', ' maps over it.']);
@@ -390,7 +391,56 @@ test('renderTermline: no uses while streaming, dedupes settled re-renders, accep
   assert.equal(registry.usesFor('functor', 's1').length, 1);
 
   const viaText = termline.data.render({ attrs: { text: 'x [[y|z]]' }, source: 's', streaming: true, sessionId: 's1' });
-  assert.equal(viaText.type, 'p');
+  assert.equal(viaText.type, 'span');
+});
+
+const T_ATTRS = {
+  v: 'A monoid lets you fold, and a functor maps over it.',
+  t: 'monoid=combines values;;functor=maps over a box',
+};
+
+test('renderTermline: the t encoding gives a span, two inline-styled chips and a working click', () => {
+  const calls = [];
+  const registry = createDefaultRegistry();
+  const { plugin, termline } = setup({ host: { revealPane: (id) => calls.push(id) }, registry });
+  const tree = termline.data.render({ attrs: T_ATTRS, source: '::termline', streaming: false, sessionId: 's1' });
+  assert.equal(tree.type, 'span');
+  const tips = tree.props.children.filter((k) => k.type === Tip);
+  assert.equal(tips.length, 2);
+  for (const tip of tips) {
+    assert.equal(tip.props.children.type, 'button');
+    assert.ok(tip.props.children.props.style.textDecoration.includes('underline'));
+    assert.equal(tip.props.children.props.style.cursor, 'pointer');
+  }
+  assert.equal(registry.usesFor('monoid', 's1')[0].quote, T_ATTRS.v);
+  tips[0].props.children.props.onClick();
+  assert.equal(plugin.$selectedTerm.get().name, 'monoid');
+  assert.deepEqual(calls, ['concept-links:glossary']);
+});
+
+test('renderTermline: legacy [[ markers in v still chip, also when host-escaped', () => {
+  const { termline } = setup();
+  for (const v of [SENTENCE, SENTENCE.replaceAll('[', '\\[').replaceAll(']', '\\]')]) {
+    const tree = renderLine(termline, v);
+    assert.equal(tree.props.children.filter((k) => k.type === Tip).length, 2);
+  }
+});
+
+test('pane: the empty state shows a sample with monoid and functor chips that are not recorded', () => {
+  const calls = [];
+  const { plugin, pane } = setup({ host: { revealPane: (id) => calls.push(id) } });
+  const tree = pane.render();
+  assert.ok(hasText(tree, 'Sample'));
+  const tips = findAll(tree, Tip);
+  assert.deepEqual(tips.map((t) => t.props.children.props.children), ['monoid', 'functor']);
+  const nodes = walk(tree);
+  assert.ok(nodes.indexOf(findAll(tree, EmptyState)[0]) < nodes.indexOf(tips[0]));
+  assert.ok(nodes.indexOf(tips[1]) < nodes.indexOf(findAll(tree, Switch)[0]));
+  assert.equal(plugin.registry.usesFor('monoid', 'sample').length, 0);
+  tips[1].props.children.props.onClick();
+  assert.equal(plugin.$selectedTerm.get().name, 'functor');
+  assert.deepEqual(calls, ['concept-links:glossary']);
+  assert.equal(findAll(pane.render(), Tip).length, 0);
 });
 
 test('renderTermline: without a value returns a span with the source', () => {
