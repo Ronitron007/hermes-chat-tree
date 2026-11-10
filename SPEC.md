@@ -344,3 +344,199 @@ provider itself always can be constructed; the registry keeps it off.
    disabled by default so it is not called.
 
 Do not hit the real network. All tests must pass (`npm test`, including task 1).
+
+## Plugin factory and UI (task 3)
+
+Create ONLY these files:
+
+- src/plugin-factory.js
+- test/plugin-factory.test.js
+
+Do not modify existing src/ or test/ files, package.json, README.md, SPEC.md,
+or .gitignore. No npm dependencies. No ~/.hermes install. No git push.
+
+`src/plugin-factory.js` is plain ESM that imports other `./` modules and
+exports factory functions. It must not import `@hermes/plugin-sdk`, `react`,
+or Node built-ins. All SDK pieces are injected as arguments, the same way the
+spike's `createPlugin` worked, so tests can run under Node.
+
+### `createDefaultRegistry()`
+
+Constructs a registry, then registers, in any insertion order (the registry's
+default chain order is what matters):
+
+inline, session (via ctx.registry; also bind if you want), static, mdn,
+wiktionary, wikipedia, coined, llm.
+
+Returns the registry.
+
+### `createPlugin(deps)`
+
+`deps` (all injected):
+
+```
+{
+  host, jsx, jsxs, atom, useValue,
+  Tip, Button, ScrollArea, EmptyState, Badge, Switch, Separator,
+  registry,          // optional; default createDefaultRegistry()
+  fetch,             // optional; default: globalThis.fetch if it is a function
+}
+```
+
+Constants to export (and also return from the plugin object):
+
+- PLUGIN_ID = 'concept-links'
+- PANE_ID = 'glossary'
+- SETTINGS_PANE_ID = 'providers'
+- DIRECTIVE_NAME = 'term'
+- HOVER_DELAY_MS = 650
+
+`register(ctx)` must register all of the following (and only these):
+
+1. Transcript directive
+   - id: 'term'
+   - area: 'transcript.directives'
+   - data: { name: 'term', render: renderTerm }
+
+2. Concepts pane
+   - id: 'glossary'
+   - area: 'panes'
+   - title: 'Concepts'
+   - data: { placement: 'right', width: '340px' }
+   - render: renderPane
+
+3. Providers pane (second pane, so closing Concepts does not disable the plugin)
+   - id: 'providers'
+   - area: 'panes'
+   - title: 'Concept providers'
+   - data: { placement: 'right', width: '340px' }
+   - render: renderSettings
+
+4. Palette command
+   - area: 'palette'
+   - data: { id: 'open-concepts', label: 'Open concepts pane', keywords: ['concept', 'term', 'glossary', 'definition'], run: () => reveal glossary pane if host.revealPane is a function }
+
+On register, if `ctx.storage` exists:
+
+- read `providerPrefs` (fallback `{}`) with shape `{ order?: string[], disabled?: string[] }`
+  and apply with `setOrder` / `setDisabled`. If `disabled` is absent, keep the
+  registry default (llm disabled). If `disabled` is present (including `[]`),
+  use it as the full disabled set.
+- read `userGlossary` (fallback `[]`) and keep it in a plugin-local variable
+  that is passed as `ctx.userGlossary` to lookups.
+
+Shared state:
+
+- `$selectedTerm = atom(null)` — `{ name, sessionId, definition }` or null.
+  `definition` is a Definition object (or null while loading).
+- Optionally `$prefsTick = atom(0)` (or similar) so the settings pane
+  re-renders after a reorder; tests can use `useValue` on whatever you pick.
+
+### renderTerm({ attrs, source, streaming, sessionId })
+
+Untrusted attrs: only trimmed strings. If `name` is empty, return
+`jsx('span', { children: source })`.
+
+Otherwise:
+
+1. `registry.recordUse({ name, def: attrs.def, sessionId: sessionId ?? null, source, attrs })`.
+2. `sync = registry.lookupSync(name, lookupCtx)` where lookupCtx includes
+   `sessionId`, `attrs`, `source`, `userGlossary`, `fetch` (and `rest: ctx.rest`
+   if it was captured at register time — store a reference).
+3. Build a Tip:
+   - `delayDuration` = 650
+   - `label` is a short tooltip node: the sync short text (or def, or 'No definition yet'),
+     the source if present, and a coined badge (`jsx(Badge, { children: 'coined' })`)
+     when `sync?.kind === 'coined'`. If Tip label must be a React node, use
+     `jsxs('div', { children: [...] })`. If there is no sync result and no def,
+     still render the chip; the label may be 'No definition yet'.
+   - children: exactly one `jsx('button', { type: 'button', onClick, className, children: name })`.
+     className should be an underline-dotted utility string, no hardcoded colors
+     (e.g. `'cursor-pointer underline decoration-dotted underline-offset-2'`).
+
+4. onClick:
+   - `$selectedTerm.set({ name, sessionId: sessionId ?? null, definition: sync })`
+   - if `typeof host?.revealPane === 'function'`, call
+     `host.revealPane('concept-links:glossary')`. Missing revealPane must not throw.
+   - then start `registry.lookup(name, lookupCtx)` (may return a Promise). When
+     it settles to a Definition, update `$selectedTerm` only if the still-selected
+     name is this term (do not clobber a later click). Errors are swallowed.
+
+### renderPane()
+
+Hook: `const selected = useValue($selectedTerm)`.
+
+If no selected term: `jsx(EmptyState, { title: 'No concept selected', description: 'Click a dotted term in the chat to see it here.' })`.
+
+Else a ScrollArea whose children include (as plain elements / kit components):
+
+- The term name
+- A Badge 'coined' when definition.kind === 'coined', and 'uncertain' when kind === 'uncertain'
+- The long text (definition.long or definition.short or 'No definition yet')
+- Which provider answered: definition.source and definition.providerId
+- First use: definition.firstUse.quote, or registry.firstUse(name, sessionId)?.quote, labelled clearly
+- All uses in the session from registry.usesFor(name, sessionId), listed in order (at least the quote or the def or the name for each)
+- A Button that clears the selection (`$selectedTerm.set(null)`), children 'Clear'
+
+### renderSettings()
+
+`useValue` something so tests can re-render after changes.
+
+List `registry.list()` in current order. For each provider show:
+
+- `provider.label` (and id)
+- A Switch: checked when NOT disabled. `onCheckedChange` / `onChange` / `checked` —
+  support both `onCheckedChange(boolean)` (kit) and a fallback `onClick` that
+  toggles, so a simple mock works. Toggling updates `setDisabled` to the new
+  full set (remember llm should stay disabled unless the user enables it).
+  Persist prefs to `ctx.storage.set('providerPrefs', { order, disabled })` when
+  storage exists.
+- A Button 'Up' and a Button 'Down' to move the provider in the order (no-op at
+  ends). Persist the new order.
+
+Do not invent other settings UI.
+
+### Tests (`test/plugin-factory.test.js`)
+
+Use the same mock style as a typical jsx tree: `jsx/jsxs = (type, props) => ({ type, props })`,
+function components for Tip/Button/etc, an atom mock with get/set/subscribe, useValue = store.get().
+A helper to walk the tree is fine.
+
+Must cover:
+
+1. createDefaultRegistry lists eight providers in the default chain order;
+   llm is disabled; lookupSync can resolve a bundled static term (e.g. monoid)
+   with no attrs.
+2. register() contributes the term directive, glossary pane, providers pane
+   (both area 'panes', placement 'right', width '340px'), and the palette
+   command. Palette run calls revealPane('concept-links:glossary') when present.
+3. renderTerm with name+def: Tip delayDuration is 650, child is a single
+   button whose children is the name; click sets $selectedTerm and calls
+   revealPane('concept-links:glossary'); recordUse was called (usesFor length
+   >= 1). Click without revealPane still sets state and does not throw.
+4. renderTerm without a name returns a span of the source text.
+5. Tooltip label includes the short definition (inline def) and, when the
+   definition kind is coined, a Badge with children 'coined'. You can force
+   coined by pre-recording a first use, disabling inline/session/static/mdn
+   /wiktionary/wikipedia (so coined wins on lookupSync if it can), or by
+   injecting a tiny stub provider — prefer a realistic path: disable every
+   provider except coined, record a first-use quote, no fetch, then render
+   a term with no def.
+6. Pane: empty state when nothing selected; after a selection with a
+   definition, the tree contains the name, the long text, the source or
+   providerId, and a Clear button that nulls the selection. When uses exist,
+   they appear. After click, if lookup resolves later with a richer
+   definition, the selected term updates (use a fake async provider).
+7. Settings: toggling a Switch (onCheckedChange(false) or onClick) disables
+   that provider and, when ctx.storage is present, writes providerPrefs.
+   Up/Down changes order and persists. register() reads providerPrefs and
+   userGlossary from storage and applies them (e.g. pre-seed storage with
+   disabled:['static'] and a userGlossary entry, then a lookupSync of that
+   user term works and static bundled terms are skipped if you also disable
+   nothing else... actually if only static is disabled, user glossary is
+   still served by the static provider — user glossary is an input to static.
+   So to test storage apply: seed order that puts static first, or disable
+   'llm' and 'mdn', and assert isDisabled/list order).
+8. Closing risk: two panes are registered, not one.
+
+All existing tests plus these must pass under `npm test`.
