@@ -86,9 +86,11 @@ function createRegistry(options = {}) {
       const named = [];
       for (const id of Array.isArray(ids) ? ids : []) if (!named.includes(id)) named.push(id);
       order = named.concat(order.filter((id) => !named.includes(id)));
+      cache.clear();
     },
     setDisabled(ids) {
       disabled = new Set((Array.isArray(ids) ? ids : []).filter(known));
+      for (const [key, entry] of cache) if (disabled.has(entry.def.providerId)) cache.delete(key);
     },
     isDisabled(id) {
       return disabled.has(id);
@@ -155,7 +157,7 @@ function createRegistry(options = {}) {
     async lookup(term, ctx) {
       const key = termKey(term, ctx?.sessionId);
       const hit = cache.get(key);
-      if (hit) return hit.def;
+      if (hit && !disabled.has(hit.def.providerId)) return hit.def;
       const full = { ...ctx, registry };
       for (const provider of enabledChain()) {
         let out = attempt(provider, term, full);
@@ -181,7 +183,8 @@ function createRegistry(options = {}) {
       for (const [key, entry] of cache) if (entry.session === session) cache.delete(key);
     },
     peekCache(term, sessionId) {
-      return cache.get(termKey(term, sessionId))?.def ?? null;
+      const def = cache.get(termKey(term, sessionId))?.def ?? null;
+      return def && !disabled.has(def.providerId) ? def : null;
     },
   };
 
@@ -289,6 +292,21 @@ const DEFAULT_GLOSSARY = [
   { term: 'effect system', def: 'A type system feature that tracks which side effects a function may perform in its signature.' },
   { term: 'orthogonal persistence', def: 'A design where data lives beyond program runs without code treating persistent and temporary data differently.' },
   { term: 'nonce', def: 'A number used once, supplied to an operation so that old messages cannot be replayed or reused.' },
+  { term: 'monad', def: 'A design pattern that wraps values in a context and chains operations on them, handling the context such as failure or state automatically.' },
+  { term: 'functor', def: 'A container type that supports mapping a function over its contents while keeping the container structure unchanged.' },
+  { term: 'hoisting', def: 'JavaScript behavior where declarations are processed before code runs, so they can be used earlier in their scope than where they are written.' },
+  { term: 'idempotency', def: 'The property that repeating an operation has the same effect as doing it once, which makes retries safe.' },
+  { term: 'flexbox', def: 'A CSS layout model that arranges items along a row or column and distributes the space between them.' },
+  { term: 'grid', def: 'A CSS layout model that places items into rows and columns of a two-dimensional grid.' },
+  { term: 'polyfill', def: 'Code that adds a modern feature to an older environment that does not support it natively.' },
+  { term: 'mutex', def: 'A lock that lets only one thread at a time enter a critical section of code.' },
+  { term: 'deadlock', def: 'A state where two or more tasks each wait for the other to release a resource, so none can proceed.' },
+  { term: 'race condition', def: 'A bug where the result depends on the unpredictable timing or ordering of concurrent operations.' },
+  { term: 'immutability', def: 'The property of data that cannot be changed after creation, so updates produce new values instead.' },
+  { term: 'lazy evaluation', def: 'Delaying the computation of a value until it is actually needed, and then reusing the result.' },
+  { term: 'event loop', def: 'A loop that waits for events or queued tasks and runs their handlers one at a time.' },
+  { term: 'middleware', def: 'Code that sits between a request and its handler and can inspect, change, or short-circuit the exchange.' },
+  { term: 'tail call', def: 'A function call made as the very last step of another function, which can reuse the current stack frame.' },
 ];
 
 function toMap(entries) {
@@ -753,6 +771,217 @@ function materializeTermline(attrs) {
   return { pieces, sentence: sentenceText };
 }
 
+const SAFE_HREF = /^(?:https?:\/\/|mailto:)[^\s()<>]+$/i;
+const LINK_AT = /^\[([^[\]]+)\]\(([^()\s]+)\)/;
+const isWord = (ch) => ch !== undefined && /[\p{L}\p{N}]/u.test(ch);
+const isSpace = (ch) => ch === undefined || /\s/.test(ch);
+
+const pushText = (nodes, text) => {
+  if (text === '') return;
+  const last = nodes[nodes.length - 1];
+  if (last && last.kind === 'text') last.text += text;
+  else nodes.push({ kind: 'text', text });
+};
+
+// Index of the first closing run for which `ok(index)` holds, hopping over code
+// spans so a marker inside backticks never closes an outer span.
+function findCloser(input, from, ok) {
+  for (let j = from; j < input.length; j++) {
+    if (input[j] === '`') {
+      const end = input.indexOf('`', j + 1);
+      if (end !== -1) j = end;
+      continue;
+    }
+    if (ok(j)) return j;
+  }
+  return -1;
+}
+
+// Conservative inline markdown: **bold**, __bold__, *italic*, _italic_, `code`
+// and [label](http(s)/mailto url). Anything that does not close cleanly stays
+// literal text. Returns nodes of { kind: 'text', text } or
+// { kind: 'strong' | 'em' | 'code' | 'link', children, href? }.
+function parseInlineMarkdown(input, allowed = { strong: true, em: true, link: true }) {
+  const s = typeof input === 'string' ? input : '';
+  const nodes = [];
+  let i = 0;
+  const wrap = (kind, from, to, skip, extra, rules) => {
+    const children = parseInlineMarkdown(s.slice(from, to), rules);
+    nodes.push({ kind, ...extra, children });
+    i = to + skip;
+  };
+
+  while (i < s.length) {
+    const ch = s[i];
+
+    if (ch === '`') {
+      let run = 1;
+      while (s[i + run] === '`') run++;
+      const fence = '`'.repeat(run);
+      const end = s.indexOf(fence, i + run);
+      if (end > i + run && s[end + run] !== '`') {
+        nodes.push({ kind: 'code', children: [{ kind: 'text', text: s.slice(i + run, end) }] });
+        i = end + run;
+        continue;
+      }
+      pushText(nodes, fence);
+      i += run;
+      continue;
+    }
+
+    if (ch === '!' && s[i + 1] === '[') {
+      const img = LINK_AT.exec(s.slice(i + 1));
+      if (img) {
+        pushText(nodes, s.slice(i, i + 1 + img[0].length));
+        i += 1 + img[0].length;
+        continue;
+      }
+    }
+
+    if (ch === '[' && allowed.link) {
+      const m = LINK_AT.exec(s.slice(i));
+      if (m && SAFE_HREF.test(m[2])) {
+        const children = parseInlineMarkdown(m[1], { ...allowed, link: false });
+        nodes.push({ kind: 'link', href: m[2], children });
+        i += m[0].length;
+        continue;
+      }
+    }
+
+    if ((ch === '*' || ch === '_') && allowed.strong && allowed.em && s.startsWith(ch.repeat(3), i)
+      && !isSpace(s[i + 3]) && (ch === '*' || !isWord(s[i - 1]))) {
+      const close = findCloser(s, i + 3, (j) => s.startsWith(ch.repeat(3), j) && !isSpace(s[j - 1])
+        && (ch === '*' || !isWord(s[j + 3])));
+      if (close > i + 3) {
+        nodes.push({
+          kind: 'strong',
+          children: [{ kind: 'em', children: parseInlineMarkdown(s.slice(i + 3, close), { strong: false, em: false, link: allowed.link }) }],
+        });
+        i = close + 3;
+        continue;
+      }
+    }
+
+    if ((ch === '*' || ch === '_') && s[i + 1] === ch) {
+      const left = ch === '*' || !isWord(s[i - 1]);
+      if (allowed.strong && left && !isSpace(s[i + 2]) && s[i + 2] !== ch) {
+        const close = findCloser(s, i + 2, (j) => s[j] === ch && s[j + 1] === ch && s[j + 2] !== ch
+          && !isSpace(s[j - 1]) && s[j - 1] !== ch && (ch === '*' || !isWord(s[j + 2])));
+        if (close > i + 2) {
+          wrap('strong', i + 2, close, 2, {}, { ...allowed, strong: false });
+          continue;
+        }
+      }
+      pushText(nodes, ch + ch);
+      i += 2;
+      continue;
+    }
+
+    if (ch === '*' || ch === '_') {
+      const left = ch === '*' || !isWord(s[i - 1]);
+      if (allowed.em && left && !isSpace(s[i + 1])) {
+        const close = findCloser(s, i + 1, (j) => s[j] === ch && s[j - 1] !== ch && s[j + 1] !== ch
+          && !isSpace(s[j - 1]) && (ch === '*' || !isWord(s[j + 1])));
+        if (close > i + 1) {
+          wrap('em', i + 1, close, 1, {}, { ...allowed, em: false });
+          continue;
+        }
+      }
+    }
+
+    pushText(nodes, ch);
+    i++;
+  }
+  return nodes;
+}
+
+const PH_OPEN = '\uE000';
+const PH_CLOSE = '\uE001';
+const PH_RE = /\uE000(\d+)\uE001/;
+
+const textOf = (nodes) =>
+  nodes.map((n) => (n.kind === 'text' ? n.text : n.kind === 'term' ? n.name : textOf(n.children))).join('');
+
+// Replaces the first text leaf (document order) that `split` can break up.
+function mapFirstLeaf(nodes, split) {
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    if (n.kind === 'text') {
+      const parts = split(n.text);
+      if (parts) return [...nodes.slice(0, i), ...parts, ...nodes.slice(i + 1)];
+    } else if (n.kind !== 'term') {
+      const kids = mapFirstLeaf(n.children, split);
+      if (kids) return [...nodes.slice(0, i), { ...n, children: kids }, ...nodes.slice(i + 1)];
+    }
+  }
+  return null;
+}
+
+function expandPlaceholders(nodes, terms) {
+  return nodes.flatMap((n) => {
+    if (n.kind === 'term') return [n];
+    if (n.kind !== 'text') return [{ ...n, children: expandPlaceholders(n.children, terms) }];
+    const out = [];
+    let rest = n.text;
+    for (let m = PH_RE.exec(rest); m; m = PH_RE.exec(rest)) {
+      if (m.index > 0) out.push({ kind: 'text', text: rest.slice(0, m.index) });
+      out.push({ kind: 'term', ...terms[Number(m[1])] });
+      rest = rest.slice(m.index + m[0].length);
+    }
+    if (rest !== '') out.push({ kind: 'text', text: rest });
+    return out;
+  });
+}
+
+// Like materializeTermline, but the sentence is parsed as inline markdown first, so
+// term chips can sit inside strong/em/a/code nodes and no marker characters leak
+// into the neighbouring text. Returns { nodes, sentence } where `sentence` is the
+// visible text.
+function materializeInline(attrs) {
+  const pick = (x) => (typeof x === 'string' ? unescapeTermlineValue(x).trim() : '');
+  const sentenceText = pick(attrs?.v) || pick(attrs?.text);
+  if (sentenceText === '') return { nodes: [], sentence: '' };
+
+  const legacy = scanMarkers(sentenceText.replace(/[\uE000\uE001]/g, ''));
+  if (legacy.pieces.some((p) => p.kind === 'term')) {
+    const terms = [];
+    const masked = legacy.pieces
+      .map((p) => {
+        if (p.kind === 'text') return p.text;
+        terms.push({ name: p.name, def: p.def });
+        return `${PH_OPEN}${terms.length - 1}${PH_CLOSE}`;
+      })
+      .join('');
+    const nodes = expandPlaceholders(parseInlineMarkdown(masked), terms);
+    return { nodes, sentence: textOf(nodes) };
+  }
+
+  let nodes = parseInlineMarkdown(sentenceText.replace(/[\uE000\uE001]/g, ''));
+  const done = new Set();
+  for (const { name, def } of parseTermList(attrs?.t)) {
+    const key = name.toLowerCase();
+    if (done.has(key)) continue;
+    const re = new RegExp(
+      `(?<![\\p{L}\\p{N}_])${escapeRe(name).replace(/\s+/g, '\\s+')}(?![\\p{L}\\p{N}_])`,
+      'iu',
+    );
+    const next = mapFirstLeaf(nodes, (text) => {
+      const m = re.exec(text);
+      if (!m) return null;
+      const parts = [];
+      if (m.index > 0) parts.push({ kind: 'text', text: text.slice(0, m.index) });
+      parts.push({ kind: 'term', name: m[0], def });
+      if (m.index + m[0].length < text.length) parts.push({ kind: 'text', text: text.slice(m.index + m[0].length) });
+      return parts;
+    });
+    if (next) {
+      nodes = next;
+      done.add(key);
+    }
+  }
+  return { nodes, sentence: textOf(nodes) };
+}
+
 function formatTermline(pieces) {
   return (Array.isArray(pieces) ? pieces : [])
     .map((p) =>
@@ -791,6 +1020,8 @@ const CHIP_STYLE = {
   textDecoration: 'underline dotted',
   textUnderlineOffset: '2px',
 };
+
+const CODE_STYLE = { fontFamily: 'ui-monospace, monospace', fontSize: '0.9em' };
 
 const SAMPLE_TERMLINE = {
   v: 'A monoid lets you fold a list in any grouping, and a functor maps over it.',
@@ -842,11 +1073,15 @@ function createPlugin(deps) {
     $prefsTick.set(++tick);
   }
 
+  // The session provider replays recorded defs, so a disabled inline provider
+  // must not leak its attribute def into the session store.
+  const recordedDef = (def) => (def && !registry.isDisabled('inline') ? def : undefined);
+
   function makeChip({ name, def, sid, source, attrs, key }) {
     const lookupCtx = { sessionId: sid, attrs, source, userGlossary, fetch: fetchFn, rest };
     const sync = registry.lookupSync(name, lookupCtx);
 
-    const text = sync?.short || def || NO_DEF;
+    const text = sync?.short || NO_DEF;
     const label = jsxs('div', {
       children: [
         jsx('span', { children: text }),
@@ -855,7 +1090,9 @@ function createPlugin(deps) {
       ].filter(Boolean),
     });
 
-    const onClick = () => {
+    const onClick = (event) => {
+      // A chip inside a markdown link must not also follow the link.
+      event?.preventDefault?.();
       $selectedTerm.set({ name, sessionId: sid, definition: sync });
       if (typeof host?.revealPane === 'function') host.revealPane(`${PLUGIN_ID}:${PANE_ID}`);
       let pending;
@@ -887,30 +1124,40 @@ function createPlugin(deps) {
     if (!name) return jsx('span', { children: source });
     const def = str(attrs?.def);
     const sid = sessionId ?? null;
-    if (!streaming) registry.recordUse({ name, def: def || undefined, sessionId: sid, source, attrs });
+    if (!streaming) registry.recordUse({ name, def: recordedDef(def), sessionId: sid, source, attrs });
     return makeChip({ name, def, sid, source, attrs });
   }
 
   function renderTermline({ attrs, source, streaming, sessionId } = {}) {
-    const parsed = materializeTermline(attrs);
-    if (!parsed.pieces.length) return jsx('span', { children: source });
+    const parsed = materializeInline(attrs);
+    if (!parsed.nodes.length) return jsx('span', { children: source });
     const sid = sessionId ?? null;
-    const children = parsed.pieces.map((piece, i) => {
-      if (piece.kind === 'text') return piece.text;
-      const { name, def } = piece;
-      const termAttrs = { name, def };
-      if (!streaming) {
-        registry.recordUse({
-          name,
-          def: def || undefined,
-          sessionId: sid,
-          source,
-          attrs: termAttrs,
-          surrounding: parsed.sentence,
-        });
-      }
-      return makeChip({ name, def, sid, source, attrs: termAttrs, key: `t${i}` });
-    });
+    const build = (nodes, path) =>
+      nodes.map((node, i) => {
+        if (node.kind === 'text') return node.text;
+        const key = `${path}${i}`;
+        if (node.kind === 'term') {
+          const { name, def } = node;
+          const termAttrs = { name, def };
+          if (!streaming) {
+            registry.recordUse({
+              name,
+              def: recordedDef(def),
+              sessionId: sid,
+              source,
+              attrs: termAttrs,
+              surrounding: parsed.sentence,
+            });
+          }
+          return makeChip({ name, def, sid, source, attrs: termAttrs, key: `t${key}` });
+        }
+        const children = build(node.children, `${key}.`);
+        if (node.kind === 'strong') return jsxs('strong', { children }, `s${key}`);
+        if (node.kind === 'em') return jsxs('em', { children }, `s${key}`);
+        if (node.kind === 'code') return jsxs('code', { style: CODE_STYLE, children }, `s${key}`);
+        return jsxs('a', { href: node.href, target: '_blank', rel: 'noreferrer noopener', children }, `s${key}`);
+      });
+    const children = build(parsed.nodes, '');
     // Not a <p>: the host already gives a solo directive its own block.
     return jsxs('span', { className: PARAGRAPH_CLASS, style: { display: 'block' }, children });
   }
@@ -1006,7 +1253,8 @@ function createPlugin(deps) {
     const fromDefinition = definition?.firstUse?.quote;
     const first =
       quotes[0] ?? (hasQuote(fromDefinition) && !defTexts.includes(fromDefinition.trim()) ? fromDefinition : null);
-    const uniqueQuotes = [...new Set(quotes)];
+    const firstText = first ? first.trim() : null;
+    const laterQuotes = [...new Set(quotes.map((q) => q.trim()))].filter((q) => q !== firstText);
     const kind = definition?.kind;
     return wrap(
       [
@@ -1018,13 +1266,13 @@ function createPlugin(deps) {
           ? jsx('p', { className: 'text-xs opacity-70', children: `Provider: ${definition.providerId}` })
           : null,
         first ? jsx('p', { className: 'text-sm', children: `First use in this session: ${first}` }) : null,
-        uniqueQuotes.length
+        laterQuotes.length
           ? jsxs('div', {
               children: [
                 jsx('h3', { className: 'text-sm font-semibold', children: 'Uses in this session' }),
                 jsx('ul', {
                   className: 'text-sm',
-                  children: uniqueQuotes.map((q, i) => jsx('li', { children: q }, i)),
+                  children: laterQuotes.map((q, i) => jsx('li', { children: q }, i)),
                 }),
               ],
             })
