@@ -14,6 +14,7 @@ const files = [
   'src/mdn-provider.js',
   'src/coined-provider.js',
   'src/llm-provider.js',
+  'src/termline.js',
   'src/plugin-factory.js',
 ]
 
