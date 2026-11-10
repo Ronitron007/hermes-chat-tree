@@ -697,3 +697,193 @@ Be honest:
 
 No market-research or product-comparison content beyond what is needed to
 explain these providers.
+
+## Desktop bugfix (task 5) — three live bugs
+
+The plugin was tested in real Hermes Desktop (screenshots under
+`/tmp/computer-use/`, launch log `/tmp/hd.log`). Fix the three bugs below
+in the plugin. Do not modify Hermes Desktop itself. Do not install into
+`~/.hermes`. Do not add npm dependencies. Do not git push.
+
+### Bug 1 — mid-sentence `::term` renders as separate blocks
+
+**Root cause (host, not our chip):** in the installed source
+
+`/home/box/.hermes/hermes-agent/apps/desktop/src/components/assistant-ui/markdown-text.tsx`
+(the `MarkdownParagraph` function, around lines 616–630), a paragraph that
+contains a claimed directive is *split*. Each prose run becomes its own
+`<p>`, and each directive is a sibling `TranscriptDirectiveLeaf`. The
+comment even says a sentence that ends in a directive is "its sentence
+followed by the card". There is no inline flag on
+`TranscriptDirectiveContribution` (`transcript-directives.ts`). ContribBoundary
+`variant="chip"` does not put the leaf back inside the `<p>`.
+
+So even if our render returns an inline `<button>` or `<span>`, the host
+still breaks "A ::term{...} lets you ... ::term{...} maps over it." into:
+
+```
+A
+monoid
+lets you fold a list in any grouping, and a
+functor
+maps over it.
+```
+
+That is what the Desktop test showed. We cannot change the host. The
+feasible workaround is a **paragraph-level directive** whose body is the
+whole sentence, so the paragraph is exactly one claimed directive and the
+host renders "the card alone". Our render then draws one `<p>` (or a
+single block element with the same paragraph class) containing inline
+chips and the surrounding words.
+
+#### `src/termline.js`
+
+Export:
+
+- `MARKER_OPEN = '[['`
+- `MARKER_SEP = '|'`
+- `MARKER_CLOSE = ']]'`
+- `parseTermline(value)` → `{ pieces: Array<{kind:'text', text:string}|{kind:'term', name:string, def:string}>, sentence: string }`
+  `sentence` is the pieces joined with each term replaced by its `name` (the
+  readable sentence, no markers).
+- `formatTermline(pieces)` → the encoded string (inverse of parse, for tests
+  and docs). Terms become `[[name|def]]`.
+- `sanitizeTermlinePart(s)` — strip `|`, `[`, `]`, `{`, `}`, `"`, `'`,
+  backslashes and newlines from a name or def so the marker encoding and
+  the directive attr body stay valid.
+
+A text piece that is empty may be omitted. Parsing is greedy on `[[...]]`.
+A `[[` without a matching `]]` is left as text. If there is no `|`, the
+inside is the name and `def` is `''`.
+
+#### Directive `termline`
+
+Register a second transcript directive, `name: 'termline'`, alongside `term`.
+
+`renderTermline({ attrs, source, streaming, sessionId })`:
+
+- Read `attrs.v` (or `attrs.text`) as the encoded sentence. If empty,
+  return `jsx('span', { children: source })`.
+- `parsed = parseTermline(value)`.
+- For each term piece, `recordUse({ name, def, sessionId, source, surrounding: parsed.sentence })`
+  but **not while `streaming` is true**. Registry dedupe (below) still
+  applies so later re-renders of the settled message do not triple-count.
+- Return a single `jsx('p', { className: same paragraph-ish wrap class, children })`
+  whose children are text nodes/spans and the same Tip-wrapped inline chips
+  used by `renderTerm` (delay 650, underline-dotted, click selects +
+  `revealPane('concept-links:glossary')` + async lookup). The chip element
+  must be inline (`button` with a class that includes `inline`, or a
+  `span` with `role="button"` and keyboard click). Do not wrap the sentence
+  in a `div` that is only the chip.
+
+Keep `::term{name= def=}` working for mid-sentence use (old chats, a model
+that ignores the skill). It will still split in this Desktop build; that is
+the host's behaviour. document it in a short comment above `renderTerm`.
+Still record uses (when not streaming), but pass `surrounding` only if we
+have a real sentence — never use the definition as the quote.
+
+### Bug 2 — "First use" / "Uses" show the definition, three times
+
+**Root cause (ours):** `recordUse` in `src/providers.js` falls back to `def`
+(then `name`) when `surrounding` is missing. `renderTerm` calls
+`recordUse` on every render and passes `source` (the raw `::term{...}`
+string) but no `surrounding`. The pane then prints `definition.firstUse.quote`
+or `use.quote`, which is the definition text. Because `recordUse` is a
+side effect of render, streaming re-renders and the settle flip record the
+same occurrence three times.
+
+Fixes in `createRegistry().recordUse`:
+
+- `quote` is `surrounding` when that is a non-empty string. Do **not** fall
+  back to `def`. If there is no surrounding, `quote` is `null` (the pane
+  must not display a "First use" / use line for a null quote).
+- **Dedupe** when `source` is a non-empty string: if this session already
+  has a use of the same normalised name whose `source` is identical, or
+  one is a prefix of the other (streaming grew the directive), do not push
+  a new use. Update the existing record's `def` / `surrounding` / `quote`
+  / `source` when the new one is more complete (longer source, or a
+  surrounding that the old one lacked). Return the existing record.
+- When `source` is missing, keep recording a new use each call (existing
+  tests that record several uses without a source stay valid, except any
+  that asserted `quote === def` — update those: without surrounding, quote
+  is null).
+- `renderTerm` / `renderTermline` must not call `recordUse` while
+  `streaming === true`.
+
+Pane copy:
+
+- "First use in this session: {sentence}" only when there is a real quote
+  (the surrounding sentence, not the definition). Prefer
+  `registry.firstUse(...)?.quote` if it is a sentence; do not show
+  `definition.firstUse.quote` when that quote equals the definition text.
+- "Uses in this session" lists unique quotes (or unique uses after
+  registry dedupe). Do not list the definition three times. Skip uses
+  whose quote is null.
+
+### Bug 3 — "Concept providers" pane never appeared
+
+The second pane was registered (`id: 'providers'`, area `panes`,
+placement `right`), but the Desktop test only showed tabs Widget Control,
+Notes, and Concepts. The palette command was "Open concepts pane" and
+did not mention providers, so even if the palette worked it would not
+open settings. Likely the host only tabs a plugin pane once it has been
+revealed (Concepts appeared after `revealPane` on click; providers was
+never revealed).
+
+Make settings reachable even if the second pane never tabs:
+
+- Put a **Providers** section inside the Concepts pane itself: the list
+  of providers with Switch + Up/Down, the same as `renderSettings` today.
+  It must be visible both when a term is selected (below the term, after
+  a Separator) and when nothing is selected (below the EmptyState). Reuse
+  the same toggle/reorder/persist logic; do not duplicate it poorly —
+  extract a `providerRows()` helper used by both the section and the
+  standalone providers pane.
+- Keep registering the standalone providers pane (so the plugin still has
+  two panes, against the one-pane-close-disables-plugin risk).
+- Palette: keep "Open concepts pane". Add a second palette command
+  "Concept provider settings" (`id: 'open-provider-settings'`, keywords
+  including `provider`, `settings`, `glossary`) that calls
+  `host.revealPane('concept-links:glossary')` and, if `host.revealPane` and
+  `host.undismissPane` exist, also reveals/undismisses
+  `concept-links:providers`. Feature-detect; missing methods must not
+  throw. Give each palette contribution a top-level `id` as well as
+  `data.id`.
+
+### Tests
+
+Update existing tests that assumed `quote` falls back to `def` or `name`.
+Add tests (in `test/termline.test.js` and/or the existing test files) for:
+
+1. `parseTermline` / `formatTermline` round-trip, a sentence with two terms,
+   unmatched `[[`, a term with no def, sanitise.
+2. `renderTermline` returns a single `p` whose children include the prose
+   and two Tip/chips in order, not a stack of block wrappers. Click on a
+   chip still sets `$selectedTerm` and reveals the glossary pane.
+3. `recordUse` with the same `source` (and a streaming prefix of that
+   source) does not grow `usesFor`. A missing `source` still adds a new
+   use. Quote comes from `surrounding`, not `def`.
+4. `renderTerm` with `streaming: true` does not record a use; a later
+   `streaming: false` render records one; a third render does not add
+   another.
+5. The Concepts pane shows the surrounding sentence under First use / Uses,
+   not the definition, and only once. When quote is null, those lines are
+   absent.
+6. The Concepts pane contains the Providers section (labels, Switch, Up,
+   Down) even when no term is selected. The standalone providers pane is
+   still registered. Two palette commands exist; the settings one reveals
+   the glossary pane (and providers when revealPane is present).
+
+`npm test` must stay all-green (existing suites included).
+
+### Files for task 5 (only these)
+
+- src/termline.js          (new)
+- src/providers.js         (modify)
+- src/plugin-factory.js    (modify)
+- test/termline.test.js    (new)
+- test/providers.test.js   (modify)
+- test/plugin-factory.test.js (modify)
+
+Do not modify skill, Python, docs, desktop/plugin.js, package.json, SPEC.md,
+or README in this task. Those follow in a later task after this one is green.
