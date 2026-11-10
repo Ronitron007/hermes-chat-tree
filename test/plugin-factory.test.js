@@ -333,6 +333,78 @@ test('inline disabled: tooltip and click ignore the inline def; enabled still sh
   assert.ok(hasText(on.props.label, 'Inline directive'));
 });
 
+test('renderTerm re-render after Inline is disabled drops the inline tooltip; click never yields inline', async () => {
+  const INLINE = 'Only an inline meaning';
+  const registry = createDefaultRegistry();
+  registry.setDisabled(['llm']);
+  const { plugin, directive } = setup({ registry });
+  const attrs = { name: 'zzz-unknown-term', def: INLINE };
+  // Streaming renders record nothing, so the session store cannot echo the inline def later.
+  const before = render(directive, attrs, { streaming: true });
+  assert.ok(hasText(before.props.label, INLINE));
+  assert.ok(hasText(before.props.label, 'Inline directive'));
+
+  registry.setDisabled(['inline', 'coined', 'llm']);
+  const after = render(directive, attrs, { streaming: true });
+  assert.ok(!hasText(after.props.label, INLINE));
+  assert.ok(!hasText(after.props.label, 'Inline directive'));
+
+  after.props.children.props.onClick();
+  await tick();
+  assert.notEqual(plugin.$selectedTerm.get().definition?.providerId, 'inline');
+});
+
+test('renderTermline re-render after Inline is disabled drops the inline tooltip; click never yields inline', async () => {
+  const INLINE = 'Only an inline meaning';
+  const registry = createDefaultRegistry();
+  registry.setDisabled(['llm']);
+  const { plugin, termline } = setup({ registry });
+  const attrs = { v: 'A zzz-unknown-term here.', t: `zzz-unknown-term=${INLINE}` };
+  const draw = () => termline.data.render({ attrs, source: '::termline', streaming: true, sessionId: 's1' });
+  const chipOf = (tree) => tree.props.children.find((k) => k.type === Tip);
+  const before = chipOf(draw());
+  assert.ok(hasText(before.props.label, INLINE));
+  assert.ok(hasText(before.props.label, 'Inline directive'));
+
+  registry.setDisabled(['inline', 'coined', 'llm']);
+  const after = chipOf(draw());
+  assert.ok(!hasText(after.props.label, INLINE));
+  assert.ok(!hasText(after.props.label, 'Inline directive'));
+
+  after.props.children.props.onClick();
+  await tick();
+  assert.notEqual(plugin.$selectedTerm.get().definition?.providerId, 'inline');
+});
+
+test('renderTerm and renderTermline subscribe to $prefsTick before anything else', () => {
+  const seen = [];
+  const plugin = createPlugin({
+    host: {}, jsx: el, jsxs: el, atom, useValue: (s) => { seen.push(s); return s.get(); },
+    Tip, Button, ScrollArea, EmptyState, Badge, Switch, Separator,
+    registry: createDefaultRegistry(), fetch: offline,
+  });
+  plugin.renderTerm({ attrs: { name: 'monoid' }, source: '::term', streaming: true });
+  assert.deepEqual(seen, [plugin.$prefsTick]);
+  plugin.renderTerm({ source: '::term', streaming: true });
+  assert.equal(seen.length, 2);
+  plugin.renderTermline({ attrs: { v: 'A [[monoid|combines values]] here.' }, source: 's', streaming: true });
+  assert.equal(seen.length, 3);
+  assert.equal(seen[2], plugin.$prefsTick);
+  plugin.renderTermline({ source: 's', streaming: true });
+  assert.equal(seen.length, 4);
+  assert.ok(seen.every((s) => s === plugin.$prefsTick));
+});
+
+test('termline root keeps display block and the host paragraph gap; a lone ::term chip has no block margin', () => {
+  const { termline, directive } = setup({ registry: createDefaultRegistry() });
+  const tree = renderLine(termline, SENTENCE);
+  assert.equal(tree.props.style.display, 'block');
+  assert.equal(tree.props.style.marginBlock, 'var(--paragraph-gap) 0');
+  const chip = render(directive, { name: 'monoid' }).props.children;
+  assert.equal(chip.props.style?.marginBlock, undefined);
+  assert.equal(chip.props.style?.display === 'block', false);
+});
+
 test('pane: Providers section is present with and without a selected term', () => {
   const storage = memoryStorage();
   const registry = createDefaultRegistry();
@@ -393,7 +465,7 @@ test('renderTermline: one block span with prose and two inline chips in order', 
   const { plugin, termline } = setup({ host: { revealPane: (id) => calls.push(id) }, registry });
   const tree = renderLine(termline, SENTENCE);
   assert.equal(tree.type, 'span');
-  assert.deepEqual(tree.props.style, { display: 'block' });
+  assert.deepEqual(tree.props.style, { display: 'block', marginBlock: 'var(--paragraph-gap) 0' });
   const kids = tree.props.children;
   assert.deepEqual(kids.map((k) => (typeof k === 'string' ? k : k.type === Tip ? `<${k.props.children.props.children}>` : '?')),
     ['A ', '<monoid>', ' lets you fold, and a ', '<functor>', ' maps over it.']);

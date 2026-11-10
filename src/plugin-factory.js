@@ -134,6 +134,7 @@ export function createPlugin(deps) {
   // (markdown-text.tsx, MarkdownParagraph), so the chip lands in its own block.
   // Whole sentences go through `termline` instead.
   function renderTerm({ attrs, source, streaming, sessionId } = {}) {
+    useValue($prefsTick);
     const name = str(attrs?.name);
     if (!name) return jsx('span', { children: source });
     const def = str(attrs?.def);
@@ -143,6 +144,7 @@ export function createPlugin(deps) {
   }
 
   function renderTermline({ attrs, source, streaming, sessionId } = {}) {
+    useValue($prefsTick);
     const parsed = materializeInline(attrs);
     if (!parsed.nodes.length) return jsx('span', { children: source });
     const sid = sessionId ?? null;
@@ -172,8 +174,13 @@ export function createPlugin(deps) {
         return jsxs('a', { href: node.href, target: '_blank', rel: 'noreferrer noopener', children }, `s${key}`);
       });
     const children = build(parsed.nodes, '');
-    // Not a <p>: the host already gives a solo directive its own block.
-    return jsxs('span', { className: PARAGRAPH_CLASS, style: { display: 'block' }, children });
+    // Not a <p>: the host already gives a solo directive its own block, but
+    // only host <p> elements get the paragraph gap, so mirror it here.
+    return jsxs('span', {
+      className: PARAGRAPH_CLASS,
+      style: { display: 'block', marginBlock: 'var(--paragraph-gap) 0' },
+      children,
+    });
   }
 
   // Rows for the provider list. Shared by the Concepts pane and the standalone
