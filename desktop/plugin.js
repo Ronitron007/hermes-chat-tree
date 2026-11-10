@@ -947,9 +947,11 @@ const textOf = (nodes) =>
   nodes.map((n) => (n.kind === 'text' ? n.text : n.kind === 'term' ? n.name : textOf(n.children))).join('');
 
 // Replaces the first text leaf (document order) that `split` can break up.
+// Code spans are verbatim, so a name inside one is never chipped.
 function mapFirstLeaf(nodes, split) {
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
+    if (n.kind === 'code') continue;
     if (n.kind === 'text') {
       const parts = split(n.text);
       if (parts) return [...nodes.slice(0, i), ...parts, ...nodes.slice(i + 1)];

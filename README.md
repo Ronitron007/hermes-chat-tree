@@ -52,6 +52,8 @@ A **docs / codebase index** provider was ruled out. The Hermes plugin SDK has no
 
 The Python annotator chips first mentions from the bundled glossary (case-insensitive, with simple plural/inflection stemming so `Monads` hits `monad`), then also looks up a small set of other candidates (bold phrases — including at the start of a paragraph — mid-sentence capitalised noun phrases, and technical tokens such as camelCase) through the same MDN → Wiktionary → Wikipedia helpers the dashboard proxy uses (`lookup_sources.py`). Multiword bold phrases such as `CSS Flexbox` try the full phrase, then the head noun, then known sub-terms, and the chip covers the visible phrase. Lookups share a 1.5s budget and a small process-wide cache, and cap at 8 terms per turn. A definition is never invented: a miss is omitted, or tagged with an empty def so the UI coined fallback can run (bold and technical candidates only).
 
+Each turn also writes one diagnostic line to the Hermes log (`hermes_plugins.concept_links`): candidate/resolved counts and skip reasons per paragraph.
+
 The hook is `transform_llm_output` without `hold_stream`, so a reply can appear as plain text for a short time and then be replaced by the tagged `::termline` version. That delay is annotation timing, not a chip re-render flash.
 
 Details, costs, and risks are in [`docs/providers.md`](docs/providers.md). The full design notes are in [`SPEC.md`](SPEC.md).
@@ -89,8 +91,8 @@ Rebuild the UI plugin after editing `src/` with `npm run assemble` (writes `desk
 ## Tests
 
 ```bash
-npm test                         # 111 tests (Node built-in test runner, no extra dependencies)
-python3 test/test_annotator.py   # 42 tests
+npm test                         # 115 tests (Node built-in test runner, no extra dependencies)
+python3 test/test_annotator.py   # 52 tests
 python3 test/test_lookup_sources.py  # 22 tests
 ```
 
@@ -99,7 +101,7 @@ The earlier feasibility spike lives under [`spike/`](spike/) (`feasibility.md`, 
 ## Known gaps
 
 - Mid-sentence `::term{...}` still splits a Desktop paragraph into separate blocks. New annotation emits a whole-paragraph `::termline` instead, and the annotator rewrites leftover mid-sentence `::term` into `::termline` when it can. The skill tells the model not to emit mid-sentence `::term`.
-- The annotator leaves headings, lists, tables, fenced code, and any paragraph that contains inline backticks or `[[` unmarked.
+- The annotator leaves headings, lists, tables, block quotes, fenced code, and paragraphs that contain `[[` unmarked. Ordinary prose with inline code, links, emphasis, quotes, em-dashes, and emails is annotated; terms that appear only inside inline code are not chipped. Lists are left unmarked so list markdown is not rewritten.
 - Hover tooltips use only synchronous providers (inline, session, static). MDN, Wiktionary, Wikipedia, and coined resolve asynchronously on click and then upgrade the Concepts pane.
 - The LLM provider is implemented but turned off (`POST /define` returns 501).
 - Paragraphs over 4800 characters, or whose directive body would exceed 2048 characters, are left unmarked (host limits). `{`, `}`, and raw newlines cannot appear in `v` or `t`. Attribute quoting is limited (double quotes inside the sentence force single-quoted attrs, or are stripped).
@@ -109,7 +111,7 @@ The earlier feasibility spike lives under [`spike/`](spike/) (`feasibility.md`, 
 ## Layout
 
 - `src/` — provider chain, cache, termline parser (including inline markdown), and plugin factory
-- `test/` — Node tests plus `test_annotator.py` and `test_lookup_sources.py`
+- `test/` — Node tests plus `test_annotator.py`, `test_lookup_sources.py`, and `fixtures/real-replies/` (captured live Desktop replies)
 - `desktop/plugin.js` — assembled disk plugin
 - `scripts/assemble.mjs` — builds `desktop/plugin.js` from `src/`
 - `skills/concept-links/SKILL.md` — instructs the assistant to emit `::termline`
