@@ -64,8 +64,10 @@ disabled set, so enabling `llm` there is possible but has no effect while
   directive, so the annotator and the skill avoid them.
 - **Other surfaces.** The CLI, TUI and messaging platforms do not render the
   directive. Users there see the raw `::term{...}` text.
-- **Docs versus source.** Mid-prose documentation can disagree with the live
-  source. Treat a definition as a reading aid, not as the authority.
+- **Docs versus source.** The official SDK docs still say a transcript directive
+  must be an entire paragraph, but the installed Desktop source and its tests
+  allow `::term` in the middle of a sentence. Confirm that on a live Desktop
+  session. Treat a definition as a reading aid, not as the authority.
 - **Who makes inline links appear.** A desktop plugin cannot rewrite unmarked
   chat. Links appear because the skill makes the assistant emit `::term`
   directives. The Python hook is the automatic layer on top, for the bundled
