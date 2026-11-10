@@ -40,33 +40,41 @@ GLOSSARY = [
 MAX_PARAGRAPH = 4800  # the host drops directives in longer paragraphs
 MAX_BODY = 2048  # cap on the directive attribute body
 MAX_TERMS = 8
-# Characters that would break the directive attribute body.
-_UNSAFE = re.compile(r'["{}\\\r\n]')
-# `t` is "name=def;;name=def": names cannot hold `=`, and neither part can hold `;;`.
-_PAIR_SEP = ";;"
+# The host has no escape inside quoted attrs, and `{`/`}` would end the body early.
+_BODY_UNSAFE = re.compile(r"[{}\\\r\n]")
+_BRACES = re.compile(r"[{}]")
 # Paragraphs that open with block markdown (lists, headings, quotes, tables) are not plain prose.
 _BLOCK = re.compile(r"^\s*(#|[-*+]\s|>|\||\d+[.)]\s)")
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
-_EXISTING = re.compile(r"::\w+\{[^}\n]*\}")
-_NAME = re.compile(r'name="([^"]*)"')
+_TERM = re.compile(r"::term\{([^}\n]*)\}")
+_TERMLINE = re.compile(r"^\s*::termline\{[^}\n]*\}\s*$")
+_ANY_DIRECTIVE = re.compile(r"::\w+\{")
+_ATTR = re.compile(r"""(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+_T_ATTR = re.compile(r"""\bt\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+_T_ESCAPE = re.compile(r"([\\;=])")
 
 
-def _safe(s):
-    return bool(s) and not _UNSAFE.search(s)
+def _key(s):
+    return " ".join(s.split()).lower()
+
+
+def _esc(s):
+    """Escape a `t` part so a name or definition may contain `\\`, `;` and `=`."""
+    return _T_ESCAPE.sub(r"\\\1", s)
 
 
 def _build(glossary):
     defs = {}
     for term, definition in glossary:
-        term, definition = " ".join(term.split()), " ".join(definition.split())
-        if _safe(term) and _safe(definition) and "=" not in term and _PAIR_SEP not in term + definition:
+        term, definition = " ".join(term.split()), " ".join(_BRACES.sub("", definition).split())
+        if term and not _BODY_UNSAFE.search(term):
             defs.setdefault(term.lower(), (term, definition))
     names = sorted(defs, key=len, reverse=True)
     if not names:
         return defs, None
     alts = "|".join(re.escape(n).replace(r"\ ", r"\s+") for n in names)
     # Whitespace-or-start before, so "(monoid)" or '"monoid"' is left alone.
-    pattern = r"(?P<skip>(`+)[^`]*?\2(?!`)|::\w+\{[^}\n]*\})|(?<!\S)(?P<term>" + alts + r")(?![\w-])"
+    pattern = r"(?<!\S)(?P<term>" + alts + r")(?![\w-])"
     return defs, re.compile(pattern, re.IGNORECASE)
 
 
@@ -101,33 +109,42 @@ def _paragraphs(text):
 
 
 def annotate_terms(text, glossary=None):
-    """Rewrite each prose paragraph that mentions glossary terms as one ::termline.
+    """Rewrite each prose paragraph that has linked terms as one ::termline.
 
-    The plain sentence goes in v and the first-mentioned terms in t as
-    "name=def;;name=def". Returns the new text, or None when nothing changed.
+    Linked terms are mid-sentence ::term directives (stripped back to the plain
+    word) and first mentions of glossary terms. The plain sentence goes in v and
+    the terms in t as "name=def;;name=def". Returns the new text, or None when
+    nothing changed.
     """
     try:
         if not isinstance(text, str) or not text:
             return None
         defs, pattern = _build(GLOSSARY if glossary is None else glossary)
-        if pattern is None:
-            return None
         seen = set()
-        for m in _EXISTING.finditer(text):
-            n = _NAME.search(m.group(0))
-            if n:
-                seen.add(" ".join(n.group(1).split()).lower())
-
         parts, changed = [], False
         for prose, chunk in _paragraphs(text):
             if prose and len(chunk) <= MAX_PARAGRAPH:
-                new = _termline(chunk, defs, pattern, seen)
-                if new is not None:
-                    changed, chunk = True, new
+                if _TERMLINE.match(chunk):
+                    _note_termline(chunk, seen)
+                else:
+                    new = _termline(chunk, defs, pattern, seen)
+                    if new is not None:
+                        changed, chunk = True, new
             parts.append(chunk)
         return "".join(parts) if changed else None
     except Exception:
         return None
+
+
+def _note_termline(chunk, seen):
+    """Count terms already carried by an existing ::termline as used."""
+    m = _T_ATTR.search(chunk)
+    if not m:
+        return
+    for pair in (m.group(1) or m.group(2) or "").split(";;"):
+        name = pair.split("=", 1)[0]
+        if name.strip():
+            seen.add(_key(name))
 
 
 def _termline(chunk, defs, pattern, seen):
@@ -137,30 +154,59 @@ def _termline(chunk, defs, pattern, seen):
     """
     body = chunk.rstrip("\r\n")
     tail = chunk[len(body):]
-    sentence = " ".join(body.split())
-    if not sentence or _BLOCK.match(body) or "`" in sentence or "::" in sentence or "[[" in sentence or "]]" in sentence or _UNSAFE.search(sentence):
+    raw = " ".join(body.split())
+    if not raw or _BLOCK.match(body) or "`" in raw or "[[" in raw or "]]" in raw:
         return None
-    pending = set(seen)
-    used = []
 
-    def sub(m):
-        if len(pending) >= MAX_TERMS:
-            return m.group(0)
-        key = " ".join(m.group("term").split()).lower()
-        if key in pending:
-            return m.group(0)
+    plain, cands, last, size = [], [], 0, 0
+    for m in _TERM.finditer(raw):
+        attrs = {k: a or b for k, a, b in _ATTR.findall(m.group(1))}
+        name = " ".join((attrs.get("name") or "").split())
+        if not name:
+            return None
+        lead = raw[last:m.start()]
+        plain.append(lead)
+        size += len(lead)
+        cands.append((size, _key(name), name, " ".join(_BRACES.sub("", attrs.get("def") or "").split())))
+        plain.append(name)
+        size += len(name)
+        last = m.end()
+    plain.append(raw[last:])
+    sentence = "".join(plain)
+    if _ANY_DIRECTIVE.search(sentence) or _BODY_UNSAFE.search(sentence):
+        return None
+    explicit = {c[1] for c in cands}
+    has_term = bool(cands)
+    if pattern is not None:
+        for m in pattern.finditer(sentence):
+            key = _key(m.group("term"))
+            if key not in explicit:
+                cands.append((m.start(), key) + defs[key])
+    if not cands:
+        return None
+
+    pending, used = set(seen), []
+    for _, key, name, definition in sorted(cands, key=lambda c: c[0]):
+        if len(pending) >= MAX_TERMS or key in pending:
+            continue
         pending.add(key)
-        used.append(key)
-        return m.group(0)
-
-    pattern.sub(sub, sentence)
-    if not used:
+        used.append((key, name, definition))
+    if not used and not has_term:
         return None
-    pairs = ";;".join("%s=%s" % defs[key] for key in used)
-    directive = '::termline{v="%s" t="%s"}' % (sentence, pairs)
+
+    pairs = ";;".join("%s=%s" % (_esc(name), _esc(definition)) for _, name, definition in used)
+    v, t, quote = sentence, pairs, '"'
+    if '"' in v + t:
+        if "'" in v + t:
+            v, t = v.replace('"', ""), t.replace('"', "")
+        else:
+            quote = "'"
+    if not v.strip():
+        return None
+    directive = "::termline{v=%s%s%s t=%s%s%s}" % (quote, v, quote, quote, t, quote)
     if len(directive) - len("::termline{}") > MAX_BODY:
         return None
-    seen.update(used)
+    seen.update(key for key, _, _ in used)
     return directive + tail
 
 

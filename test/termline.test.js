@@ -9,6 +9,8 @@ import {
   sanitizeTermlinePart,
   unescapeTermlineValue,
   parseTermList,
+  escapeTermListPart,
+  unescapeTermListPart,
   materializeTermline,
 } from '../src/termline.js';
 
@@ -125,4 +127,35 @@ test('materialize: legacy markers win, no value gives no pieces', () => {
   assert.equal(legacy.sentence, 'A monoid works');
   assert.deepEqual(materializeTermline({ t: 'a=b' }), { pieces: [], sentence: '' });
   assert.deepEqual(materializeTermline(null), { pieces: [], sentence: '' });
+});
+
+test('termList escapes: round-trip names and defs holding \\, ; and =', () => {
+  assert.equal(escapeTermListPart('a=b;c\\d'), 'a\\=b\\;c\\\\d');
+  assert.equal(unescapeTermListPart(escapeTermListPart('a=b;c\\d;;')), 'a=b;c\\d;;');
+  const t = [
+    ['x=y', 'maps a=b; then c;;d'],
+    ['f', 'path C:\\dir'],
+  ]
+    .map(([n, d]) => `${escapeTermListPart(n)}=${escapeTermListPart(d)}`)
+    .join(';;');
+  assert.deepEqual(parseTermList(t), [
+    { name: 'x=y', def: 'maps a=b; then c;;d' },
+    { name: 'f', def: 'path C:\\dir' },
+  ]);
+});
+
+test('parseTermList: an escaped ;; does not split and unescaped t still parses', () => {
+  assert.deepEqual(parseTermList('a=one\\;\\;two;;b=three'), [
+    { name: 'a', def: 'one;;two' },
+    { name: 'b', def: 'three' },
+  ]);
+  assert.deepEqual(parseTermList('monoid=def;;functor=def'), [
+    { name: 'monoid', def: 'def' },
+    { name: 'functor', def: 'def' },
+  ]);
+});
+
+test('materialize: a def with = and ; reaches the chip intact', () => {
+  const out = materializeTermline({ v: 'A monoid works.', t: 'monoid=x\\=y\\; z' });
+  assert.deepEqual(out.pieces[1], { kind: 'term', name: 'monoid', def: 'x=y; z' });
 });

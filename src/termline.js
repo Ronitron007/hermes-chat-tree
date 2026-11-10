@@ -65,15 +65,44 @@ function scanMarkers(input) {
   return { pieces, sentence };
 }
 
-// "monoid=def;;functor=def" -> [{ name, def }]. Splits on the first `=` per pair.
+// `t` parts escape `\`, `;` and `=` with a backslash so a name or definition may hold them.
+export function escapeTermListPart(s) {
+  return String(s ?? '').replace(/[\\;=]/g, '\\$&');
+}
+
+// Also removes the host's markdown backslashes (`\[`), which can reach a part unremoved.
+export function unescapeTermListPart(s) {
+  return typeof s === 'string' ? s.replace(/\\([\\;=`*_~[\]<>$&])/g, '$1') : '';
+}
+
+// "monoid=def;;functor=def" -> [{ name, def }]. Splits on unescaped `;;`, then on the
+// first unescaped `=` per pair, then unescapes each part.
 export function parseTermList(t) {
   const out = [];
-  for (const pair of unescapeTermlineValue(t).split(TERM_PAIR_SEP)) {
-    const eq = pair.indexOf('=');
-    const name = (eq === -1 ? pair : pair.slice(0, eq)).trim();
-    if (name === '') continue;
-    out.push({ name, def: eq === -1 ? '' : pair.slice(eq + 1).trim() });
+  const input = typeof t === 'string' ? t : '';
+  let name = null;
+  let cur = '';
+  const finish = () => {
+    const n = unescapeTermListPart(name ?? cur).trim();
+    if (n !== '') out.push({ name: n, def: name === null ? '' : unescapeTermListPart(cur).trim() });
+    name = null;
+    cur = '';
+  };
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (ch === '\\' && i + 1 < input.length) {
+      cur += ch + input[++i];
+    } else if (ch === ';' && input[i + 1] === ';') {
+      finish();
+      i++;
+    } else if (ch === '=' && name === null) {
+      name = cur;
+      cur = '';
+    } else {
+      cur += ch;
+    }
   }
+  finish();
   return out;
 }
 

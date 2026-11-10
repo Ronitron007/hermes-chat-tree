@@ -13,10 +13,11 @@ When you explain something technical, tag specialised terms so Hermes Desktop
 can turn each one into a dotted link with a hover definition and an entry in
 the Concepts pane.
 
-In Hermes Desktop, a mid-sentence `::term{name= def=}` is lifted out of the
-sentence and shown as a separate block, which breaks the sentence apart. To
-keep the sentence together, make the **entire paragraph** a single `::termline`
-directive. Put no prose before or after it on that paragraph.
+Emit **only** paragraph-level `::termline{v= t=}` directives. Never write a
+mid-sentence `::term{name= def=}`: on Hermes Desktop an inline `::term` splits
+the sentence into separate blocks (`A` / `monoid` / `lets you fold...`). Make
+the **entire paragraph** a single `::termline` directive. Put no prose before
+or after it on that paragraph.
 
 Use this form: `v` is the plain sentence and `t` lists the terms as
 `name=def` pairs separated by `;;`.
@@ -50,6 +51,7 @@ backslashes.
 - If you coined or introduced a term in this conversation, still tag the first
   mention. Prefer a short gloss of how you used it, not a made-up formal
   definition.
-- Do not use mid-sentence `::term{name= def=}` in Desktop replies. That form
-  is only a fallback the plugin still understands for old chats, and it breaks
-  the sentence into blocks.
+- Never use mid-sentence `::term{name= def=}` in replies. The plugin only
+  understands it as a fallback for old chats, and it breaks the sentence into
+  blocks on Desktop. The plugin's annotator rewrites any it finds into a
+  `::termline`, but do not rely on that.
