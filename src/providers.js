@@ -65,9 +65,11 @@ export function createRegistry(options = {}) {
       const named = [];
       for (const id of Array.isArray(ids) ? ids : []) if (!named.includes(id)) named.push(id);
       order = named.concat(order.filter((id) => !named.includes(id)));
+      cache.clear();
     },
     setDisabled(ids) {
       disabled = new Set((Array.isArray(ids) ? ids : []).filter(known));
+      for (const [key, entry] of cache) if (disabled.has(entry.def.providerId)) cache.delete(key);
     },
     isDisabled(id) {
       return disabled.has(id);
@@ -134,7 +136,7 @@ export function createRegistry(options = {}) {
     async lookup(term, ctx) {
       const key = termKey(term, ctx?.sessionId);
       const hit = cache.get(key);
-      if (hit) return hit.def;
+      if (hit && !disabled.has(hit.def.providerId)) return hit.def;
       const full = { ...ctx, registry };
       for (const provider of enabledChain()) {
         let out = attempt(provider, term, full);
@@ -160,7 +162,8 @@ export function createRegistry(options = {}) {
       for (const [key, entry] of cache) if (entry.session === session) cache.delete(key);
     },
     peekCache(term, sessionId) {
-      return cache.get(termKey(term, sessionId))?.def ?? null;
+      const def = cache.get(termKey(term, sessionId))?.def ?? null;
+      return def && !disabled.has(def.providerId) ? def : null;
     },
   };
 

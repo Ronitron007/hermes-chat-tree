@@ -85,11 +85,15 @@ export function createPlugin(deps) {
     $prefsTick.set(++tick);
   }
 
+  // The session provider replays recorded defs, so a disabled inline provider
+  // must not leak its attribute def into the session store.
+  const recordedDef = (def) => (def && !registry.isDisabled('inline') ? def : undefined);
+
   function makeChip({ name, def, sid, source, attrs, key }) {
     const lookupCtx = { sessionId: sid, attrs, source, userGlossary, fetch: fetchFn, rest };
     const sync = registry.lookupSync(name, lookupCtx);
 
-    const text = sync?.short || def || NO_DEF;
+    const text = sync?.short || NO_DEF;
     const label = jsxs('div', {
       children: [
         jsx('span', { children: text }),
@@ -130,7 +134,7 @@ export function createPlugin(deps) {
     if (!name) return jsx('span', { children: source });
     const def = str(attrs?.def);
     const sid = sessionId ?? null;
-    if (!streaming) registry.recordUse({ name, def: def || undefined, sessionId: sid, source, attrs });
+    if (!streaming) registry.recordUse({ name, def: recordedDef(def), sessionId: sid, source, attrs });
     return makeChip({ name, def, sid, source, attrs });
   }
 
@@ -145,7 +149,7 @@ export function createPlugin(deps) {
       if (!streaming) {
         registry.recordUse({
           name,
-          def: def || undefined,
+          def: recordedDef(def),
           sessionId: sid,
           source,
           attrs: termAttrs,
@@ -249,7 +253,8 @@ export function createPlugin(deps) {
     const fromDefinition = definition?.firstUse?.quote;
     const first =
       quotes[0] ?? (hasQuote(fromDefinition) && !defTexts.includes(fromDefinition.trim()) ? fromDefinition : null);
-    const uniqueQuotes = [...new Set(quotes)];
+    const firstText = first ? first.trim() : null;
+    const laterQuotes = [...new Set(quotes.map((q) => q.trim()))].filter((q) => q !== firstText);
     const kind = definition?.kind;
     return wrap(
       [
@@ -261,13 +266,13 @@ export function createPlugin(deps) {
           ? jsx('p', { className: 'text-xs opacity-70', children: `Provider: ${definition.providerId}` })
           : null,
         first ? jsx('p', { className: 'text-sm', children: `First use in this session: ${first}` }) : null,
-        uniqueQuotes.length
+        laterQuotes.length
           ? jsxs('div', {
               children: [
                 jsx('h3', { className: 'text-sm font-semibold', children: 'Uses in this session' }),
                 jsx('ul', {
                   className: 'text-sm',
-                  children: uniqueQuotes.map((q, i) => jsx('li', { children: q }, i)),
+                  children: laterQuotes.map((q, i) => jsx('li', { children: q }, i)),
                 }),
               ],
             })

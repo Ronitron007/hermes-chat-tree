@@ -285,3 +285,28 @@ test('throwing canResolve / resolve never breaks lookup', async () => {
   assert.equal(await r.lookup('unknown term', { sessionId: 's' }), null);
   assert.equal(r.lookupSync('unknown term', {}), null);
 });
+
+test('lookup never returns a cached def from a provider that is now disabled', async () => {
+  const r = fullRegistry();
+  r.setDisabled([]);
+  const ctx = { sessionId: 's1', attrs: { name: 'zzz', def: 'Inline meaning' } };
+  const first = await r.lookup('zzz', ctx);
+  assert.equal(first.providerId, 'inline');
+  assert.equal(r.peekCache('zzz', 's1').providerId, 'inline');
+
+  r.setDisabled(['inline']);
+  assert.equal(r.peekCache('zzz', 's1'), null);
+  assert.equal(await r.lookup('zzz', ctx), null);
+
+  r.setDisabled([]);
+  assert.equal((await r.lookup('zzz', ctx)).providerId, 'inline');
+});
+
+test('setOrder drops cached defs so the new order decides', async () => {
+  const r = createRegistry();
+  r.register(fake('a', { result: def('from a') }));
+  r.register(fake('b', { result: def('from b') }));
+  assert.equal((await r.lookup('x', { sessionId: 's' })).short, 'from a');
+  r.setOrder(['b', 'a']);
+  assert.equal((await r.lookup('x', { sessionId: 's' })).short, 'from b');
+});

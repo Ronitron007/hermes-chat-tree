@@ -256,7 +256,8 @@ test('pane: empty state, then name, long text, source, provider, uses and Clear'
   assert.ok(hasText(tree, 'Some Source'));
   assert.ok(hasText(tree, 'prov'));
   assert.ok(hasText(tree, 'First use in this session: A widget is handy.'));
-  assert.equal(walk(tree).filter((n) => n?.type === 'li').length, 1);
+  assert.ok(!hasText(tree, 'Uses in this session'));
+  assert.equal(walk(tree).filter((n) => n?.type === 'li').length, 0);
   assert.equal(findAll(tree, Badge).length, 0);
 
   buttonNamed(tree, 'Clear').props.onClick();
@@ -279,19 +280,57 @@ test('pane: shows the sentence once, never the definition, and nothing when the 
   assert.equal(walk(tree).filter((n) => n?.type === 'li').length, 0);
   assert.equal(texts(tree).filter((t) => t.includes('A small gadget')).length, 1);
 
-  // termline settled render three times: the sentence shows once under each heading.
+  // termline settled render three times: the sentence shows once, under First use only.
   for (let i = 0; i < 3; i++) renderLine(termline, 'A [[gizmo|A small gadget]] helps.');
   select('gizmo', { ...defn, firstUse: { quote: 'A small gadget', sessionId: 's1' } });
   tree = pane.render();
   assert.equal(plugin.registry.usesFor('gizmo', 's1').length, 1);
   assert.equal(texts(tree).filter((t) => t.includes('First use in this session: A gizmo helps.')).length, 1);
-  assert.equal(walk(tree).filter((n) => n?.type === 'li').length, 1);
+  assert.equal(texts(tree).filter((t) => t.includes('A gizmo helps.')).length, 1);
+  assert.ok(!hasText(tree, 'Uses in this session'));
+  assert.equal(walk(tree).filter((n) => n?.type === 'li').length, 0);
 
   // A stored definition.firstUse.quote equal to the definition text is not shown.
   select('unseen', defn);
   assert.ok(!hasText(pane.render(), 'First use'));
   select('unseen', { ...defn, firstUse: { quote: 'It was said here.', sessionId: 's1' } });
   assert.ok(hasText(pane.render(), 'First use in this session: It was said here.'));
+});
+
+test('pane: later different sentences are listed under Uses, not the first use', () => {
+  const { plugin, termline, pane } = setup();
+  renderLine(termline, 'A [[widget|A small gadget]] is handy.', { source: '::termline{v="one"}' });
+  renderLine(termline, 'Another [[widget|A small gadget]] was used later.', { source: '::termline{v="two"}' });
+  plugin.$selectedTerm.set({ name: 'widget', sessionId: 's1', definition: { short: 's', long: 's', firstUse: null } });
+  const tree = pane.render();
+  assert.ok(hasText(tree, 'First use in this session: A widget is handy.'));
+  assert.ok(hasText(tree, 'Uses in this session'));
+  const items = walk(tree).filter((n) => n?.type === 'li');
+  assert.equal(items.length, 1);
+  assert.equal(items[0].props.children, 'Another widget was used later.');
+  assert.equal(texts(tree).filter((t) => t.includes('A widget is handy.')).length, 1);
+});
+
+test('inline disabled: tooltip and click ignore the inline def; enabled still shows it', async () => {
+  const INLINE = 'Only an inline meaning';
+  const registry = createDefaultRegistry();
+  registry.setDisabled(['inline', 'coined', 'llm']);
+  const { plugin, directive } = setup({ registry });
+  const tip = render(directive, { name: 'zzz-unknown-term', def: INLINE });
+  assert.ok(!hasText(tip.props.label, INLINE));
+  assert.ok(hasText(tip.props.label, 'No definition yet'));
+
+  tip.props.children.props.onClick();
+  assert.equal(plugin.$selectedTerm.get().definition, null);
+  await tick();
+  assert.notEqual(plugin.$selectedTerm.get().definition?.providerId, 'inline');
+  assert.ok(!JSON.stringify(plugin.$selectedTerm.get().definition ?? {}).includes(INLINE));
+  assert.equal(registry.peekCache('zzz-unknown-term', 's1'), null);
+
+  registry.setDisabled(['llm']);
+  const on = render(directive, { name: 'zzz-unknown-term', def: INLINE });
+  assert.ok(hasText(on.props.label, INLINE));
+  assert.ok(hasText(on.props.label, 'Inline directive'));
 });
 
 test('pane: Providers section is present with and without a selected term', () => {
