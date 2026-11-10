@@ -252,7 +252,9 @@ export function createPlugin(deps) {
           className: 'flex flex-col gap-2',
           children: [
             jsx('h3', { className: 'text-sm font-semibold', children: 'Sample' }),
-            renderTermline({
+            // An element, not a call: renderTermline's hook must not join this
+            // pane's hooks, or the count changes when a term gets selected.
+            jsx(renderTermline, {
               attrs: SAMPLE_TERMLINE,
               source: '::termline',
               streaming: true,
