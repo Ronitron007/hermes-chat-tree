@@ -14,7 +14,7 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
 
 - A branch can use a cheaper model for a side question.
 
-- **Branch names and a Branches mode.** Each branch starts with a name row at its fork: the Hermes title of the chat and its model. The `Exchanges | Branches` switch beside the refresh icon shows one row for each chat instead, with its number of exchanges and a `merged` mark. Double-click a branch name, in either view, to rename the chat. Enter saves the new name and Escape cancels. Hermes renames the chat with `session.title`.
+- **Branch names and a Branches mode.** Each branch starts with a name row at its fork: the Hermes title of the chat and its model. The branch icon beside the refresh icon switches to the Branches view, which shows one row for each chat, with its number of exchanges and a `merged` mark. Double-click a branch name, in either view, to rename the chat. Enter saves the new name and Escape cancels. Hermes renames the chat with `session.title`.
 
 - **Row actions.** When you point to a row, up to three icons show: **Branch here** (the fork icon of Hermes), **Merge into**, and **Open in a tab**. **Merge into** opens a pick in two steps: the ancestor, then the mode, with the size and the fit check.
 

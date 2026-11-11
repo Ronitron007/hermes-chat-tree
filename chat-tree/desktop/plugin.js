@@ -25,6 +25,7 @@ const BranchIcon = sdk.icons?.GitForkIcon || sdk.icons?.GitFork
 // (the pane then draws the icon, uses the native title, or shows the pick under the graph).
 const TabIcon = sdk.icons?.ExternalLink
 const RefreshIcon = sdk.icons?.RefreshCwIcon || sdk.icons?.RefreshCw
+const ViewIcon = sdk.icons?.GitBranchIcon || sdk.icons?.GitBranch
 const Codicon = sdk.Codicon
 const Tip = sdk.Tip
 const Popover = sdk.Popover
@@ -1405,6 +1406,7 @@ function createChatTree(deps) {
   // icon, the native title.
   const MergeCodicon = deps.Codicon ?? null;
   const TabIcon = deps.TabIcon ?? null;
+  const ViewIcon = deps.ViewIcon ?? null;
   const RefreshIcon = deps.RefreshIcon ?? null;
   const Tip = deps.Tip ?? null;
   // The merge pick opens in Hermes's Popover at the row. Without it, the pick shows under the graph.
@@ -3260,31 +3262,37 @@ function createChatTree(deps) {
   // The last two are the in-memory UI and hover atoms. Render only reads state; loading happens on focus change
   // and on the timer, in register(); branching and merging happen in click handlers. Row builders
   // have no hooks.
-  // Exchanges | Branches: two segmented buttons, the pressed one in the accent.
+  // One toggle for the view: a branch icon, pressed (in the accent) in the Branches view. A click
+  // switches between Exchanges and Branches; the tooltip names the view and the next one.
   function modeToggle(mode) {
-    const button = (value, text, radius) =>
-      jsx(
-        'button',
-        {
-          type: 'button',
-          'aria-pressed': mode === value,
-          style: { ...MODE_BUTTON, borderRadius: radius, ...(value === BRANCHES_MODE ? { marginLeft: -1 } : {}), ...(mode === value ? MODE_ON : {}) },
-          'data-selectable-text': 'true',
-          'data-mode': value,
-          onClick: () => setMode(value),
-          children: text,
-        },
-        value,
-      );
-    return jsxs(
-      'div',
+    const branches = mode === BRANCHES_MODE;
+    const next = branches ? EXCHANGES_MODE : BRANCHES_MODE;
+    const label = branches ? 'Branches view. Click for exchanges.' : 'Exchanges view. Click for branches.';
+    const icon = ViewIcon
+      ? jsx(ViewIcon, { size: 14, 'aria-hidden': 'true' }, 'icon')
+      : jsxs('svg', {
+          viewBox: '0 0 24 24', width: 14, height: 14, fill: 'none', stroke: 'currentColor', strokeWidth: 2,
+          strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true',
+          children: [
+            jsx('circle', { cx: 7, cy: 18, r: 2 }, 'a'),
+            jsx('circle', { cx: 7, cy: 6, r: 2 }, 'b'),
+            jsx('circle', { cx: 17, cy: 6, r: 2 }, 'c'),
+            jsx('path', { d: 'M7 8v8M17 8a4 4 0 0 1 -4 4h-2a4 4 0 0 0 -4 4' }, 'd'),
+          ],
+        }, 'icon');
+    return jsx(
+      'button',
       {
-        role: 'group',
-        'aria-label': 'View',
-        style: { ...SELECTABLE, flex: '0 0 auto', display: 'inline-flex' },
+        type: 'button',
+        title: label,
+        'aria-label': label,
+        'aria-pressed': branches,
+        style: { ...MODE_BUTTON, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 24, height: 22, padding: 0, borderRadius: 4, ...(branches ? MODE_ON : {}) },
         'data-selectable-text': 'true',
         'data-mode-toggle': 'true',
-        children: [button(EXCHANGES_MODE, 'Exchanges', '4px 0 0 4px'), button(BRANCHES_MODE, 'Branches', '0 4px 4px 0')],
+        'data-mode': mode,
+        onClick: () => setMode(next),
+        children: icon,
       },
       'mode',
     );
@@ -3533,6 +3541,7 @@ const _plugin = createChatTree({
   BranchIcon,
   TabIcon,
   RefreshIcon,
+  ViewIcon,
   Codicon,
   Tip,
   Popover,
