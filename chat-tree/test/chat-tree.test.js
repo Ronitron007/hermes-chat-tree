@@ -3075,7 +3075,7 @@ test('collapse never takes a name row: a long child lane keeps it before its +N 
   assert.deepEqual(geo.paths.filter((p) => p.key.startsWith('lane:c')).map((p) => p.d), ['M 22 39 V 61', 'M 22 69 V 91', 'M 22 91 V 113']);
 });
 
-test('a name row: 12 px muted title with the fork icon and model; a click opens its first exchange in place', async () => {
+test('a name row: 14 px muted title with the fork icon and model; a click opens its first exchange in place', async () => {
   const ctx = setup();
   await flush();
   const tree = ctx.pane.render();
@@ -3083,7 +3083,7 @@ test('a name row: 12 px muted title with the fork icon and model; a click opens 
   const b1 = nameRows(tree).find((n) => n.props['data-name-row'] === 'b1');
   const label = byAttr(b1, 'data-label')[0];
   assert.equal(label.props.children, 'b1');
-  assert.equal(label.props.style.fontSize, 12);
+  assert.equal(label.props.style.fontSize, 14);
   assert.equal(label.props.style.color, MUTED);
   // Narrow-pane rules: the label ellipsizes, every other child keeps its size.
   assert.deepEqual([label.props.style.flex, label.props.style.minWidth, label.props.style.textOverflow, label.props.style.whiteSpace], ['1 1 auto', 0, 'ellipsis', 'nowrap']);
@@ -3325,4 +3325,15 @@ test('Merge as-is sends the merge text as a message in the target, once the targ
   assert.equal(host.drafts.length, 0, 'nothing was staged');
   assert.match(textOf(ctx.pane.render()), /Sent to/);
   ctx.unload();
+});
+
+test('a branch name is bigger than node text: name rows 14 px, node rows 12 px', async () => {
+  const ctx = setup();
+  await flush();
+  const tree = ctx.pane.render();
+  const nameLabel = byAttr(nameRows(tree)[0], 'data-label')[0];
+  const nodeLabels = nodeRows(tree).map((n) => byAttr(n, 'data-label')[0]).filter(Boolean);
+  assert.ok(nodeLabels.length > 0);
+  assert.equal(nameLabel.props.style.fontSize, 14);
+  for (const label of nodeLabels) assert.equal(label.props.style.fontSize, 12);
 });
