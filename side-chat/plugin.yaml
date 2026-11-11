@@ -1,0 +1,12 @@
+name: side-chat
+label: Side Chat
+version: 0.1.0
+author: Rohan Malik
+license: MIT
+description: >
+  Ask a side question in a fork of the open chat, on a cheaper model, without
+  a new message in the main chat. The answer shows in a side pane. A merge
+  stages the side exchange in the main chat composer as Full text, a Merge
+  record, or a Digest, and never sends it. Desktop only (desktop/plugin.js);
+  no agent tools, hooks, middleware or env vars.
+requires_hermes: ">=0.23"

@@ -1,0 +1,1190 @@
+// Chat tree pane: the focused chat, its ancestors, all its branches, and its live subagents,
+// as an indented outline (default) or an outline beside a hand-drawn SVG lane graph. A click
+// opens a node's chat in a tab. Side chats show a [side] badge and a Merge as-is button that
+// stages the side exchange verbatim in the parent composer (never sends it).
+// Plain ESM with no imports: the SDK pieces and timers are injected so it runs under node --test.
+// Spec: docs/research/2026-11-11-chat-tree/spec-chat-tree.md, spec-merge-back.md
+
+export const PLUGIN_ID = 'chat-tree';
+export const PANE_ID = 'pane';
+export const REFRESH_MS = 15_000;
+export const LIST_LIMIT = 500;
+export const SIDE_PREFIX = 'Side: ';
+export const MINIMAP_MIN = 40;
+// Same wording as side-chat (side-chat/src/side-chat.js): the two panes show one merge flow.
+export const MERGE_STAGED_TEXT =
+  'The draft is in the main chat composer. Edit it and send. After sending, session.undo on an idle parent can drop that turn.';
+export const MERGE_HIDDEN_TEXT = "The main chat's composer is not visible. Open the main chat and try again.";
+export const MERGE_NO_COMPOSER_TEXT = 'The composer draft API is missing. Nothing was written.';
+
+const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text' };
+const INDENT_PX = 14;
+const DISCLOSURE_PX = 14;
+
+const str = (v) => (typeof v === 'string' ? v.trim() : '');
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+const errorText = (error) => str(error?.message) || str(error) || 'Unknown error';
+
+// ── Pure tree logic (ported from apps/desktop/src/lib/session-branch-tree.ts) ──────────────
+
+// session-branch-tree.ts:28-40. `/new` and idle resets stamp `_reset_from`: a new conversation,
+// not a fork. `/branch` writes `_branched_from`. Older forks only have `parent_session_id`.
+export function forkParentId(row) {
+  if (str(row?._reset_from)) return undefined;
+  return str(row?._branched_from) || str(row?.parent_session_id) || undefined;
+}
+
+// session-branch-tree.ts:45-46. Rows that share this key are one conversation (compression).
+export const lineageKey = (row) => `${str(row?.profile) || 'default'}::${str(row?._lineage_root_id) || row?.id}`;
+
+// session-branch-tree.ts:53-82. One row per compression lineage: the row nothing in its lineage
+// continues from, then the freshest (first in input on a tie).
+export function collapseLineages(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    const key = lineageKey(row);
+    const group = groups.get(key);
+    if (group) group.push(row);
+    else groups.set(key, [row]);
+  }
+  if (groups.size === rows.length) return rows;
+  const winners = new Set();
+  for (const group of groups.values()) {
+    const continued = new Set(group.map((row) => str(row.parent_session_id)));
+    const score = (row) => (continued.has(row.id) ? -Infinity : Math.max(num(row.last_active), num(row.started_at)));
+    winners.add(group.reduce((best, row) => (score(row) > score(best) ? row : best)));
+  }
+  return rows.filter((row) => winners.has(row));
+}
+
+// Children sort oldest first by started_at, else last_active (spec chat_tree_pane.behavior).
+export const sortTime = (row) => num(row?.started_at) || num(row?.last_active);
+
+// Every id a kept row answers to: its own id, its lineage root, and the ids of collapsed stale
+// tips of its lineage (session-branch-tree.ts:93-116). The `_lineage_ids` chain goes beyond the
+// sidebar rule on purpose: the server row of a compressed chat is its tip, with the chain
+// root..tip in `_lineage_ids` (hermes_state_session_list.py:20-44). A /branch made from a middle
+// segment names that segment; without the chain it would lose its parent and show as a root.
+function indexRows(input, rows) {
+  const byId = new Map();
+  for (const row of rows) {
+    byId.set(row.id, row);
+    const root = str(row._lineage_root_id);
+    if (root) byId.set(root, row);
+  }
+  const survivor = new Map(rows.map((row) => [lineageKey(row), row]));
+  for (const row of [...rows, ...input]) {
+    const keep = survivor.get(lineageKey(row));
+    if (!keep) continue;
+    if (!byId.has(row.id)) byId.set(row.id, keep);
+    for (const id of Array.isArray(row._lineage_ids) ? row._lineage_ids : []) {
+      if (typeof id === 'string' && id && !byId.has(id)) byId.set(id, keep);
+    }
+  }
+  return byId;
+}
+
+// The parent row, or undefined. Compression ancestry is not a branch (session-branch-tree.ts:128-131).
+function parentRow(row, byId) {
+  const id = forkParentId(row);
+  const parent = id ? byId.get(id) : undefined;
+  if (!parent || parent === row || lineageKey(parent) === lineageKey(row)) return undefined;
+  return parent;
+}
+
+// Walks the parent rule up. Stops at a row with no parent, a parent not in the list, or a row
+// already visited (a cycle).
+export function findRoot(row, byId) {
+  const seen = new Set();
+  let current = row;
+  for (;;) {
+    seen.add(current);
+    const parent = parentRow(current, byId);
+    if (!parent || seen.has(parent)) return current;
+    current = parent;
+  }
+}
+
+// Builds { root, focused, partial } where each node is { row, children }. Each row is visited once.
+// Returns null when the focused id is not in the list.
+export function buildTree(input, focusedId) {
+  const all = (Array.isArray(input) ? input : []).filter((row) => row && typeof row.id === 'string' && row.id);
+  const rows = collapseLineages(all);
+  const byId = indexRows(all, rows);
+  const focusedRow = focusedId ? byId.get(focusedId) : undefined;
+  if (!focusedRow) return null;
+
+  const children = new Map();
+  for (const row of rows) {
+    const parent = parentRow(row, byId);
+    if (!parent) continue;
+    const list = children.get(parent) ?? [];
+    list.push(row);
+    children.set(parent, list);
+  }
+  for (const list of children.values()) list.sort((a, b) => sortTime(a) - sortTime(b));
+
+  const seen = new Set();
+  const visit = (row) => {
+    seen.add(row);
+    const nodes = [];
+    for (const kid of children.get(row) ?? []) if (!seen.has(kid)) nodes.push(visit(kid));
+    return { row, children: nodes };
+  };
+  const rootRow = findRoot(focusedRow, byId);
+  // The top row names a parent that the page does not hold: older than the page, archived, or
+  // hidden. The real root is above it.
+  const missing = forkParentId(rootRow);
+  return { root: visit(rootRow), focused: focusedRow, partial: Boolean(missing && !byId.has(missing)) };
+}
+
+// The rows from the tree root down to the focused chat, for the breadcrumb.
+export function pathToFocused(tree) {
+  if (!tree) return [];
+  const walk = (node, trail) => {
+    const next = [...trail, node.row];
+    if (node.row === tree.focused) return next;
+    for (const kid of node.children) {
+      const hit = walk(kid, next);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  return walk(tree.root, []) ?? [];
+}
+
+// Depth-first, flat: [{ depth, kind: 'chat', row, focused, childCount, collapsed } |
+// { depth, kind: 'subagent', agent }]. Live subagents go first under the focused chat.
+// isCollapsed(row) hides a node's children (and its subagents) from the list.
+export function flattenTree(tree, subagents = [], isCollapsed = null) {
+  if (!tree) return [];
+  const out = [];
+  const walk = (node, depth) => {
+    const focused = node.row === tree.focused;
+    const childCount = node.children.length;
+    const collapsed = childCount > 0 && Boolean(isCollapsed?.(node.row));
+    out.push({ depth, kind: 'chat', row: node.row, focused, childCount, collapsed });
+    if (collapsed) return;
+    if (focused) for (const agent of subagents) out.push({ depth: depth + 1, kind: 'subagent', agent });
+    for (const child of node.children) walk(child, depth + 1);
+  };
+  walk(tree.root, 0);
+  return out;
+}
+
+// For the lane graph. Lane `a` is the vertical line under the node at depth `a`. For each row:
+// continues[a] says whether lane a keeps running past the row (its owner has a later child), and
+// hasKids says whether a child row follows. Scans from the end, so it is one pass.
+export function graphGuides(items) {
+  const later = []; // later[k]: a row of depth k follows in the same branch
+  const guides = new Array(items.length);
+  for (let i = items.length - 1; i >= 0; i--) {
+    const depth = items[i].depth;
+    guides[i] = {
+      continues: Array.from({ length: depth }, (_, lane) => later[lane + 1] === true),
+      hasKids: i + 1 < items.length && items[i + 1].depth > depth,
+    };
+    later.length = depth + 1; // deeper rows above belong to an earlier subtree
+    later[depth] = true;
+  }
+  return guides;
+}
+
+export const isSideTitle = (title) => typeof title === 'string' && title.startsWith(SIDE_PREFIX);
+
+// Shared with side-chat through globalThis: assembled plugins cannot import each other.
+const SIDE_BRANCH_IDS = '__hermesSideChatBranchIds';
+const MERGED_IDS = '__hermesSideChatMergedIds';
+
+function idSet(key) {
+  if (!(globalThis[key] instanceof Set)) {
+    const ids = new Set();
+    try {
+      const raw = globalThis.localStorage?.getItem?.(key);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(parsed)) {
+        for (const id of parsed) if (typeof id === 'string' && id) ids.add(id);
+      }
+    } catch {
+      // node tests have no localStorage; a bad stored value must not break the pane.
+    }
+    globalThis[key] = ids;
+  }
+  return globalThis[key];
+}
+
+function rememberId(key, id) {
+  if (typeof id !== 'string' || !id) return;
+  const ids = idSet(key);
+  if (ids.has(id)) return;
+  ids.add(id);
+  try {
+    globalThis.localStorage?.setItem?.(key, JSON.stringify([...ids]));
+  } catch {
+    // Persistence is best effort.
+  }
+}
+
+export const rememberSideBranch = (id) => rememberId(SIDE_BRANCH_IDS, id);
+
+export function isKnownSideBranch(id) {
+  return typeof id === 'string' && id !== '' && idSet(SIDE_BRANCH_IDS).has(id);
+}
+
+export function isSideChat(row) {
+  return isSideTitle(row?.title) || isKnownSideBranch(row?.id);
+}
+
+// A side chat whose exchange was staged in its parent composer. Takes a row or an id.
+export const rememberMergedBranch = (id) => rememberId(MERGED_IDS, id);
+
+export function isMergedChat(rowOrId) {
+  const id = typeof rowOrId === 'string' ? rowOrId : rowOrId?.id;
+  return typeof id === 'string' && id !== '' && idSet(MERGED_IDS).has(id);
+}
+
+// ── Merge-back helpers (copied from side-chat/src/side-chat.js; plugins cannot import each other) ──
+
+// Transcript rows on this Hermes may carry text, a string content, or content parts.
+export function rowText(row) {
+  const direct = typeof row?.text === 'string' ? row.text.trim() : '';
+  if (direct) return direct;
+  const content = row?.content;
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  return content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('').trim();
+}
+
+// A side chat is a copy of its parent, then its own turns. Walk both lists from the start while
+// role and text match: that is the copied history. The remainder of the side list is new.
+export function rowsAfterSharedPrefix(sideRows, parentRows) {
+  const side = Array.isArray(sideRows) ? sideRows : [];
+  const parent = Array.isArray(parentRows) ? parentRows : [];
+  let i = 0;
+  while (i < side.length && i < parent.length && side[i]?.role === parent[i]?.role && rowText(side[i]) === rowText(parent[i])) i += 1;
+  return side.slice(i);
+}
+
+// ASCII path of agent/model_metadata.py estimate_tokens_rough: CHARS_PER_TOKEN = 4, (len+3)//4.
+export function estimateTokens(text) {
+  if (typeof text !== 'string' || text.length === 0) return 0;
+  return Math.floor((text.length + 3) / 4);
+}
+
+function formatTokenCount(n) {
+  const value = Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
+  return String(Math.trunc(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function finiteNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+// Parent window from session.usage (TUI UsageStats, possibly nested under .usage),
+// session.stats (last_prompt_tokens / context_length / context_tokens), or session.context_breakdown.
+export function parseContextHeadroom(payload) {
+  const sources = [];
+  const push = (obj) => {
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) sources.push(obj);
+  };
+  push(payload);
+  push(payload?.usage);
+  push(payload?.usage_stats);
+  for (const src of sources) {
+    const max = finiteNumber(src.context_max) ?? finiteNumber(src.context_length);
+    if (max == null || max <= 0) continue;
+    const used = finiteNumber(src.context_used) ?? finiteNumber(src.last_prompt_tokens) ?? finiteNumber(src.context_tokens) ?? 0;
+    let estimated = false;
+    if (typeof src.context_estimated === 'boolean') estimated = src.context_estimated;
+    else if (typeof src.context_source === 'string' && src.context_source && src.context_source !== 'provider_usage') {
+      estimated = true;
+    }
+    return { used, max, available: Math.max(0, max - used), estimated };
+  }
+  return null;
+}
+
+// Every user/assistant pair. Tool and system rows are not turns. Each user starts a turn.
+// Following non-empty assistant texts until the next user are that answer, joined with newlines.
+export function turnsFromRows(rows) {
+  const turns = [];
+  let question = '';
+  let parts = [];
+  const flush = () => {
+    if (question && parts.length) turns.push({ question, answer: parts.join('\n') });
+    question = '';
+    parts = [];
+  };
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const role = row?.role;
+    if (role === 'tool' || role === 'system') continue;
+    if (role === 'user') {
+      flush();
+      question = rowText(row);
+      continue;
+    }
+    if (role === 'assistant' && question) {
+      const text = rowText(row);
+      if (text) parts.push(text);
+    }
+  }
+  flush();
+  return turns;
+}
+
+export function formatSideVerbatim(title, turns) {
+  const name = str(title) || 'Side chat';
+  const list = Array.isArray(turns) ? turns : [];
+  const blocks = list.map((turn) => `You:\n${turn.question}\n\nAssistant:\n${turn.answer}`);
+  return `From side chat: ${name}\n\n${blocks.join('\n\n')}`;
+}
+
+export function formatNoFitNotice(fields) {
+  const src = fields || {};
+  const sideEstimated = src.sideEstimated === true;
+  const windowEstimated = src.windowEstimated === true;
+  const side = `${formatTokenCount(src.sideTokens)} tokens${sideEstimated ? ' (estimated)' : ''}`;
+  const parent = `${formatTokenCount(src.used)} used of ${formatTokenCount(src.max)}${windowEstimated ? ', estimated' : ''}`;
+  return `Doesn't fit: side chat is ${side}, parent has ${formatTokenCount(src.available)} available (${parent}).`;
+}
+
+export function formatMissingWindowNotice(sideTokens) {
+  return `${MERGE_STAGED_TEXT} Side chat is about ${formatTokenCount(sideTokens)} tokens (estimated). The parent context window was not reported.`;
+}
+
+// The compact readout next to the notice. Side tokens are always an estimate.
+function fitReadout(state) {
+  const side = formatTokenCount(state.sideTokens);
+  if (state.fit === 'yes') return `✓ Fits: about ${side} tokens (estimated) of ${formatTokenCount(state.available)} available.`;
+  if (state.fit === 'no') return `✗ No room: about ${side} tokens (estimated), ${formatTokenCount(state.available)} available.`;
+  return `? Window not reported: about ${side} tokens (estimated).`;
+}
+
+// Session times are Unix seconds (SessionInfo.last_active).
+export function timeText(seconds) {
+  const s = num(seconds);
+  return s ? new Date(s * 1000).toLocaleString() : '';
+}
+
+// subagent.list rows are untrusted: keep only well-typed fields.
+function cleanAgent(a) {
+  if (!a || typeof a !== 'object' || typeof a.subagent_id !== 'string') return null;
+  const opt = (v) => (typeof v === 'string' && v ? v : null);
+  return {
+    subagent_id: a.subagent_id,
+    goal: opt(a.goal),
+    status: opt(a.status),
+    model: opt(a.model),
+    child_session_id: opt(a.child_session_id),
+  };
+}
+
+// listPersistedSessions route from the focused chat's owner, shaped like the hermes-bots route
+// (plugins/hermes-bots/routing.ts:64-71). The SDK reads only route.connectionId (sdk/index.ts:1457);
+// an owner with no connection id uses null, the window's own route.
+export function routeFor(owner) {
+  const connectionId = str(owner?.connectionId);
+  const profile = str(owner?.profile);
+  if (!connectionId || !profile) return null;
+  return { connectionId, mode: connectionId === 'local' ? 'local' : 'remote', profile, targetProfile: profile };
+}
+
+// openSession options for the owner (sdk/index.ts:836-850, 922-934): an explicit route dials the
+// registry path, so a local owner passes only its profile, as the SDK's own local bot open does.
+export function openOptions(owner) {
+  const route = routeFor(owner);
+  if (route && route.mode === 'remote') return { intent: 'tab', route };
+  const profile = str(owner?.profile);
+  return profile ? { intent: 'tab', profile } : { intent: 'tab' };
+}
+
+const profileKey = (v) => str(v) || 'default'; // store/profile.ts normalizeProfileKey
+
+// ── Lane graph (decorative SVG, drawn by hand) ──────────────────────────────────────────────
+
+const LANE_W = 12;
+const GRAPH_PAD = 8;
+const MAX_LANES = 8;
+const NODE_Y = 12; // centre of the first text line of a row
+const LANE_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899'];
+const MERGED_GREY = '#9ca3af';
+const laneX = (lane) => GRAPH_PAD + Math.min(lane, MAX_LANES - 1) * LANE_W;
+const laneColor = (lane) => LANE_COLORS[lane % LANE_COLORS.length];
+
+// Inline styles, not host classes: the plugin cannot rely on the host's CSS having them.
+const BADGE_BASE = { ...SELECTABLE, borderRadius: 4, padding: '0 4px', fontSize: 10, lineHeight: '14px', fontWeight: 600 };
+const SIDE_BADGE = { ...BADGE_BASE, border: '1px solid #f59e0b', background: 'rgba(245,158,11,0.18)' };
+const MERGED_BADGE = { ...BADGE_BASE, border: `1px solid ${MERGED_GREY}`, background: 'rgba(128,128,128,0.25)' };
+const FORK_LABEL = { ...SELECTABLE, border: '1px dashed currentColor', borderRadius: 4, padding: '0 4px', fontSize: 10, lineHeight: '14px', opacity: 0.75 };
+const PLAIN_BUTTON = { ...SELECTABLE, background: 'none', border: 0, padding: 0, color: 'inherit', font: 'inherit', cursor: 'pointer' };
+const TICK_COLORS = { focused: '#3b82f6', side: '#f59e0b', merged: MERGED_GREY, other: 'rgba(128,128,128,0.45)' };
+
+export function createChatTree(deps) {
+  const { host, jsx, jsxs, atom, useValue, Button, ScrollArea } = deps;
+
+  // rows: last good session rows. agents: last good subagents, for agentsFor (a runtime id).
+  const $data = atom({ rows: [], agents: [], agentsFor: null });
+  // note: why live subagents are not shown (not an error).
+  const $status = atom({ loading: false, error: null, note: null });
+  // In memory only, never stored: view ('outline' | 'graph'); open: { [chat id]: boolean } explicit
+  // expand/collapse choices; merge: { [side chat id]: { busy, notice, fit, sideTokens, available } }.
+  const freshUi = () => ({ view: 'outline', open: {}, merge: {} });
+  const $ui = atom(freshUi());
+  // Stand-in so the pane calls useValue the same number of times when host.state lacks an atom.
+  const $none = atom(null);
+
+  // Per-activation state. register() resets it: a disable then enable calls register() again on
+  // the same module object (apps/desktop/src/contrib/runtime-loader.ts:499-512).
+  let disposed = false;
+  let generation = 0;
+  let inFlight = 0;
+  let activation = 0;
+  let cancelTimer = null;
+  let lastKey = null;
+  let scopedTimeout = null;
+  const unsubscribers = [];
+
+  const atomOf = (name) => host?.state?.[name] ?? $none;
+  const runtimeId = () => atomOf('focusedSessionId').get() ?? atomOf('activeSessionId').get() ?? null;
+  // host.request goes to the active gateway only (sdk/index.ts:1507-1514). A chat owned by another
+  // profile or connection would ask the wrong backend.
+  const ownerIsActive = (owner) =>
+    Boolean(owner) &&
+    str(owner.connectionId) === str(atomOf('connectionId').get()) &&
+    profileKey(owner.profile) === profileKey(atomOf('profile').get());
+
+  function schedule(fn, ms) {
+    if (scopedTimeout) return scopedTimeout(fn, ms);
+    const set = deps.setTimeout ?? ((f, t) => globalThis.setTimeout(f, t));
+    const clear = deps.clearTimeout ?? ((id) => globalThis.clearTimeout(id));
+    const id = set(fn, ms);
+    return () => clear(id);
+  }
+
+  // Reads both sources. Each failure shows its text and keeps that source's last good data.
+  // A newer load wins: an older reply that lands late is dropped.
+  async function load() {
+    if (disposed) return;
+    const mine = ++generation;
+    const act = activation;
+    inFlight += 1;
+    try {
+      await loadOnce(mine);
+    } finally {
+      // A load from an earlier activation must not touch this activation's count.
+      if (act === activation) inFlight -= 1;
+    }
+  }
+
+  async function loadOnce(mine) {
+    const stored = atomOf('focusedStoredSessionId').get();
+    const runtime = runtimeId();
+    const owner = atomOf('focusedSessionOwner').get();
+    if (!stored && !runtime) return $status.set({ loading: false, error: null, note: null });
+    $status.set({ ...$status.get(), loading: true });
+    const agentsOk = ownerIsActive(owner);
+
+    const errors = [];
+    const sessions = (async () => {
+      const profile = str(owner?.profile);
+      if (!profile) throw new Error('The profile of this chat is unknown.');
+      if (typeof host?.listPersistedSessions !== 'function') throw new Error('This Hermes has no session list for plugins.');
+      const result = await host.listPersistedSessions(routeFor(owner), { profile, limit: LIST_LIMIT });
+      return Array.isArray(result?.sessions) ? result.sessions : [];
+    })();
+    const agents = (async () => {
+      if (!runtime || !agentsOk) return [];
+      const result = await host.request('subagent.list', { session_id: runtime });
+      return (Array.isArray(result?.subagents) ? result.subagents : []).map(cleanAgent).filter(Boolean);
+    })();
+    const [rows, live] = await Promise.allSettled([sessions, agents]);
+    if (disposed || mine !== generation) return;
+
+    const next = { ...$data.get() };
+    if (rows.status === 'fulfilled') next.rows = rows.value;
+    else errors.push(`Sessions: ${errorText(rows.reason)}`);
+    if (live.status === 'fulfilled') {
+      next.agents = live.value;
+      next.agentsFor = runtime;
+    } else errors.push(`Subagents: ${errorText(live.reason)}`);
+    $data.set(next);
+    $status.set({
+      loading: false,
+      error: errors.length ? errors.join('\n') : null,
+      note: agentsOk ? null : 'Subagents unavailable for this chat.',
+    });
+  }
+
+  const reload = () => {
+    load().then(null, (error) => {
+      if (!disposed) $status.set({ loading: false, error: errorText(error) });
+    });
+  };
+
+  // A tick never cuts off a load still in flight: a source slower than the period would else
+  // never land (use-subagent-snapshot.ts:30 skips the same way). Focus changes still load.
+  function tick() {
+    if (disposed) return;
+    if (inFlight === 0) reload();
+    cancelTimer = schedule(tick, REFRESH_MS);
+  }
+
+  // Loads again only when the focused chat or its owner really changes; the owner atom is
+  // recomputed on every session-list change.
+  function onFocus() {
+    const owner = atomOf('focusedSessionOwner').get();
+    const key = JSON.stringify([
+      atomOf('focusedStoredSessionId').get(),
+      runtimeId(),
+      str(owner?.connectionId),
+      str(owner?.profile),
+      str(atomOf('connectionId').get()),
+      str(atomOf('profile').get()),
+    ]);
+    if (key === lastKey) return;
+    lastKey = key;
+    reload();
+  }
+
+  function openChat(id) {
+    if (!id || typeof host?.openSession !== 'function') return;
+    const options = openOptions(atomOf('focusedSessionOwner').get());
+    Promise.resolve()
+      .then(() => host.openSession(id, options))
+      .then(null, () => {});
+  }
+
+  // A drag that selects text also fires click; do not open a tab then.
+  const selecting = () => {
+    try {
+      return Boolean(str(globalThis.getSelection?.()?.toString?.()));
+    } catch {
+      return false;
+    }
+  };
+  const onClickOpen = (id) => () => {
+    if (!selecting()) openChat(id);
+  };
+  const stop = (event) => {
+    event?.stopPropagation?.();
+  };
+
+  // ── UI state (all in $ui; render only reads it) ───────────────────────────────────────────
+
+  const setUi = (patch) => $ui.set({ ...$ui.get(), ...patch });
+  const setView = (view) => setUi({ view });
+  const setOpen = (id, open) => setUi({ open: { ...$ui.get().open, [id]: open } });
+  const setMerge = (id, state) => setUi({ merge: { ...$ui.get().merge, [id]: state } });
+
+  // Expanded unless the user chose otherwise. A merged side branch starts collapsed.
+  const isOpen = (ui, row) => (typeof ui.open[row.id] === 'boolean' ? ui.open[row.id] : !(isSideChat(row) && isMergedChat(row)));
+
+  // ── Merge as-is: stage a side chat verbatim in its parent's composer. Never sends. ───────────
+
+  // This Hermes (v0.23) has no session.transcript: fall back to session.history, a complete snapshot.
+  async function readRows(sessionId) {
+    try {
+      const rows = [];
+      const seen = new Set();
+      let cursor = null;
+      for (let i = 0; i < 1000; i++) {
+        const result = await host.request('session.transcript', {
+          session_id: sessionId,
+          order: 'oldest',
+          ...(cursor ? { cursor } : {}),
+        });
+        const batch = Array.isArray(result?.rows) ? result.rows : [];
+        rows.push(...batch);
+        const next = typeof result?.next_cursor === 'string' && result.next_cursor ? result.next_cursor : null;
+        if (batch.length === 0 || !next || next === cursor || seen.has(next)) break;
+        seen.add(next);
+        cursor = next;
+      }
+      return rows;
+    } catch {
+      // Unknown method or a failed page: read the complete history instead.
+    }
+    const history = await host.request('session.history', { session_id: sessionId });
+    return Array.isArray(history?.messages) ? history.messages : [];
+  }
+
+  // Parent context window. Never the side chat's own: it holds a copy of the parent's history.
+  async function parentHeadroom(parentId, sideId) {
+    const ids = [];
+    if (typeof parentId === 'string' && parentId) ids.push(parentId);
+    const focused = atomOf('focusedSessionId').get();
+    const focusedIsSide = atomOf('focusedStoredSessionId').get() === sideId;
+    if (!focusedIsSide && typeof focused === 'string' && focused && !ids.includes(focused)) ids.push(focused);
+    for (const method of ['session.usage', 'session.stats', 'session.context_breakdown']) {
+      for (const session_id of ids) {
+        try {
+          const window = parseContextHeadroom(await host.request(method, { session_id }));
+          if (window) return window;
+        } catch {
+          // A throw or a payload with no context max tries the next id, then the next method.
+        }
+      }
+    }
+    return null;
+  }
+
+  async function tryDraft(sessionId, text) {
+    try {
+      return (await host.composer.setDraft(sessionId, text)) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Click handler: reads, fit check, open the parent, stage the draft. Never throws, never sends,
+  // and never merges unless the user clicked. The check happens here, not in render.
+  async function mergeAsIs(row) {
+    const sideId = row?.id;
+    if (!sideId || $ui.get().merge[sideId]?.busy) return;
+    const act = activation;
+    const alive = () => !disposed && act === activation;
+    const show = (state) => {
+      if (alive()) setMerge(sideId, state);
+    };
+    try {
+      if (typeof host?.composer?.setDraft !== 'function') return show({ notice: MERGE_NO_COMPOSER_TEXT });
+      const parentId = forkParentId(row);
+      if (!parentId) return show({ notice: 'This side chat has no parent chat to merge into.' });
+      show({ busy: true });
+
+      let sideRows;
+      let parentRows;
+      try {
+        sideRows = await readRows(sideId);
+      } catch (error) {
+        return show({ notice: `Could not read the side chat: ${errorText(error)}` });
+      }
+      if (!alive()) return;
+      try {
+        parentRows = await readRows(parentId);
+      } catch (error) {
+        return show({ notice: `Could not read the parent chat: ${errorText(error)}` });
+      }
+      if (!alive()) return;
+
+      const turns = turnsFromRows(rowsAfterSharedPrefix(sideRows, parentRows));
+      if (!turns.length) {
+        return show({ notice: 'Nothing to merge: the side chat has no new question and answer after the shared history.' });
+      }
+      const verbatim = formatSideVerbatim(row.title, turns);
+      const sideTokens = estimateTokens(verbatim);
+
+      const headroom = await parentHeadroom(parentId, sideId);
+      if (!alive()) return;
+      if (headroom && sideTokens > headroom.available) {
+        return show({
+          fit: 'no',
+          sideTokens,
+          available: headroom.available,
+          notice: formatNoFitNotice({
+            sideTokens,
+            available: headroom.available,
+            used: headroom.used,
+            max: headroom.max,
+            sideEstimated: true,
+            windowEstimated: headroom.estimated === true,
+          }),
+        });
+      }
+
+      if (typeof host.openSession === 'function') {
+        try {
+          await host.openSession(parentId, { intent: 'in-place' });
+        } catch {
+          // setDraft is fail-closed when the parent composer is not mounted.
+        }
+      }
+      if (!alive()) return;
+      let ok = await tryDraft(parentId, verbatim);
+      if (!ok) {
+        // Never stage into the side chat itself.
+        const focused = atomOf('focusedSessionId').get();
+        if (typeof focused === 'string' && focused && atomOf('focusedStoredSessionId').get() !== sideId) {
+          ok = await tryDraft(focused, verbatim);
+        }
+      }
+      if (!alive()) return;
+
+      const fit = headroom ? 'yes' : 'unknown';
+      const base = { fit, sideTokens, available: headroom?.available };
+      if (!ok) return show({ ...base, notice: MERGE_HIDDEN_TEXT });
+      // Staged: the row turns into a grey merged row, and a branch with children folds away.
+      rememberMergedBranch(sideId);
+      if (!alive()) return;
+      const ui = $ui.get();
+      const open = { ...ui.open };
+      delete open[sideId];
+      $ui.set({
+        ...ui,
+        open,
+        merge: { ...ui.merge, [sideId]: { ...base, notice: headroom ? MERGE_STAGED_TEXT : formatMissingWindowNotice(sideTokens) } },
+      });
+    } catch (error) {
+      show({ notice: `Merge failed: ${errorText(error)}` });
+    }
+  }
+
+  // ── Rows ──────────────────────────────────────────────────────────────────────────────────
+
+  function disclosure(row, open) {
+    const label = str(row.title) || 'Untitled';
+    const set = (value) => setOpen(row.id, value);
+    return jsx('button', {
+      key: 'disclosure',
+      type: 'button',
+      'aria-expanded': open,
+      'aria-label': `${open ? 'Collapse' : 'Expand'} branches of ${label}`,
+      'data-disclosure': 'true',
+      style: { ...PLAIN_BUTTON, width: DISCLOSURE_PX, lineHeight: 1 },
+      onClick: (event) => {
+        stop(event);
+        set(!isOpen($ui.get(), row));
+      },
+      onKeyDown: (event) => {
+        if (event?.key === 'ArrowLeft') {
+          stop(event);
+          event.preventDefault?.();
+          set(false);
+        } else if (event?.key === 'ArrowRight') {
+          stop(event);
+          event.preventDefault?.();
+          set(true);
+        }
+      },
+      children: open ? '▾' : '▸',
+    });
+  }
+
+  // Outline rows indent by depth. Graph rows let the lanes show depth, and move their vertical
+  // padding inside the body so the graph cell fills the whole row and the lane lines join.
+  const rowPad = (item, graph) =>
+    graph ? { paddingLeft: '4px', paddingTop: 0, paddingBottom: 0 } : { paddingLeft: `${4 + item.depth * INDENT_PX}px` };
+  const bodyPad = (graph) => (graph ? { padding: '2px 0' } : {});
+
+  // One cell of the lane graph, drawn at the left of its row. Lines run to the bottom of the row
+  // (y2 = 100%), so tall rows (notices) keep the lanes joined. No hit area: it is decoration.
+  function graphCell(item, guide, lanes, flags) {
+    const { depth } = item;
+    const width = GRAPH_PAD * 2 + Math.min(lanes, MAX_LANES) * LANE_W;
+    const outer = flags.merged ? 6.5 : 4.5; // outer radius: lines stop at the ring, not at its centre
+    const shapes = [];
+    guide.continues.forEach((on, lane) => {
+      if (on) shapes.push(jsx('line', { key: `lane${lane}`, x1: laneX(lane), y1: 0, x2: laneX(lane), y2: '100%', stroke: laneColor(lane), strokeWidth: 1.5 }));
+    });
+    if (depth > 0) {
+      // The fork: a curve from the parent's lane into the left edge of this node.
+      const from = laneX(depth - 1);
+      const to = laneX(depth);
+      const stroke = laneColor(depth);
+      shapes.push(
+        to === from
+          ? jsx('line', { key: 'fork', x1: from, y1: 0, x2: from, y2: NODE_Y - outer, stroke, strokeWidth: 1.5 })
+          : jsx('path', {
+              key: 'fork',
+              d: `M ${from} 0 C ${from} ${NODE_Y * 0.8}, ${from + 2} ${NODE_Y}, ${to - outer} ${NODE_Y}`,
+              fill: 'none',
+              stroke,
+              strokeWidth: 1.5,
+            }),
+      );
+    }
+    if (guide.hasKids) {
+      shapes.push(jsx('line', { key: 'own', x1: laneX(depth), y1: NODE_Y + outer, x2: laneX(depth), y2: '100%', stroke: laneColor(depth), strokeWidth: 1.5 }));
+    }
+    const x = laneX(depth);
+    const color = flags.merged ? MERGED_GREY : laneColor(depth);
+    const dash = flags.merged ? undefined : flags.side || flags.agent ? '3 2' : undefined;
+    const strokeWidth = flags.focused ? 3 : 1.5;
+    // Hollow nodes; a merged node gets a double ring.
+    if (flags.merged) shapes.push(jsx('circle', { key: 'ring', cx: x, cy: NODE_Y, r: outer, fill: 'none', stroke: color, strokeWidth: 1.5 }));
+    shapes.push(jsx('circle', { key: 'node', cx: x, cy: NODE_Y, r: flags.merged ? 3.5 : outer, fill: 'none', stroke: color, strokeWidth, strokeDasharray: dash }));
+    return jsx('div', {
+      key: 'graph',
+      'aria-hidden': 'true',
+      style: { position: 'relative', flexShrink: 0, alignSelf: 'stretch', width },
+      children: jsxs('svg', {
+        'aria-hidden': 'true',
+        'data-graph': 'true',
+        width,
+        height: '100%',
+        style: { position: 'absolute', top: 0, left: 0, overflow: 'visible' },
+        children: shapes,
+      }),
+    });
+  }
+
+  function mergeResult(state) {
+    return jsxs('div', {
+      className: 'flex flex-col',
+      style: SELECTABLE,
+      'data-selectable-text': 'true',
+      'data-merge-result': 'true',
+      ...(state.fit ? { 'data-token-fit': state.fit } : {}),
+      children: [
+        jsx('p', {
+          className: 'text-xs',
+          style: SELECTABLE,
+          'data-selectable-text': 'true',
+          'data-merge-notice': 'true',
+          children: state.notice,
+        }),
+        state.fit ? jsx('span', { className: 'text-xs opacity-70', style: SELECTABLE, 'data-token-readout': 'true', children: fitReadout(state) }) : null,
+      ].filter(Boolean),
+    });
+  }
+
+  // Merge controls of a side-chat row. A click here must not open the chat behind it.
+  function mergeControls(row, state) {
+    const busy = state?.busy === true;
+    return jsxs('div', {
+      className: 'flex flex-col gap-1',
+      style: { ...SELECTABLE, marginTop: 4 },
+      'data-merge-controls': 'true',
+      onClick: stop,
+      children: [
+        jsxs('div', {
+          className: 'flex flex-wrap items-center gap-1',
+          children: [
+            jsx(Button, {
+              type: 'button',
+              'data-merge': 'asis',
+              disabled: busy,
+              title: 'Stage this side chat in the parent composer as it is. Nothing is sent.',
+              onClick: (event) => {
+                stop(event);
+                return mergeAsIs(row);
+              },
+              children: 'Merge as-is',
+            }),
+            jsx(Button, {
+              type: 'button',
+              'data-merge': 'digest',
+              disabled: true,
+              title: 'A short digest is planned. It is not built yet.',
+              onClick: stop,
+              children: 'Digest (later)',
+            }),
+            busy ? jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: 'Checking...' }) : null,
+          ].filter(Boolean),
+        }),
+        state?.notice ? mergeResult(state) : null,
+      ].filter(Boolean),
+    });
+  }
+
+  function chatLine(item, view, guide, lanes, ui, hiddenAgents) {
+    const { row } = item;
+    const side = isSideChat(row);
+    const merged = isMergedChat(row);
+    const graph = view === 'graph';
+    const parts = [str(row.model), `${num(row.message_count)} msgs`, timeText(row.last_active)].filter(Boolean);
+    const forks = item.childCount;
+    const titleLine = [
+      forks > 0
+        ? disclosure(row, !item.collapsed)
+        : jsx('span', { key: 'spacer', 'aria-hidden': 'true', style: { ...SELECTABLE, display: 'inline-block', width: DISCLOSURE_PX } }),
+      jsxs('span', {
+        key: 'title',
+        className: `text-sm${item.focused ? ' font-semibold' : ''}`,
+        style: SELECTABLE,
+        children: [item.focused ? '● ' : '', str(row.title) || 'Untitled'].filter(Boolean),
+      }),
+      side ? jsx('span', { key: 'side', className: 'text-xs', style: SIDE_BADGE, 'data-kind': 'side', children: '[side]' }) : null,
+      merged ? jsx('span', { key: 'merged', className: 'text-xs', style: MERGED_BADGE, 'data-kind': 'merged', children: '[merged]' }) : null,
+      forks > 0
+        ? jsx('span', { key: 'forks', className: 'text-xs', style: FORK_LABEL, 'data-fork-count': forks, children: `${forks} fork${forks === 1 ? '' : 's'}` })
+        : null,
+      hiddenAgents > 0
+        ? jsx('span', { key: 'live', className: 'text-xs opacity-70', style: SELECTABLE, 'data-live-count': hiddenAgents, children: `${hiddenAgents} live` })
+        : null,
+    ].filter(Boolean);
+    return jsxs('div', {
+      key: `chat:${row.id}`,
+      role: 'button',
+      className: `flex gap-1 rounded px-1 py-0.5 cursor-pointer hover:bg-muted${item.focused ? ' bg-muted' : ''}`,
+      style: { ...SELECTABLE, ...rowPad(item, graph), ...(merged ? { opacity: 0.6 } : {}) },
+      'data-selectable-text': 'true',
+      'data-session-id': row.id,
+      ...(side ? { 'data-side': 'true' } : {}),
+      ...(merged ? { 'data-merged': 'true' } : {}),
+      onClick: onClickOpen(row.id),
+      children: [
+        graph ? graphCell(item, guide, lanes, { merged, side, focused: item.focused }) : null,
+        jsxs('div', {
+          key: 'body',
+          className: 'flex min-w-0 flex-1 flex-col',
+          style: { ...SELECTABLE, ...bodyPad(graph) },
+          children: [
+            jsx('div', { className: 'flex flex-wrap items-baseline gap-x-1', style: SELECTABLE, children: titleLine }),
+            jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: parts.join(' · ') }),
+            side ? mergeControls(row, ui.merge[row.id]) : null,
+          ].filter(Boolean),
+        }),
+      ].filter(Boolean),
+    });
+  }
+
+  function agentLine(item, view, guide, lanes) {
+    const { agent } = item;
+    const graph = view === 'graph';
+    const parts = [agent.status, agent.model].filter(Boolean);
+    const id = agent.child_session_id;
+    return jsxs('div', {
+      key: `agent:${agent.subagent_id}`,
+      className: `flex gap-1 rounded px-1 py-0.5${id ? ' cursor-pointer hover:bg-muted' : ''}`,
+      style: { ...SELECTABLE, ...rowPad(item, graph) },
+      'data-selectable-text': 'true',
+      'data-subagent-id': agent.subagent_id,
+      ...(id ? { role: 'button', onClick: onClickOpen(id) } : {}),
+      children: [
+        graph ? graphCell(item, guide, lanes, { agent: true }) : null,
+        jsxs('div', {
+          key: 'body',
+          className: 'flex min-w-0 flex-1 flex-col',
+          style: { ...SELECTABLE, ...bodyPad(graph) },
+          children: [
+            jsx('span', { className: 'text-sm', style: SELECTABLE, children: `↳ subagent: ${agent.goal ?? '(no goal)'}` }),
+            jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: parts.join(' · ') }),
+          ],
+        }),
+      ].filter(Boolean),
+    });
+  }
+
+  // root · … · focused. Each crumb opens its chat the way a row click does.
+  function breadcrumb(tree) {
+    const path = pathToFocused(tree);
+    if (!path.length) return null;
+    const children = [];
+    path.forEach((row, index) => {
+      if (index > 0) children.push(jsx('span', { key: `sep${index}`, style: SELECTABLE, children: ' · ' }));
+      const title = str(row.title) || 'Untitled';
+      children.push(
+        jsx(Button, {
+          key: `crumb:${row.id}`,
+          type: 'button',
+          'data-crumb': row.id,
+          title,
+          ...(row === tree.focused ? { 'aria-current': 'page' } : {}),
+          style: {
+            ...PLAIN_BUTTON,
+            height: 'auto',
+            minHeight: 0,
+            boxShadow: 'none',
+            maxWidth: 140,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            textDecoration: 'underline',
+            fontWeight: row === tree.focused ? 600 : 400,
+          },
+          onClick: onClickOpen(row.id),
+          children: title,
+        }),
+      );
+    });
+    return jsxs('nav', {
+      key: 'breadcrumb',
+      'aria-label': 'Chat path',
+      className: 'flex flex-wrap items-center text-xs',
+      style: SELECTABLE,
+      'data-selectable-text': 'true',
+      'data-breadcrumb': 'true',
+      children,
+    });
+  }
+
+  // Scrolls a row of this pane into view. Looks only inside this pane's own root.
+  function scrollToRow(event, id) {
+    try {
+      const root = event?.currentTarget?.closest?.('[data-chat-tree-root="true"]');
+      const target = root?.querySelector?.(`[data-session-id="${String(id).replace(/["\\]/g, '\\$&')}"]`);
+      target?.scrollIntoView?.({ block: 'nearest' });
+    } catch {
+      // Scrolling is a convenience.
+    }
+  }
+
+  // One tick per chat row, for long trees.
+  function minimap(items) {
+    const ticks = items
+      .filter((item) => item.kind === 'chat')
+      .map((item) => {
+        const kind = item.focused ? 'focused' : isMergedChat(item.row) ? 'merged' : isSideChat(item.row) ? 'side' : 'other';
+        return jsx('div', {
+          key: `tick:${item.row.id}`,
+          'data-tick': kind,
+          title: str(item.row.title) || 'Untitled',
+          style: { flex: '1 1 0', minHeight: 1, maxHeight: 6, background: TICK_COLORS[kind], cursor: 'pointer' },
+          onClick: (event) => {
+            stop(event);
+            scrollToRow(event, item.row.id);
+          },
+        });
+      });
+    return jsxs('div', {
+      key: 'minimap',
+      'aria-hidden': 'true',
+      'data-minimap': 'true',
+      style: { display: 'flex', flexDirection: 'column', gap: 1, flexShrink: 0, width: 8, height: '60vh', position: 'sticky', top: 0, alignSelf: 'flex-start' },
+      children: ticks,
+    });
+  }
+
+  const viewToggle = (view, current, label) =>
+    jsx(Button, {
+      key: view,
+      type: 'button',
+      'data-view-toggle': view,
+      'aria-pressed': current === view,
+      style: current === view ? { fontWeight: 600, textDecoration: 'underline' } : { opacity: 0.7 },
+      onClick: () => setView(view),
+      children: label,
+    });
+
+  // Hook order is fixed: six useValue calls, every render, before any branch (React error 300).
+  // The sixth is the in-memory UI atom. Render only reads state; loading happens on focus change
+  // and on the timer, in register(); merging happens in a click handler. Row builders have no hooks.
+  function renderPane() {
+    const stored = useValue(atomOf('focusedStoredSessionId'));
+    const focused = useValue(atomOf('focusedSessionId'));
+    const active = useValue(atomOf('activeSessionId'));
+    const data = useValue($data);
+    const status = useValue($status);
+    const ui = useValue($ui);
+
+    const runtime = focused ?? active ?? null;
+    const tree = buildTree(data.rows, stored ?? runtime);
+    const agents = runtime && data.agentsFor === runtime ? data.agents : [];
+    const items = flattenTree(tree, agents, (row) => !isOpen(ui, row));
+    const view = ui.view === 'graph' ? 'graph' : 'outline';
+    const guides = view === 'graph' ? graphGuides(items) : [];
+    const lanes = view === 'graph' ? Math.max(1, ...items.map((item) => item.depth + 1)) : 0;
+
+    let notice = null;
+    if (!stored && !runtime) notice = 'Open a chat to see its tree.';
+    else if (!tree && !status.loading) {
+      // The page is the newest LIST_LIMIT rows by creation (sdk/index.ts:1446-1455, offset fixed at 0).
+      notice =
+        data.rows.length >= LIST_LIMIT
+          ? `This chat is older than the newest ${LIST_LIMIT} chats. Older chats are not loaded.`
+          : 'This chat is not in the session list yet.';
+    } else if (tree?.partial) {
+      notice = `Partial tree: the parent of the top chat is not loaded (older than the newest ${LIST_LIMIT} chats, archived, or hidden).`;
+    }
+
+    const list = items.length
+      ? jsx('div', {
+          key: 'list',
+          className: `flex flex-col${view === 'graph' ? '' : ' gap-1'}`,
+          style: { flex: '1 1 auto', minWidth: 0 },
+          'data-tree-list': 'true',
+          children: items.map((item, index) =>
+            item.kind === 'chat'
+              ? chatLine(item, view, guides[index], lanes, ui, item.focused && item.collapsed ? agents.length : 0)
+              : agentLine(item, view, guides[index], lanes),
+          ),
+        })
+      : null;
+
+    return jsx(ScrollArea, {
+      children: jsxs('div', {
+        className: 'flex flex-col gap-1 p-3 text-sm',
+        style: SELECTABLE,
+        'data-selectable-text': 'true',
+        'data-chat-tree-root': 'true',
+        children: [
+          jsxs('div', {
+            className: 'flex flex-wrap items-center gap-2',
+            children: [
+              jsx(Button, { type: 'button', disabled: disposed, onClick: reload, children: 'Refresh' }),
+              jsxs('div', {
+                role: 'group',
+                'aria-label': 'View',
+                className: 'flex items-center gap-1',
+                children: [viewToggle('outline', view, 'Outline'), viewToggle('graph', view, 'Graph')],
+              }),
+              status.loading ? jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: 'Loading...' }) : null,
+            ].filter(Boolean),
+          }),
+          status.error
+            ? jsx('pre', {
+                className: 'text-xs text-destructive',
+                style: { ...SELECTABLE, whiteSpace: 'pre-wrap', margin: 0, font: 'inherit' },
+                children: status.error,
+              })
+            : null,
+          notice ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: notice }) : null,
+          status.note ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: status.note }) : null,
+          tree ? breadcrumb(tree) : null,
+          list && items.length >= MINIMAP_MIN
+            ? jsxs('div', { key: 'body', className: 'flex items-start gap-2', children: [list, minimap(items)] })
+            : list,
+        ].filter(Boolean),
+      }),
+    });
+  }
+
+  // Stops the timer and every store listener. Wired to ctx.onDispose.
+  function dispose() {
+    disposed = true;
+    generation += 1;
+    if (typeof cancelTimer === 'function') cancelTimer();
+    cancelTimer = null;
+    for (const off of unsubscribers.splice(0)) {
+      try {
+        off();
+      } catch {
+        // A listener that is already gone needs no cleanup.
+      }
+    }
+  }
+
+  function register(ctx) {
+    // A second register() (disable, then enable) starts clean: drop the old activation first.
+    if (!disposed) dispose();
+    disposed = false;
+    generation += 1;
+    activation += 1;
+    inFlight = 0;
+    lastKey = null;
+    scopedTimeout = null;
+    $status.set({ loading: false, error: null, note: null });
+    $ui.set(freshUi());
+    // ctx.setTimeout: the host clears it on unload (apps/desktop/src/contrib/plugin.ts).
+    if (typeof ctx?.setTimeout === 'function') scopedTimeout = (fn, ms) => ctx.setTimeout(fn, ms);
+    if (typeof ctx?.onDispose === 'function') ctx.onDispose(dispose);
+    for (const name of ['focusedStoredSessionId', 'focusedSessionId', 'activeSessionId', 'focusedSessionOwner', 'connectionId', 'profile']) {
+      const store = host?.state?.[name];
+      if (typeof store?.listen === 'function') unsubscribers.push(store.listen(onFocus));
+    }
+    onFocus();
+    cancelTimer = schedule(tick, REFRESH_MS);
+    ctx.register({
+      id: PANE_ID,
+      area: 'panes',
+      title: 'Chat tree',
+      data: { placement: 'right', width: '320px' },
+      render: renderPane,
+    });
+    ctx.register({
+      id: 'open-chat-tree',
+      area: 'palette',
+      data: {
+        id: 'open-chat-tree',
+        label: 'Open chat tree',
+        keywords: ['tree', 'branch', 'subagent', 'lineage'],
+        run: () => {
+          if (typeof host?.revealPane === 'function') host.revealPane(`${PLUGIN_ID}:${PANE_ID}`);
+        },
+      },
+    });
+  }
+
+  return { register, renderPane, load, openChat, dispose, $data, $status, $ui };
+}

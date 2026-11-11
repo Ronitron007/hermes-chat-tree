@@ -2,6 +2,8 @@
 // and shows the answer here. The main chat gets no new message.
 // Plain ESM with no imports: the SDK pieces, timers and clock are injected so it runs under node --test.
 // Spec: docs/research/2026-11-11-chat-tree/spec-side-chat.md
+// Verbatim merge-back: docs/research/2026-11-11-chat-tree/spec-merge-back.md
+// Merge modes: docs/specs/2026-11-12-competition-build/spec.md `unit.merge_modes`
 
 export const PLUGIN_ID = 'side-chat';
 export const PANE_ID = 'pane';
@@ -12,9 +14,50 @@ export const PAGE_LIMIT = 200;
 export const MODEL_KEY = 'sideChat:model';
 export const BUSY_TEXT = 'The main chat is busy. Ask again when the run ends.';
 export const TIMEOUT_TEXT = 'No answer yet. Open the branch to see it.';
+export const MERGE_STAGED_TEXT =
+  'The draft is in the main chat composer. Edit it and send. After sending, session.undo on an idle parent can drop that turn.';
+export const MERGE_HIDDEN_TEXT = "The main chat's composer is not visible. Open the main chat and try again.";
+export const MERGE_NO_COMPOSER_TEXT = 'The composer draft API is missing. Nothing was written.';
 
 export const listKey = (chatId) => `sideChat:${chatId}`;
 export const branchName = (question) => `Side: ${question.slice(0, 50)}`;
+
+// Shared with chat-tree through globalThis: assembled plugins cannot import each other.
+// Hermes retitles a side branch, so the side mark is keyed by these ids, with the title prefix as fallback.
+const SIDE_BRANCH_IDS = '__hermesSideChatBranchIds';
+
+function sideBranchIds() {
+  if (!(globalThis[SIDE_BRANCH_IDS] instanceof Set)) {
+    const ids = new Set();
+    try {
+      const raw = globalThis.localStorage?.getItem?.(SIDE_BRANCH_IDS);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(parsed)) {
+        for (const id of parsed) if (typeof id === 'string' && id) ids.add(id);
+      }
+    } catch {
+      // node tests have no localStorage; a bad stored value must not break the pane.
+    }
+    globalThis[SIDE_BRANCH_IDS] = ids;
+  }
+  return globalThis[SIDE_BRANCH_IDS];
+}
+
+export function rememberSideBranch(id) {
+  if (typeof id !== 'string' || !id) return;
+  const ids = sideBranchIds();
+  if (ids.has(id)) return;
+  ids.add(id);
+  try {
+    globalThis.localStorage?.setItem?.(SIDE_BRANCH_IDS, JSON.stringify([...ids]));
+  } catch {
+    // Persistence is best effort.
+  }
+}
+
+export function isKnownSideBranch(id) {
+  return typeof id === 'string' && id !== '' && sideBranchIds().has(id);
+}
 
 // Pane text must be copyable; the spike log was not.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text' };
@@ -27,6 +70,383 @@ const errorText = (error) => str(error?.message) || str(error) || 'Unknown error
 // The canonical gateway refuses a mutation it cannot run now as reason `session_busy`
 // (hermes_state_mutation_guards.py busy_refusal); the desktop sends branch_whole as that mutation.
 const isBusy = (error) => /busy/i.test(`${error?.data?.reason ?? ''} ${errorText(error)}`);
+
+// Transcript rows on this Hermes may carry text, a string content, or content parts.
+export function rowText(row) {
+  const direct = typeof row?.text === 'string' ? row.text.trim() : '';
+  if (direct) return direct;
+  const content = row?.content;
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  return content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('').trim();
+}
+
+// Copied parent rows (row_id at or under the fence) stay out of a merge.
+// The Digest merge mode takes its answer from digestTurn; formatSideDigest / digestFromRows keep the old digest text.
+export function rowsAfterFence(rows, maxRowId) {
+  if (!Number.isFinite(maxRowId) || !Array.isArray(rows)) return [];
+  return rows.filter((row) => {
+    const id = row?.row_id;
+    if (!Number.isFinite(id)) return true;
+    return id > maxRowId;
+  });
+}
+
+export function formatSideDigest(question, answer) {
+  return `From side question:\n\nQuestion: ${question}\n\nAnswer:\n${answer}`;
+}
+
+function turnFromNewRows(rows) {
+  let question = '';
+  let answer = '';
+  for (const row of rows) {
+    if (row?.role === 'user') {
+      // First complete turn only: a later user stops once this pair is in hand.
+      if (question && answer) break;
+      const text = rowText(row);
+      if (!question && text) question = text;
+    } else if (row?.role === 'assistant' && question) {
+      const text = rowText(row);
+      if (text) answer = text;
+    }
+  }
+  if (!question || !answer) return null;
+  return { question, answer };
+}
+
+// Legacy entries stored no fence. Match the side question instead of the copied parent turn.
+function turnWithoutFence(rows, question, stored) {
+  const list = Array.isArray(rows) ? rows : [];
+  let start = -1;
+  if (question) {
+    for (let i = 0; i < list.length; i++) {
+      if (list[i]?.role === 'user' && rowText(list[i]) === question) start = i;
+    }
+  }
+  if (start < 0) return { question, answer: stored };
+  let answer = '';
+  for (let i = start + 1; i < list.length; i++) {
+    if (list[i]?.role === 'user') break;
+    if (list[i]?.role === 'assistant') {
+      const text = rowText(list[i]);
+      if (text) answer = text;
+    }
+  }
+  return { question, answer: answer || stored };
+}
+
+// The side question and its final answer: the first complete side turn after the fence, else the
+// stored question and answer (fallback is the entry).
+export function digestTurn(rows, maxRowId, fallback) {
+  const question = str(fallback?.question);
+  const stored = str(fallback?.answer);
+  if (!Number.isFinite(maxRowId)) return turnWithoutFence(rows, question, stored);
+  const turn = turnFromNewRows(rowsAfterFence(rows, maxRowId));
+  return { question: turn?.question ?? question, answer: turn?.answer ?? stored };
+}
+
+export function digestFromRows(rows, maxRowId, fallback) {
+  const { question, answer } = digestTurn(rows, maxRowId, fallback);
+  return formatSideDigest(question, answer);
+}
+
+// ASCII path of agent/model_metadata.py estimate_tokens_rough: CHARS_PER_TOKEN = 4, (len+3)//4.
+// SessionMessage has no token_count, and the side session's context_used includes copied parent
+// history, so the verbatim setDraft payload is estimated from its own text.
+export function estimateTokens(text) {
+  if (typeof text !== 'string' || text.length === 0) return 0;
+  return Math.floor((text.length + 3) / 4);
+}
+
+function formatTokenCount(n) {
+  const value = Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
+  return String(Math.trunc(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function finiteNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+// Parent window from session.usage (TUI UsageStats, possibly nested under .usage),
+// session.stats (last_prompt_tokens / context_length / context_tokens), or session.context_breakdown.
+export function parseContextHeadroom(payload) {
+  const sources = [];
+  const push = (obj) => {
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) sources.push(obj);
+  };
+  push(payload);
+  push(payload?.usage);
+  push(payload?.usage_stats);
+  for (const src of sources) {
+    const max = finiteNumber(src.context_max) ?? finiteNumber(src.context_length);
+    if (max == null || max <= 0) continue;
+    const used = finiteNumber(src.context_used) ?? finiteNumber(src.last_prompt_tokens) ?? finiteNumber(src.context_tokens) ?? 0;
+    let estimated = false;
+    if (typeof src.context_estimated === 'boolean') estimated = src.context_estimated;
+    else if (typeof src.context_source === 'string' && src.context_source && src.context_source !== 'provider_usage') {
+      estimated = true;
+    }
+    return { used, max, available: Math.max(0, max - used), estimated };
+  }
+  return null;
+}
+
+// Every user/assistant pair. Tool and system rows are not turns. Each user starts a turn.
+// Following non-empty assistant texts until the next user are that answer, joined with newlines.
+export function turnsFromRows(rows) {
+  const turns = [];
+  let question = '';
+  let parts = [];
+  const flush = () => {
+    if (question && parts.length) turns.push({ question, answer: parts.join('\n') });
+    question = '';
+    parts = [];
+  };
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const role = row?.role;
+    if (role === 'tool' || role === 'system') continue;
+    if (role === 'user') {
+      flush();
+      question = rowText(row);
+      continue;
+    }
+    if (role === 'assistant' && question) {
+      const text = rowText(row);
+      if (text) parts.push(text);
+    }
+  }
+  flush();
+  return turns;
+}
+
+// The first line of every merge text. `question` is the side question exactly as prompt.submit sent
+// it (entry.question): the chat tree links a merge by matching it to the side chat's first own user message.
+export function mergeHeader(question) {
+  return `From side chat: ${str(question) || 'Side chat'}`;
+}
+
+export function formatSideVerbatim(title, turns) {
+  const list = Array.isArray(turns) ? turns : [];
+  const blocks = list.map((turn) => `You:\n${turn.question}\n\nAssistant:\n${turn.answer}`);
+  return `${mergeHeader(title)}\n\n${blocks.join('\n\n')}`;
+}
+
+// Merge modes. The user picks one per side chat; Full text is the default.
+export const MERGE_MODES = [
+  { id: 'full', label: 'Full text' },
+  { id: 'record', label: 'Merge record' },
+  { id: 'digest', label: 'Digest' },
+];
+export const DEFAULT_MERGE_MODE = 'full';
+
+export function mergeModeOf(mode) {
+  return MERGE_MODES.some((m) => m.id === mode) ? mode : DEFAULT_MERGE_MODE;
+}
+
+export function mergeModeLabel(mode) {
+  const id = mergeModeOf(mode);
+  return MERGE_MODES.find((m) => m.id === id).label;
+}
+
+export function formatSideRecord(question, sideId) {
+  return `${mergeHeader(question)}\n\nSide chat id: ${str(sideId)}`;
+}
+
+// The header already holds the question, so a digest is the header and the final answer.
+export function formatSideDigestText(question, answer) {
+  return `${mergeHeader(question)}\n\n${str(answer)}`;
+}
+
+// The staged text of a mode. parts: { question, sideId, turns, answer }. Full text uses turns,
+// Digest the final answer, Merge record the side chat id. Concept-link markup is removed below
+// the header line; the header stays exact so the tree can match it.
+export function formatMergeText(mode, parts) {
+  const p = parts && typeof parts === 'object' ? parts : {};
+  const id = mergeModeOf(mode);
+  let text;
+  if (id === 'record') text = formatSideRecord(p.question, p.sideId);
+  else if (id === 'digest') text = formatSideDigestText(p.question, p.answer);
+  else text = formatSideVerbatim(p.question, p.turns);
+  const cut = text.indexOf('\n');
+  return text.slice(0, cut) + stripConceptMarkup(text.slice(cut));
+}
+
+// ── Concept-link markup removal ──
+// Merged text is plain prose: `::termline{v=… t=…}` becomes its v sentence, `::term{name=… def=…}`
+// its name, and `[[name|def]]` its name. Rules copied from src/termline.js (the bundle has no
+// imports). Fenced and inline code stay as written: a directive never goes in code, and code may
+// hold `[[ a || b ]]`. Anything that does not parse stays as written.
+
+const TERMLINE_OPEN = '::termline{';
+const TERM_OPEN = '::term{';
+// termline.js unescapeTermlineValue's set, plus the quotes a quoted attribute value may escape.
+const ATTR_ESCAPED = /\\([\\`*_~[\]<>$&"'])/g;
+const ATTR_KEY = /[A-Za-z_][\w.:-]*/y;
+const ATTR_BARE = /[^\s"'=<>`{}]+/y;
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})\s*$/;
+
+// termline.js scanMarkers, sentence only. An earlier unmatched `[[` stays text, and a marker with
+// an empty name keeps its characters. needPipe: outside a termline only `[[name|def]]` is markup.
+function stripMarkers(input, needPipe) {
+  let out = '';
+  let pos = 0;
+  while (pos < input.length) {
+    const first = input.indexOf('[[', pos);
+    const close = first === -1 ? -1 : input.indexOf(']]', first + 2);
+    if (close === -1) break;
+    const open = input.lastIndexOf('[[', close - 2);
+    const inner = input.slice(open + 2, close);
+    const sep = inner.indexOf('|');
+    const name = (sep === -1 ? inner : inner.slice(0, sep)).trim();
+    if (name === '' || (needPipe && sep === -1)) {
+      out += input.slice(pos, open + 2);
+      pos = open + 2;
+      continue;
+    }
+    out += input.slice(pos, open) + name;
+    pos = close + 2;
+  }
+  return out + input.slice(pos);
+}
+
+// Index of the quote that closes the value opened at j, or -1. A backslash escapes the next character.
+function quoteEnd(s, j) {
+  for (let k = j + 1; k < s.length; k++) {
+    if (s[k] === '\\') k += 1;
+    else if (s[k] === s[j]) return k;
+    else if (s[k] === '\n' || s[k] === '\r') return -1;
+  }
+  return -1;
+}
+
+// The directive at i as { end, text }, or null. Values are "double", 'single' or bare.
+function directiveAt(s, i) {
+  const termline = s.startsWith(TERMLINE_OPEN, i);
+  if (!termline && !s.startsWith(TERM_OPEN, i)) return null;
+  const attrs = Object.create(null);
+  let j = i + (termline ? TERMLINE_OPEN : TERM_OPEN).length;
+  for (;;) {
+    while (s[j] === ' ' || s[j] === '\t') j += 1;
+    if (s[j] === '}') break;
+    ATTR_KEY.lastIndex = j;
+    const key = ATTR_KEY.exec(s);
+    if (!key) return null;
+    j = ATTR_KEY.lastIndex;
+    let value = '';
+    if (s[j] === '=') {
+      j += 1;
+      if (s[j] === '"' || s[j] === "'") {
+        const end = quoteEnd(s, j);
+        if (end === -1) return null;
+        value = s.slice(j + 1, end).replace(ATTR_ESCAPED, '$1');
+        j = end + 1;
+      } else {
+        ATTR_BARE.lastIndex = j;
+        const bare = ATTR_BARE.exec(s);
+        if (!bare) return null;
+        value = bare[0];
+        j = ATTR_BARE.lastIndex;
+      }
+    }
+    attrs[key[0]] = value;
+  }
+  if (termline) {
+    const sentence = (attrs.v ?? '').trim() || (attrs.text ?? '').trim();
+    return { end: j + 1, text: stripMarkers(sentence, false) };
+  }
+  const name = (attrs.name ?? '').trim();
+  return name ? { end: j + 1, text: name } : null;
+}
+
+// End of the code span whose opening run of `run` backticks starts at i, or -1 (the run is text).
+function codeSpanEnd(s, i, run) {
+  let j = s.indexOf('`', i + run);
+  while (j !== -1) {
+    let k = j;
+    while (s[k] === '`') k += 1;
+    if (k - j === run) return k;
+    j = s.indexOf('`', k);
+  }
+  return -1;
+}
+
+// One paragraph: code spans stay, directives become their text, markers their name.
+function stripInline(s) {
+  let out = '';
+  let text = '';
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === '`') {
+      let run = 1;
+      while (s[i + run] === '`') run += 1;
+      const end = codeSpanEnd(s, i, run);
+      if (end === -1) {
+        text += s.slice(i, i + run);
+        i += run;
+      } else {
+        out += stripMarkers(text, true) + s.slice(i, end);
+        text = '';
+        i = end;
+      }
+      continue;
+    }
+    const directive = s[i] === ':' ? directiveAt(s, i) : null;
+    if (directive) {
+      out += stripMarkers(text, true) + directive.text;
+      text = '';
+      i = directive.end;
+      continue;
+    }
+    text += s[i];
+    i += 1;
+  }
+  return out + stripMarkers(text, true);
+}
+
+export function stripConceptMarkup(text) {
+  if (typeof text !== 'string') return '';
+  const out = [];
+  let para = [];
+  let fence = null;
+  const flush = () => {
+    if (para.length) out.push(stripInline(para.join('\n')));
+    para = [];
+  };
+  for (const line of text.split('\n')) {
+    if (fence) {
+      out.push(line);
+      const close = FENCE_CLOSE.exec(line);
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null;
+      continue;
+    }
+    const open = FENCE_OPEN.exec(line);
+    if (open || !line.trim()) {
+      flush();
+      out.push(line);
+      if (open) fence = open[1];
+      continue;
+    }
+    para.push(line);
+  }
+  flush();
+  return out.join('\n');
+}
+
+// fields.mode: the mode label. The notice outlives a mode switch, so it names the mode.
+export function formatNoFitNotice(fields) {
+  const src = fields || {};
+  const sideEstimated = src.sideEstimated === true;
+  const windowEstimated = src.windowEstimated === true;
+  const mode = str(src.mode);
+  const side = `${formatTokenCount(src.sideTokens)} tokens${sideEstimated ? ' (estimated)' : ''}`;
+  const parent = `${formatTokenCount(src.used)} used of ${formatTokenCount(src.max)}${windowEstimated ? ', estimated' : ''}`;
+  return `Doesn't fit${mode ? ` (${mode})` : ''}: side chat is ${side}, parent has ${formatTokenCount(src.available)} available (${parent}).`;
+}
+
+export function formatMissingWindowNotice(sideTokens) {
+  return `${MERGE_STAGED_TEXT} Side chat is about ${formatTokenCount(sideTokens)} tokens (estimated). The parent context window was not reported.`;
+}
 
 // Poll readout, shown under each entry so a manual run can tell whether the host reports the
 // branch as busy (finding 2 of the review on PR #10).
@@ -59,6 +479,7 @@ function cleanEntry(e) {
     answer: opt(e.answer),
     error: opt(e.error),
     status: STATUSES.has(e.status) ? e.status : 'timeout',
+    maxRowId: Number.isFinite(e.maxRowId) ? e.maxRowId : null,
     at: typeof e.at === 'number' && Number.isFinite(e.at) ? e.at : 0,
     diag: cleanDiag(e.diag),
   };
@@ -71,7 +492,8 @@ export function createSideChat(deps) {
   // stored main chat id -> entries, newest first.
   const $lists = atom({});
   const $form = atom({ question: '', model: '', provider: '' });
-  // stored main chat id -> { notice, pending }. pending: a fork is in flight.
+  // stored main chat id -> { notice, pending, heldNotice, modes }. pending: a fork is in flight.
+  // heldNotice: a no-fit notice, cleared only by Dismiss. modes: side chat id -> merge mode.
   const $status = atom({});
   // Stand-in so the pane calls useValue the same number of times when host.state lacks an atom.
   const $none = atom(null);
@@ -133,7 +555,11 @@ export function createSideChat(deps) {
     write(listKey(chatId), next);
   }
 
-  const addEntry = (chatId, entry) => setList(chatId, [entry, ...($lists.get()[chatId] ?? [])]);
+  const addEntry = (chatId, entry) => {
+    rememberSideBranch(entry?.session_id);
+    rememberSideBranch(entry?.stored_session_id);
+    setList(chatId, [entry, ...($lists.get()[chatId] ?? [])]);
+  };
 
   function updateEntry(chatId, id, patch) {
     const list = $lists.get()[chatId] ?? [];
@@ -154,15 +580,33 @@ export function createSideChat(deps) {
         .map(cleanEntry)
         .filter((e) => e && !ids.has(e.id))
         .map((e) => (e.status === 'asking' && !polls.has(e.id) ? { ...e, status: 'timeout' } : e));
+      for (const entry of restored) {
+        rememberSideBranch(entry.session_id);
+        rememberSideBranch(entry.stored_session_id);
+      }
       const merged = [...current, ...restored].sort((a, b) => b.at - a.at).slice(0, MAX_ENTRIES);
       $lists.set({ ...$lists.get(), [chatId]: merged });
       if (current.length) write(listKey(chatId), merged);
     });
   }
 
+  // This Hermes (v0.23) has no session.transcript. Cache that and read session.history,
+  // which is one complete snapshot. An empty transcript page is not a missing method.
+  let transcriptMissing = false;
   const request = (params) => host.request('session.transcript', params);
-  const page = (sessionId, cursor) =>
-    request({ session_id: sessionId, order: 'oldest', limit: PAGE_LIMIT, ...(cursor ? { cursor } : {}) });
+  async function page(sessionId, cursor) {
+    const params = { session_id: sessionId, order: 'oldest', limit: PAGE_LIMIT, ...(cursor ? { cursor } : {}) };
+    if (!transcriptMissing) {
+      try {
+        return await request(params);
+      } catch {
+        transcriptMissing = true;
+      }
+    }
+    const history = await host.request('session.history', { session_id: sessionId });
+    const messages = Array.isArray(history?.messages) ? history.messages : [];
+    return { rows: messages, next_cursor: null, reset: true, complete: true };
+  }
 
   // Reads the copied history to its end before the question goes in. Only an EMPTY page means
   // caught up: the gateway also cuts pages at 2 MiB and between tool groups (session_stored_reads.py). The poll then starts from
@@ -176,7 +620,8 @@ export function createSideChat(deps) {
       const rows = Array.isArray(result?.rows) ? result.rows : [];
       for (const row of rows) if (Number.isFinite(row?.row_id)) maxRowId = Math.max(maxRowId ?? row.row_id, row.row_id);
       cursor = result?.next_cursor ?? cursor;
-      if (rows.length === 0) break;
+      // History is a complete snapshot. Without this, the fence rereads it until the cap.
+      if (result?.complete === true || rows.length === 0) break;
     }
     return { cursor, maxRowId };
   }
@@ -222,7 +667,11 @@ export function createSideChat(deps) {
         }
         for (const row of rows) {
           if (!isNew(row)) continue;
-          if (row?.role === 'user' && str(row.text) === entry.question) {
+          const text = rowText(row);
+          // A numeric fence already dropped copied rows, so any new user row is this turn.
+          // With no fence, only the exact question starts it.
+          const startsTurn = row?.role === 'user' && (text === entry.question || Number.isFinite(start.maxRowId));
+          if (startsTurn) {
             questionSeen = true;
             tail = [];
           } else if (questionSeen && (row?.role === 'assistant' || row?.role === 'tool')) {
@@ -230,13 +679,13 @@ export function createSideChat(deps) {
           }
         }
         cursor = result.next_cursor ?? (result.reset ? null : cursor);
-        // A full page means more rows wait; read on without the delay.
-        if (rows.length >= PAGE_LIMIT) return step();
+        // A full page means more rows wait; a complete history snapshot does not.
+        if (rows.length >= PAGE_LIMIT && result.complete !== true) return step();
       }
       const busy = Boolean(atomOf('busyBySession').get()?.[entry.session_id]);
       if (busy) seenBusy = true;
       const last = tail[tail.length - 1];
-      const candidate = last?.role === 'assistant' ? str(last.text) || null : null;
+      const candidate = last?.role === 'assistant' ? rowText(last) || null : null;
       if (candidate && !busy && (seenBusy || candidate === previous)) {
         return finish({ status: 'answered', answer: candidate, diag: diag(seenBusy ? 'busy-signal' : 'two-reads') });
       }
@@ -300,6 +749,7 @@ export function createSideChat(deps) {
       // No fence: the poll reads from the first page and matches the last question row it sees.
     }
     if (disposed) return;
+    if (Number.isFinite(start.maxRowId)) updateEntry(chatId, entry.id, { maxRowId: start.maxRowId });
 
     const params = { session_id: branch.session_id, text };
     // A blank model field keeps the session model: no override at all.
@@ -319,10 +769,192 @@ export function createSideChat(deps) {
       .then(null, () => {});
   }
 
+  // Pages the branch the same way the fence does, then the caller drops copied history.
+  async function transcriptRows(sessionId) {
+    const rows = [];
+    let cursor = null;
+    const seen = new Set();
+    for (let i = 0; i < 1000; i++) {
+      const result = await page(sessionId, cursor);
+      const batch = Array.isArray(result?.rows) ? result.rows : [];
+      rows.push(...batch);
+      const next = typeof result?.next_cursor === 'string' && result.next_cursor ? result.next_cursor : null;
+      if (batch.length === 0 || !next || next === cursor || seen.has(next)) break;
+      seen.add(next);
+      cursor = next;
+    }
+    return rows;
+  }
+
+  // Parent context window. Never the side session: branch_whole copies parent history, so that
+  // context_used would count the parent and falsely fail the fit check.
+  async function parentHeadroom() {
+    const ids = [];
+    const stored = listChatId();
+    if (typeof stored === 'string' && stored) ids.push(stored);
+    let focused = null;
+    try {
+      focused = atomOf('focusedSessionId').get();
+    } catch {
+      focused = null;
+    }
+    if (typeof focused === 'string' && focused && !ids.includes(focused)) ids.push(focused);
+    const methods = ['session.usage', 'session.stats', 'session.context_breakdown'];
+    for (const method of methods) {
+      for (const session_id of ids) {
+        try {
+          const window = parseContextHeadroom(await host.request(method, { session_id }));
+          if (window) return window;
+        } catch {
+          // A throw or a payload with no context max tries the next id, then the next method.
+        }
+      }
+    }
+    return null;
+  }
+
+  // The text of the picked mode, markup removed. Merge record needs no read. Full text and Digest
+  // read the branch and fall back to the stored question and answer.
+  async function mergeText(entry, mode) {
+    const id = mergeModeOf(mode);
+    const parts = { question: entry.question, sideId: entry.stored_session_id || entry.session_id };
+    if (id === 'record') return formatMergeText(id, parts);
+    let rows = null;
+    if (entry.session_id) {
+      try {
+        rows = await transcriptRows(entry.session_id);
+      } catch {
+        rows = null;
+      }
+    }
+    if (id === 'digest') return formatMergeText(id, { ...parts, answer: digestTurn(rows, entry.maxRowId, entry).answer });
+    const turns = turnsFromRows(rowsAfterFence(rows, entry.maxRowId));
+    if (!turns.length) turns.push({ question: str(entry.question), answer: str(entry.answer) });
+    return formatMergeText(id, { ...parts, turns });
+  }
+
+  // Stages the side chat in the parent composer, in the picked mode, when it fits. Never submits.
+  async function stageMerge(entry, mode) {
+    try {
+      if (disposed || entry?.status !== 'answered' || !str(entry?.answer)) return;
+      const parentId = listChatId();
+      const setDraft = host?.composer?.setDraft;
+      if (typeof setDraft !== 'function') {
+        setStatus(parentId, { notice: MERGE_NO_COMPOSER_TEXT });
+        return;
+      }
+      const text = await mergeText(entry, mode);
+      if (disposed) return;
+      // No host token count exists for this payload (SessionMessage has no token_count).
+      const sideTokens = estimateTokens(text);
+      const headroom = await parentHeadroom();
+      if (disposed) return;
+      if (headroom && sideTokens > headroom.available) {
+        // Held: ask(), polls and later merges leave it. Only Dismiss clears it.
+        setStatus(parentId, {
+          notice: null,
+          heldNotice: formatNoFitNotice({
+            sideTokens,
+            available: headroom.available,
+            used: headroom.used,
+            max: headroom.max,
+            sideEstimated: true,
+            windowEstimated: headroom.estimated === true,
+            mode: mergeModeLabel(mode),
+          }),
+        });
+        return;
+      }
+      if (typeof parentId !== 'string' || !parentId) {
+        setStatus(parentId, { notice: MERGE_HIDDEN_TEXT });
+        return;
+      }
+      if (typeof host?.openSession === 'function') {
+        try {
+          await host.openSession(parentId, { intent: 'in-place' });
+        } catch {
+          // setDraft is fail-closed when the parent composer is not mounted.
+        }
+      }
+      if (disposed) return;
+      let ok = false;
+      try {
+        ok = (await setDraft(parentId, text)) === true;
+      } catch {
+        ok = false;
+      }
+      if (!ok) {
+        let runtimeId = null;
+        try {
+          runtimeId = atomOf('focusedSessionId').get();
+        } catch {
+          runtimeId = null;
+        }
+        if (typeof runtimeId === 'string' && runtimeId) {
+          try {
+            ok = (await setDraft(runtimeId, text)) === true;
+          } catch {
+            ok = false;
+          }
+        }
+      }
+      if (disposed) return;
+      const staged = headroom ? MERGE_STAGED_TEXT : formatMissingWindowNotice(sideTokens);
+      setStatus(parentId, { notice: ok ? staged : MERGE_HIDDEN_TEXT });
+    } catch {
+      try {
+        setStatus(listChatId(), { notice: MERGE_HIDDEN_TEXT });
+      } catch {
+        // A click must not throw into the pane.
+      }
+    }
+  }
+
+  // Hermes listens for keys on window capture; the composer takes whatever still bubbles.
+  function stopHostEvent(event) {
+    event.stopPropagation?.();
+    event.stopImmediatePropagation?.();
+  }
+
   function setField(key, value) {
     const next = { ...$form.get(), [key]: value };
     $form.set(next);
     if (key !== 'question') write(MODEL_KEY, { model: next.model, provider: next.provider });
+  }
+
+  // Per side chat, in memory while the pane runs. Never stored.
+  function setMergeMode(chatId, entryId, mode) {
+    const modes = $status.get()[chatId ?? '']?.modes;
+    setStatus(chatId, { modes: { ...modes, [entryId]: mergeModeOf(mode) } });
+  }
+
+  function dismissNotice(chatId) {
+    setStatus(chatId, { heldNotice: null });
+  }
+
+  // One Button per mode; the picked one is pressed. Plain Buttons: every SDK version has them.
+  function modePicker(chatId, entryId, mode) {
+    return jsx('div', {
+      className: 'flex flex-wrap items-center gap-1',
+      style: SELECTABLE,
+      role: 'group',
+      'aria-label': 'Merge mode',
+      children: MERGE_MODES.map((m) =>
+        jsx(
+          Button,
+          {
+            type: 'button',
+            size: 'xs',
+            variant: m.id === mode ? 'secondary' : 'ghost',
+            'aria-pressed': m.id === mode,
+            'data-merge-mode': m.id,
+            onClick: () => setMergeMode(chatId, entryId, m.id),
+            children: m.label,
+          },
+          m.id,
+        ),
+      ),
+    });
   }
 
   function statusText(entry) {
@@ -333,12 +965,14 @@ export function createSideChat(deps) {
   }
 
   // No hooks here. The pane renders it as an element, never as a function call.
-  function EntryRow({ entry }) {
+  function EntryRow({ entry, chatId, mode }) {
     const when = entry.at ? new Date(entry.at).toLocaleTimeString() : '';
     const modelText = entry.model ? `${entry.model}${entry.provider ? ` (${entry.provider})` : ''}` : 'session model';
+    const picked = mergeModeOf(mode);
     return jsxs('div', {
       className: 'flex flex-col gap-1 rounded border p-2',
       style: SELECTABLE,
+      'data-side-chat': entry.id,
       children: [
         jsx('p', { className: 'text-sm font-semibold', style: PRE_STYLE, children: entry.question }),
         jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: `${modelText} · ${when}` }),
@@ -361,6 +995,15 @@ export function createSideChat(deps) {
           onClick: () => openBranch(entry),
           children: 'Open',
         }),
+        entry.status === 'answered' ? modePicker(chatId, entry.id, picked) : null,
+        entry.status === 'answered'
+          ? jsx(Button, {
+              type: 'button',
+              disabled: !str(entry.answer),
+              onClick: () => stageMerge(entry, picked),
+              children: 'Merge into parent',
+            })
+          : null,
       ].filter(Boolean),
     });
   }
@@ -385,6 +1028,9 @@ export function createSideChat(deps) {
       children: jsxs('div', {
         className: 'flex flex-col gap-2 p-4 text-sm',
         style: SELECTABLE,
+        onKeyDown: stopHostEvent,
+        onKeyUp: stopHostEvent,
+        onPointerDown: stopHostEvent,
         children: [
           jsx('p', {
             className: 'text-xs opacity-70',
@@ -397,25 +1043,63 @@ export function createSideChat(deps) {
             placeholder: 'Side question',
             onChange: (event) => setField('question', event.target.value),
             onKeyDown: (event) => {
+              stopHostEvent(event);
               if (event.key === 'Enter' && !event.shiftKey) {
                 event.preventDefault?.();
                 onAsk();
               }
             },
+            onKeyUp: stopHostEvent,
+            onPointerDown: stopHostEvent,
           }),
           jsx(Input, {
             value: form.model,
             placeholder: 'Side model (blank = session model)',
             onChange: (event) => setField('model', event.target.value),
+            onKeyDown: stopHostEvent,
+            onKeyUp: stopHostEvent,
+            onPointerDown: stopHostEvent,
           }),
           jsx(Input, {
             value: form.provider,
             placeholder: 'Side provider (optional)',
             onChange: (event) => setField('provider', event.target.value),
+            onKeyDown: stopHostEvent,
+            onKeyUp: stopHostEvent,
+            onPointerDown: stopHostEvent,
           }),
           jsx(Button, { type: 'button', disabled: !chatId || Boolean(status.pending), onClick: onAsk, children: 'Ask' }),
-          status.notice ? jsx('p', { className: 'text-xs', style: SELECTABLE, children: status.notice }) : null,
-          ...entries.map((entry) => jsx(EntryRow, { entry }, entry.id)),
+          status.notice
+            ? jsx('p', {
+                className: 'text-xs',
+                style: SELECTABLE,
+                'data-selectable-text': 'true',
+                children: status.notice,
+              })
+            : null,
+          status.heldNotice
+            ? jsxs('div', {
+                className: 'flex items-start justify-between gap-2',
+                style: SELECTABLE,
+                'data-held-notice': 'true',
+                children: [
+                  jsx('p', {
+                    className: 'text-xs',
+                    style: SELECTABLE,
+                    'data-selectable-text': 'true',
+                    children: status.heldNotice,
+                  }),
+                  jsx(Button, {
+                    type: 'button',
+                    size: 'xs',
+                    variant: 'ghost',
+                    onClick: () => dismissNotice(chatId),
+                    children: 'Dismiss',
+                  }),
+                ],
+              })
+            : null,
+          ...entries.map((entry) => jsx(EntryRow, { entry, chatId, mode: status.modes?.[entry.id] }, entry.id)),
         ].filter(Boolean),
       }),
     });
@@ -436,6 +1120,8 @@ export function createSideChat(deps) {
   }
 
   function register(ctx) {
+    // The loader calls register again on the same module after a disable and enable.
+    disposed = false;
     storage = ctx?.storage ?? null;
     if (typeof ctx?.setTimeout === 'function') scopedTimeout = (fn, ms) => ctx.setTimeout(fn, ms);
     if (typeof ctx?.onDispose === 'function') ctx.onDispose(dispose);
