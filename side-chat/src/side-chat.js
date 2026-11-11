@@ -2,7 +2,7 @@
 // and shows the answer here. The main chat gets no new message.
 // Plain ESM with no imports: the SDK pieces, timers and clock are injected so it runs under node --test.
 // Spec: docs/research/2026-11-11-chat-tree/spec-side-chat.md
-// Cherry-pick merge-back: docs/research/2026-11-11-chat-tree/spec-merge-back.md
+// Verbatim merge-back: docs/research/2026-11-11-chat-tree/spec-merge-back.md
 
 export const PLUGIN_ID = 'side-chat';
 export const PANE_ID = 'pane';
@@ -80,8 +80,8 @@ export function rowText(row) {
   return content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('').trim();
 }
 
-// Cherry-pick merge-back: a short plain-text digest of the side turn. Copied parent rows
-// (row_id at or under the fence) stay out. The user edits the digest and sends it.
+// Copied parent rows (row_id at or under the fence) stay out of a merge.
+// formatSideDigest / digestFromRows stay exported for a later digest option. stageMerge does not call them.
 export function rowsAfterFence(rows, maxRowId) {
   if (!Number.isFinite(maxRowId) || !Array.isArray(rows)) return [];
   return rows.filter((row) => {
@@ -142,6 +142,95 @@ export function digestFromRows(rows, maxRowId, fallback) {
   const question = turn?.question ?? str(fallback?.question);
   const answer = turn?.answer ?? str(fallback?.answer);
   return formatSideDigest(question, answer);
+}
+
+// ASCII path of agent/model_metadata.py estimate_tokens_rough: CHARS_PER_TOKEN = 4, (len+3)//4.
+// SessionMessage has no token_count, and the side session's context_used includes copied parent
+// history, so the verbatim setDraft payload is estimated from its own text.
+export function estimateTokens(text) {
+  if (typeof text !== 'string' || text.length === 0) return 0;
+  return Math.floor((text.length + 3) / 4);
+}
+
+function formatTokenCount(n) {
+  const value = Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
+  return String(Math.trunc(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function finiteNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+// Parent window from session.usage (TUI UsageStats, possibly nested under .usage),
+// session.stats (last_prompt_tokens / context_length / context_tokens), or session.context_breakdown.
+export function parseContextHeadroom(payload) {
+  const sources = [];
+  const push = (obj) => {
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) sources.push(obj);
+  };
+  push(payload);
+  push(payload?.usage);
+  push(payload?.usage_stats);
+  for (const src of sources) {
+    const max = finiteNumber(src.context_max) ?? finiteNumber(src.context_length);
+    if (max == null || max <= 0) continue;
+    const used = finiteNumber(src.context_used) ?? finiteNumber(src.last_prompt_tokens) ?? finiteNumber(src.context_tokens) ?? 0;
+    let estimated = false;
+    if (typeof src.context_estimated === 'boolean') estimated = src.context_estimated;
+    else if (typeof src.context_source === 'string' && src.context_source && src.context_source !== 'provider_usage') {
+      estimated = true;
+    }
+    return { used, max, available: Math.max(0, max - used), estimated };
+  }
+  return null;
+}
+
+// Every user/assistant pair. Tool and system rows are not turns. Each user starts a turn.
+// Following non-empty assistant texts until the next user are that answer, joined with newlines.
+export function turnsFromRows(rows) {
+  const turns = [];
+  let question = '';
+  let parts = [];
+  const flush = () => {
+    if (question && parts.length) turns.push({ question, answer: parts.join('\n') });
+    question = '';
+    parts = [];
+  };
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const role = row?.role;
+    if (role === 'tool' || role === 'system') continue;
+    if (role === 'user') {
+      flush();
+      question = rowText(row);
+      continue;
+    }
+    if (role === 'assistant' && question) {
+      const text = rowText(row);
+      if (text) parts.push(text);
+    }
+  }
+  flush();
+  return turns;
+}
+
+export function formatSideVerbatim(title, turns) {
+  const name = str(title) || 'Side chat';
+  const list = Array.isArray(turns) ? turns : [];
+  const blocks = list.map((turn) => `You:\n${turn.question}\n\nAssistant:\n${turn.answer}`);
+  return `From side chat: ${name}\n\n${blocks.join('\n\n')}`;
+}
+
+export function formatNoFitNotice(fields) {
+  const src = fields || {};
+  const sideEstimated = src.sideEstimated === true;
+  const windowEstimated = src.windowEstimated === true;
+  const side = `${formatTokenCount(src.sideTokens)} tokens${sideEstimated ? ' (estimated)' : ''}`;
+  const parent = `${formatTokenCount(src.used)} used of ${formatTokenCount(src.max)}${windowEstimated ? ', estimated' : ''}`;
+  return `Doesn't fit: side chat is ${side}, parent has ${formatTokenCount(src.available)} available (${parent}).`;
+}
+
+export function formatMissingWindowNotice(sideTokens) {
+  return `${MERGE_STAGED_TEXT} Side chat is about ${formatTokenCount(sideTokens)} tokens (estimated). The parent context window was not reported.`;
 }
 
 // Poll readout, shown under each entry so a manual run can tell whether the host reports the
@@ -481,7 +570,48 @@ export function createSideChat(deps) {
     return rows;
   }
 
-  // Stages a digest in the parent composer. Never submits, and never writes the parent transcript.
+  // Parent context window. Never the side session: branch_whole copies parent history, so that
+  // context_used would count the parent and falsely fail the fit check.
+  async function parentHeadroom() {
+    const ids = [];
+    const stored = listChatId();
+    if (typeof stored === 'string' && stored) ids.push(stored);
+    let focused = null;
+    try {
+      focused = atomOf('focusedSessionId').get();
+    } catch {
+      focused = null;
+    }
+    if (typeof focused === 'string' && focused && !ids.includes(focused)) ids.push(focused);
+    const methods = ['session.usage', 'session.stats', 'session.context_breakdown'];
+    for (const method of methods) {
+      for (const session_id of ids) {
+        try {
+          const window = parseContextHeadroom(await host.request(method, { session_id }));
+          if (window) return window;
+        } catch {
+          // A throw or a payload with no context max tries the next id, then the next method.
+        }
+      }
+    }
+    return null;
+  }
+
+  async function sideVerbatim(entry) {
+    let turns = null;
+    if (entry.session_id) {
+      try {
+        const fresh = turnsFromRows(rowsAfterFence(await transcriptRows(entry.session_id), entry.maxRowId));
+        if (fresh.length) turns = fresh;
+      } catch {
+        turns = null;
+      }
+    }
+    if (!turns) turns = [{ question: str(entry.question), answer: str(entry.answer) }];
+    return formatSideVerbatim(entry.question, turns);
+  }
+
+  // Stages the side exchange verbatim in the parent composer when it fits. Never submits.
   async function stageMerge(entry) {
     try {
       if (disposed || entry?.status !== 'answered' || !str(entry?.answer)) return;
@@ -491,15 +621,25 @@ export function createSideChat(deps) {
         setStatus(parentId, { notice: MERGE_NO_COMPOSER_TEXT });
         return;
       }
-      let digest = formatSideDigest(str(entry.question), str(entry.answer));
-      if (entry.session_id) {
-        try {
-          digest = digestFromRows(await transcriptRows(entry.session_id), entry.maxRowId, entry);
-        } catch {
-          digest = formatSideDigest(str(entry.question), str(entry.answer));
-        }
-      }
+      const verbatim = await sideVerbatim(entry);
       if (disposed) return;
+      // No host token count exists for this payload (SessionMessage has no token_count).
+      const sideTokens = estimateTokens(verbatim);
+      const headroom = await parentHeadroom();
+      if (disposed) return;
+      if (headroom && sideTokens > headroom.available) {
+        setStatus(parentId, {
+          notice: formatNoFitNotice({
+            sideTokens,
+            available: headroom.available,
+            used: headroom.used,
+            max: headroom.max,
+            sideEstimated: true,
+            windowEstimated: headroom.estimated === true,
+          }),
+        });
+        return;
+      }
       if (typeof parentId !== 'string' || !parentId) {
         setStatus(parentId, { notice: MERGE_HIDDEN_TEXT });
         return;
@@ -514,7 +654,7 @@ export function createSideChat(deps) {
       if (disposed) return;
       let ok = false;
       try {
-        ok = (await setDraft(parentId, digest)) === true;
+        ok = (await setDraft(parentId, verbatim)) === true;
       } catch {
         ok = false;
       }
@@ -527,14 +667,15 @@ export function createSideChat(deps) {
         }
         if (typeof runtimeId === 'string' && runtimeId) {
           try {
-            ok = (await setDraft(runtimeId, digest)) === true;
+            ok = (await setDraft(runtimeId, verbatim)) === true;
           } catch {
             ok = false;
           }
         }
       }
       if (disposed) return;
-      setStatus(parentId, { notice: ok ? MERGE_STAGED_TEXT : MERGE_HIDDEN_TEXT });
+      const staged = headroom ? MERGE_STAGED_TEXT : formatMissingWindowNotice(sideTokens);
+      setStatus(parentId, { notice: ok ? staged : MERGE_HIDDEN_TEXT });
     } catch {
       try {
         setStatus(listChatId(), { notice: MERGE_HIDDEN_TEXT });
@@ -597,7 +738,7 @@ export function createSideChat(deps) {
               type: 'button',
               disabled: !str(entry.answer),
               onClick: () => stageMerge(entry),
-              children: 'Stage merge',
+              children: 'Merge into parent',
             })
           : null,
       ].filter(Boolean),
