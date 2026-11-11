@@ -29,43 +29,41 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
 | Part | Files | Job |
 |---|---|---|
 | Desktop half | `desktop/plugin.js` (built from `src/`) | The tree pane |
-| Python half | `plugin.yaml`, `__init__.py`, `dashboard/` | The digest route |
+| Python half | `plugin.yaml`, `__init__.py` | The digest RPC method |
 
-## The digest route
+## The digest method
 
-The Desktop half calls the route through `ctx.rest('/digest', { method: 'POST', body })`. Hermes serves it at `POST /api/plugins/chat-tree/digest`.
+The Python half follows the plugin RPC path that Hermes documents for `ctx.llm` from a frontend. The pane calls the method with `host.request`:
 
-Request:
-
-```json
-{ "purpose": "fork", "title": "Rust lifetimes", "exchanges": [{ "question": "…", "answer": "…" }] }
+```js
+host.request('plugin.chat-tree.digest.write', { session_id, purpose, title, exchanges })
 ```
 
 - `purpose` is `fork` or `merge`.
 
-- `exchanges` are oldest first.
+- `exchanges` is a list of `{ question, answer }` objects, oldest first.
 
-Response:
+- The call answers `{ job }` at once. A bad request fails the call with the reason `plugin_rpc_failed`.
 
-- HTTP 200 with `{ "ok": true, "digest": "…" }` when the model wrote a digest.
+- At most 4 digests run at one time. A fifth call fails until one of them ends.
 
-- HTTP 200 with `{ "ok": false, "error": "…" }` when the model call or its reply failed.
+The model writes the digest in a worker thread. Then the pane gets the gateway event `plugin.chat-tree.digest.written` for that session:
 
-- HTTP 400 with `{ "ok": false, "error": "…" }` when the request does not have the shape above.
+- `{ job, digest }` when the model wrote a digest.
+
+- `{ job, error }` when the model call or its reply failed. The Python half never writes a digest of its own.
 
 A `fork` digest has 3 to 5 bullet lines and fewer than 80 words. It covers the chat up to the fork. A `merge` digest has fewer than 120 words. It tells what the branch asked, what it concluded, and the key facts. Both digests use only facts from the exchanges.
 
-The route sends at most 24,000 characters of exchanges to the model. It cuts each question and each answer to 6,000 characters. Then it leaves out the oldest exchanges first, and it tells the model how many it left out.
+The method sends at most 24,000 characters of exchanges to the model. It cuts each question and each answer to 6,000 characters. Then it leaves out the oldest exchanges first, and it tells the model how many it left out. It masks secrets in the text before the model call.
 
-## How the route reaches the model
+## How the method calls the model
 
-- `register(ctx)` in `__init__.py` registers the auxiliary task `chat_tree_digest` and keeps `ctx`.
+- `register(ctx)` in `__init__.py` registers the auxiliary task `chat_tree_digest` and the RPC method `digest.write`.
 
-- The route calls `ctx.llm.complete_structured` with the JSON schema `{ digest: string }`, temperature 0, and `task="chat_tree_digest"`.
+- The worker thread calls `ctx.llm.complete_structured` with the JSON schema `{ digest: string }`, temperature 0, and `task="chat_tree_digest"`.
 
-- Hermes runs `register(ctx)` and the route in the same process. The two halves share `dashboard/digest.py` through one module name. The comment at the top of that file gives the evidence in the Hermes source.
-
-- If the plugin is not loaded in that process, the route answers `ok: false` with the fix. It never writes a digest of its own.
+- The thread then calls `ctx.emit_to_session` with the result.
 
 ## Choose the digest model
 
@@ -101,7 +99,7 @@ npm run test:chat-tree
 <hermes venv>/bin/python chat-tree/tests_py/test_digest.py
 ```
 
-The Python tests need FastAPI and httpx. No test calls a model.
+The Python tests import `agent.redact` and `agent.plugin_llm` from the Hermes source. No test calls a model.
 
 ## Limits
 

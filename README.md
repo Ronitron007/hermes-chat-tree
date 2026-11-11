@@ -67,10 +67,10 @@ The script copies files only. It runs no `hermes` command. It writes these files
 
 | Plugin | Files in the Hermes home |
 |---|---|
-| chat-tree | `desktop-plugins/chat-tree/plugin.js`, `plugins/chat-tree/` (`plugin.yaml`, `__init__.py`, `dashboard/`) |
+| chat-tree | `desktop-plugins/chat-tree/plugin.js`, `plugins/chat-tree/` (`plugin.yaml`, `__init__.py`) |
 | concept-links | `desktop-plugins/concept-links/plugin.js`, `plugins/concept-links/`, `skills/concept-links/SKILL.md` |
 
-The Python half of chat-tree serves one route, `POST /api/plugins/chat-tree/digest`. Hermes mounts the route only for a plugin in `plugins.enabled`. The command `hermes plugins enable chat-tree` puts it there.
+The Python half of chat-tree serves one plugin RPC method, `plugin.chat-tree.digest.write`. Hermes loads the Python half only for a plugin in `plugins.enabled`. The command `hermes plugins enable chat-tree` puts it there.
 
 ## How to use
 
@@ -105,7 +105,7 @@ npm test
 <hermes venv>/bin/python chat-tree/tests_py/test_digest.py
 ```
 
-The Python tests need FastAPI and httpx. The Python of the Hermes install has both.
+The Python tests import `agent.redact` and `agent.plugin_llm` from the Hermes source. No test calls a model.
 
 ## Limits
 
@@ -126,7 +126,7 @@ The Python tests need FastAPI and httpx. The Python of the Hermes install has bo
 | | study-tree | This entry |
 |---|---|---|
 | Where you ask | In the main chat, through an agent tool | On a branch, from the tree pane |
-| Parts | Agent tools, hooks, a skill, and a Desktop half | A Desktop pane and a Python half with one route |
+| Parts | Agent tools, hooks, a skill, and a Desktop half | A Desktop pane and a Python RPC method |
 | What comes back | The plugin adds one checked takeaway | Merge as-is or a model Digest, into any ancestor chat |
 | Tree | Side threads as a tree | One node for each exchange, with exact fork points and merge curves |
 

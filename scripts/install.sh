@@ -5,8 +5,8 @@
 #
 # Layout written:
 #   <home>/desktop-plugins/<id>/plugin.js      the Desktop bundle of each plugin
-#   <home>/plugins/chat-tree/                  the Python half of chat-tree (manifest, register(ctx),
-#                                              dashboard/ with the POST /digest route)
+#   <home>/plugins/chat-tree/                  the Python half of chat-tree (manifest, register(ctx)
+#                                              with the digest.write RPC method)
 #   <home>/plugins/concept-links/              the Python half of concept-links (manifest, hook, proxy)
 #   <home>/skills/concept-links/SKILL.md       the concept-links skill
 #
@@ -37,7 +37,6 @@ put() {
 }
 
 for f in desktop/plugin.js chat-tree/desktop/plugin.js chat-tree/plugin.yaml chat-tree/__init__.py \
-  chat-tree/dashboard/manifest.json chat-tree/dashboard/plugin_api.py chat-tree/dashboard/digest.py \
   plugin.yaml __init__.py lookup_sources.py dashboard/plugin_api.py skills/concept-links/SKILL.md; do
   need "$f"
 done
@@ -61,9 +60,6 @@ echo "chat-tree"
 put chat-tree/desktop/plugin.js "$home/desktop-plugins/chat-tree/plugin.js"
 put chat-tree/plugin.yaml "$home/plugins/chat-tree/plugin.yaml"
 put chat-tree/__init__.py "$home/plugins/chat-tree/__init__.py"
-put chat-tree/dashboard/manifest.json "$home/plugins/chat-tree/dashboard/manifest.json"
-put chat-tree/dashboard/plugin_api.py "$home/plugins/chat-tree/dashboard/plugin_api.py"
-put chat-tree/dashboard/digest.py "$home/plugins/chat-tree/dashboard/digest.py"
 find "$home/plugins/chat-tree" -type d -name __pycache__ -prune -exec rm -rf {} +
 
 prefix=""

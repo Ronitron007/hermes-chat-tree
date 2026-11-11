@@ -11,9 +11,10 @@ description: >-
   (auxiliary task chat_tree_digest, which follows the title generation model
   unless you set auxiliary.chat_tree_digest). Disclosure: reads up to 500
   persisted session summaries and the history of each chat in the focused
-  lineage through the public Desktop SDK. The Python half serves one route,
-  POST /api/plugins/chat-tree/digest, which sends the exchanges of one chat
-  (at most 24,000 characters, secrets redacted) to your configured model. No
+  lineage through the public Desktop SDK. The Python half serves one plugin
+  RPC method, plugin.chat-tree.digest.write, which sends the exchanges of one
+  chat (at most 24,000 characters, secrets redacted) to your configured model
+  and returns the digest as a session event. No
   other external services, credentials, filesystem access, shell, telemetry
   or self-updater.
 maintainer: Ronitron007
