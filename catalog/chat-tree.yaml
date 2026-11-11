@@ -4,13 +4,18 @@ repo: https://github.com/Ronitron007/hermes-concept-links
 sha: "0000000000000000000000000000000000000000"
 subdir: chat-tree
 description: >-
-  A git-graph tree of the open chat, its forks and its side chats, in a side
-  pane. Each node is one exchange. Blue marks the path to the open node and
-  grey marks the rest. Long runs fold to a +N row, and a click on a node opens
-  its chat. Disclosure: reads up to 500 persisted session summaries and the
-  history of each chat in the focused lineage through the public Desktop SDK.
-  No external services, credentials, filesystem access, shell, backend,
-  telemetry or self-updater.
+  One window for branching chats in Hermes Desktop. A side pane draws the open
+  chat and its branches as a git graph, one node for each exchange. Branch
+  from a node, ask on a cheaper model, and merge back into any ancestor chat
+  with Merge as-is or Digest. The model writes each digest through ctx.llm
+  (auxiliary task chat_tree_digest, which follows the title generation model
+  unless you set auxiliary.chat_tree_digest). Disclosure: reads up to 500
+  persisted session summaries and the history of each chat in the focused
+  lineage through the public Desktop SDK. The Python half serves one route,
+  POST /api/plugins/chat-tree/digest, which sends the exchanges of one chat
+  (at most 24,000 characters, secrets redacted) to your configured model. No
+  other external services, credentials, filesystem access, shell, telemetry
+  or self-updater.
 maintainer: Ronitron007
 tier: community
 category: desktop
@@ -22,6 +27,7 @@ platforms: []
 known_issues:
   - Requires Hermes Desktop.
   - A click opens the chat of a node. Hermes has no API to scroll to one message.
+  - Digests need hermes plugins enable chat-tree and a gateway restart.
 capabilities:
   provides_tools: []
   provides_hooks: []

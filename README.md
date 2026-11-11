@@ -1,36 +1,41 @@
-# Side chats and a chat tree for Hermes Desktop
+# A chat tree for Hermes Desktop
 
-This repository is one entry with three Hermes Desktop plugins:
-
-- **side-chat** asks a side question in a fork of the open chat. The fork can run on a cheaper model. The main chat gets no new message.
-
-- **chat-tree** draws the open chat, its forks, and its side chats as a git graph in a side pane. Each node is one exchange: one user message and its replies.
-
-- **concept-links** puts chips on technical terms in replies. A hover shows a short definition. A click opens the definition in a side pane.
+This entry is one window, the **Chat Tree** pane in Hermes Desktop. The pane draws the open chat and its branches as a git graph. You branch, ask, and merge from the same pane.
 
 The entry uses only the public plugin framework of Hermes. It changes no Hermes code.
 
 ## What the entry does
 
-- A side question runs in a fork of the open chat, so the main chat stays on topic. You can give the fork a cheaper model and a provider.
+- **Branch here.** Start a branch from a node of the tree. The branch is a new chat that continues after that exchange. Hermes names the branch.
 
-- The tree has one lane for each chat. A fork leaves its parent lane at the exact exchange where the child chat starts. A merge curves back into a `Merged: …` node on the parent lane.
+- **Ask on a cheaper model.** A branch can use a cheaper model. A side question then costs less, and the main chat stays on topic.
 
-- The tree uses two colours. Blue marks the path from the first exchange to the open node. Grey marks all other nodes.
+- **Merge back.** Merge a branch back into any ancestor chat on its path. You choose the merge mode:
 
-- A long run of exchanges folds into one `+N` row. A click on the row opens the run.
+  - **Merge as-is** copies the questions and answers of the branch.
 
-- A merge brings a side chat back into its parent. You choose the merge mode:
+  - **Digest** gives the ancestor a short digest of the branch. The digest tells what the branch asked, what it concluded, and the key facts.
 
-  - **Full text** (the default) copies each question and answer of the side chat.
+- **Digests by the model.** The model writes each digest through the plugin LLM access of Hermes (`ctx.llm.complete_structured`). At a fork, the model also writes a short digest of the chat up to the fork. A digest uses only facts from the exchanges.
 
-  - **Merge record** writes the header line and the side chat id only.
+- **Lanes and colours.** Each chat has its own lane. A branch leaves its parent lane at the exchange where it starts. A merge curves back into a node on the ancestor lane. Blue marks the path from the first exchange to the open node. Grey marks all other nodes.
 
-  - **Digest** writes the side question and the final answer of the side chat.
+- **Folded runs.** A long run of exchanges folds into one `+N` row. A click on the row opens the run.
 
-- Each merge text starts with the header line `From side chat: <side question>`. The side question is the first question that the pane sent to the side chat. The tree uses this line to draw the merge.
+## Which model writes the digests
 
-- The merge removes concept-link markup from the text and keeps the plain sentences.
+The Python half of chat-tree registers the auxiliary task `chat_tree_digest`. Until you choose a model for it, the task uses the model of the built-in title generation task. That model is usually a cheap one.
+
+To choose a model for digests, set `auxiliary.chat_tree_digest` in `config.yaml`:
+
+```yaml
+auxiliary:
+  chat_tree_digest:
+    provider: openrouter
+    model: vendor/model-id
+```
+
+Hermes Desktop shows the same setting in **Settings → Models → Auxiliary**.
 
 ## Install
 
@@ -48,6 +53,7 @@ You need Hermes 0.23 or later and Hermes Desktop.
 3. Run the commands that the script prints:
 
    ```bash
+   hermes plugins enable chat-tree
    hermes plugins disable concept-links
    hermes plugins enable concept-links
    hermes gateway restart -y --detach
@@ -61,69 +67,57 @@ The script copies files only. It runs no `hermes` command. It writes these files
 
 | Plugin | Files in the Hermes home |
 |---|---|
-| side-chat | `desktop-plugins/side-chat/plugin.js` |
-| chat-tree | `desktop-plugins/chat-tree/plugin.js` |
+| chat-tree | `desktop-plugins/chat-tree/plugin.js`, `plugins/chat-tree/` (`plugin.yaml`, `__init__.py`, `dashboard/`) |
 | concept-links | `desktop-plugins/concept-links/plugin.js`, `plugins/concept-links/`, `skills/concept-links/SKILL.md` |
 
-side-chat and chat-tree are Desktop-only plugins. They have no Python half, so the script puts nothing for them in `plugins/`.
+The Python half of chat-tree serves one route, `POST /api/plugins/chat-tree/digest`. Hermes mounts the route only for a plugin in `plugins.enabled`. The command `hermes plugins enable chat-tree` puts it there.
 
 ## How to use
 
-### Ask a side question
-
 1. Open a chat.
 
-2. Open the **Side chat** pane. The command palette has **Open side chat**.
+2. Open the **Chat tree** pane. The command palette has **Open chat tree**.
 
-3. Type the question. To use a cheaper model, type its name in the side model field.
+3. Point to a node to see the chat title and its model.
 
-4. Click **Ask**. The answer shows in the pane.
+4. Click a node to open its chat. Click a `+N` row to show the exchanges in it.
 
-5. To read the whole side chat, click **Open**.
+5. To ask a side question, choose **Branch here** on a node. To use a cheaper model, choose it for the branch.
 
-### Merge a side chat back
+6. To bring the branch back, choose the ancestor chat and the mode, **Merge as-is** or **Digest**.
 
-1. Choose the merge mode on the side chat entry.
-
-2. Click the merge button. The pane checks that the text fits in the context window of the main chat.
-
-3. Edit the text in the main chat composer, then send it. The pane never sends it for you.
-
-### Read the tree
-
-1. Open the **Chat tree** pane. The command palette has **Open chat tree**.
-
-2. Point to a node to see the chat title and its model.
-
-3. Click a node to open its chat.
-
-4. Click a `+N` row to show the exchanges in it.
-
-### Preview the panes without Hermes
+### Preview the pane without Hermes
 
 The render harness renders the real pane code with fixture chats to static HTML files.
 
 ```bash
 npm install
-npm run render        # writes dev/out/chat-tree.html and dev/out/side-chat.html
-npm run render:png    # also writes dev/out/chat-tree.png and dev/out/side-chat.png
+npm run render        # writes dev/out/chat-tree.html
+npm run render:png    # also writes dev/out/chat-tree.png
 ```
 
 Open the files in a browser. `render:png` needs Google Chrome in `/Applications`. The fixture chats are in `dev/fixtures/chats.json`.
+
+### Run the tests
+
+```bash
+npm test
+<hermes venv>/bin/python chat-tree/tests_py/test_digest.py
+```
+
+The Python tests need FastAPI and httpx. The Python of the Hermes install has both.
 
 ## Limits
 
 - Hermes has no API to scroll a chat to one message. A click on a node opens the chat of that node, at its usual scroll position.
 
-- The pane puts a merge in the main chat composer. It never sends it.
-
-- Digest is the side question and its final answer. No model writes a summary.
-
-- The main chat must be idle when you ask a side question. Hermes refuses to fork a busy chat.
-
 - The tree reads the newest 500 chats and at most 30 chats of one lineage.
 
-- A fork starts after the last exchange of the chat. A fork from an earlier message is not available yet.
+- Hermes refuses to branch a busy chat. Wait until the chat is idle.
+
+- A digest needs a model call. If the call fails, the pane gets an error and no digest. The backend never writes a digest of its own.
+
+- The backend sends at most 24,000 characters of exchanges to the model. It cuts each question and each answer to 6,000 characters. Then it leaves out the oldest exchanges first.
 
 ## How this differs from study-tree
 
@@ -131,9 +125,9 @@ Open the files in a browser. `render:png` needs Google Chrome in `/Applications`
 
 | | study-tree | This entry |
 |---|---|---|
-| Where you ask | In the main chat, through an agent tool | In a side pane, not in the main chat |
-| Parts | Agent tools, hooks, a skill, and a Desktop half | Desktop only for side-chat and chat-tree |
-| What comes back | The plugin adds one checked takeaway | You send Full text, Merge record, or Digest |
+| Where you ask | In the main chat, through an agent tool | On a branch, from the tree pane |
+| Parts | Agent tools, hooks, a skill, and a Desktop half | A Desktop pane and a Python half with one route |
+| What comes back | The plugin adds one checked takeaway | Merge as-is or a model Digest, into any ancestor chat |
 | Tree | Side threads as a tree | One node for each exchange, with exact fork points and merge curves |
 
 ## Credits
