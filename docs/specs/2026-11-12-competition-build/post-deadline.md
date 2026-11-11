@@ -160,6 +160,20 @@ A research agent read the code. These findings are inferred from the code and ar
 
 - A live check in Desktop: a click on the second exchange of the demo chat puts that exchange at the top of the view.
 
+## Unit `unit.font_swap`
+
+The branch name is bigger than the node text (Rohan, 2026-11-12 04:50: "branch name should be bigger"). Files: `chat-tree/src/chat-tree.js`, `chat-tree/test/chat-tree.test.js`, `chat-tree/desktop/plugin.js` (assembled).
+
+- In the exchanges view, a name row uses 14 px text. Before, it used 12 px (`NAME_TEXT`).
+
+- A node row uses 12 px text. Before, it used 14 px from the pane's `text-sm` class.
+
+- The branches view keeps 14 px names.
+
+- The row height, the circles, and the lane lines do not move.
+
+Check: `npm test` and `npm run assemble:chat-tree` exit 0, and a test reads the font size of a name row and of a node row.
+
 ## Process `post.process`
 
 - Opus implements each unit in its own worktree from `eb94f10`. The three units run at the same time. They change different functions of `chat-tree.js`: the marks and the status read, `submitBranch`, and the reveal. Merge them one at a time into `outbox/competition-entry`, and assemble `desktop/plugin.js` again after each merge.

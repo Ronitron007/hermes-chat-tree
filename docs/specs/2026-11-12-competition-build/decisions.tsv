@@ -51,3 +51,4 @@ date	decision	why	evidence	result	by
 2026-11-12 04:35	Reveal after data-session-switching clears, then correct the scroll each frame	A fixed 150 ms wait races the scroll restore, and placeholder heights move the target	list.tsx:468-485, 1140-1146; session-switching.ts:1-38	chosen	Claude
 2026-11-12 04:35	One fresh Opus review of all three units at the end	Rohan: we do the reviews in the end	chat with Rohan	chosen	Rohan
 2026-11-12 04:40	Run the three units at the same time, then merge one at a time	They change different functions of chat-tree.js; the bundle is assembled again after each merge	post-deadline.md post.process	chosen	Claude
+2026-11-12 04:50	Name rows use 14 px text and node rows use 12 px	Rohan: swap the font sizes, the branch name should be bigger	chat with Rohan	chosen	Rohan
