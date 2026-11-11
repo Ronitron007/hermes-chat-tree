@@ -11,6 +11,11 @@ import {
   MODEL_KEY,
   listKey,
   branchName,
+  rowsAfterFence,
+  digestFromRows,
+  MERGE_STAGED_TEXT,
+  MERGE_HIDDEN_TEXT,
+  MERGE_NO_COMPOSER_TEXT,
 } from '../src/side-chat.js';
 
 const el = (type, props, key) => ({ type, props, key });
@@ -747,4 +752,170 @@ test('after dispose and a second register (disable, then enable), a question sti
   await ask(ctx, 'still alive?');
   await ctx.clock.tick(POLL_MS * 3);
   assert.equal(entryOf(ctx).status, 'answered');
+});
+
+const DIGEST = (question, answer) => `From side question:\n\nQuestion: ${question}\n\nAnswer:\n${answer}`;
+
+test('rows after the fence are kept and copied history rows are not', () => {
+  const rows = [
+    { role: 'user', text: 'main question', row_id: 1 },
+    { role: 'assistant', text: 'main answer', row_id: 2 },
+    { role: 'user', text: 'side q', row_id: 3 },
+    { role: 'tool', text: 'search hit', row_id: 4 },
+    { role: 'assistant', text: 'side a', row_id: 5 },
+    { role: 'assistant', text: '   ', row_id: 6 },
+  ];
+  assert.deepEqual(
+    rowsAfterFence(rows, 2).map((row) => row.row_id),
+    [3, 4, 5, 6],
+  );
+  assert.equal(digestFromRows(rows, 2, { question: 'ignored', answer: 'ignored' }), DIGEST('side q', 'side a'));
+  // A copied row with no row id is still new to a fence, matching the poll. A missing fence keeps nothing.
+  assert.deepEqual(rowsAfterFence([{ role: 'user', text: 'loose', row_id: Number.NaN }], 2), [
+    { role: 'user', text: 'loose', row_id: Number.NaN },
+  ]);
+  assert.deepEqual(rowsAfterFence(rows, null), []);
+});
+
+test('digest falls back to the stored question and answer', () => {
+  const copied = [
+    { role: 'user', text: 'main question', row_id: 1 },
+    { role: 'assistant', text: 'main answer', row_id: 2 },
+  ];
+  assert.equal(digestFromRows(copied, 2, { question: 'stored q', answer: 'stored a' }), DIGEST('stored q', 'stored a'));
+  assert.equal(digestFromRows(null, 2, { question: 'stored q', answer: 'stored a' }), DIGEST('stored q', 'stored a'));
+  assert.equal(digestFromRows([], null, { question: 'stored q', answer: '  stored a  ' }), DIGEST('stored q', 'stored a'));
+});
+
+function stageButton(ctx) {
+  return findAll(expand(ctx.pane.render()), (n) => n.type === 'Button' && n.props.children === 'Stage merge')[0];
+}
+
+function withComposer(ctx, setDraft, submit = () => {}) {
+  const order = [];
+  const opened = ctx.host.opened;
+  ctx.host.openSession = async (id, opts) => {
+    order.push(['open', id, opts]);
+    opened.push([id, opts]);
+  };
+  ctx.host.composer = {
+    setDraft: async (id, text) => {
+      order.push(['draft', id, text]);
+      return setDraft(id, text);
+    },
+    submit: (...args) => {
+      order.push(['submit', ...args]);
+      return submit(...args);
+    },
+  };
+  return order;
+}
+
+test('Stage merge opens the parent in place and stages a digest without sending', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  await ask(ctx, 'what is a monad?');
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+  const button = stageButton(ctx);
+  assert.equal(button.props.disabled, false);
+  // The merge read sees copied history plus a newer turn than the one the poll stored.
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.transcript') {
+      ctx.host.calls.push([method, params]);
+      return {
+        rows: [
+          { role: 'user', text: 'main question', row_id: 101 },
+          { role: 'assistant', text: 'main answer', row_id: 102 },
+          { role: 'user', text: 'what is a monad?', row_id: 210 },
+          { role: 'assistant', text: 'fresh side answer', row_id: 211 },
+        ],
+        next_cursor: null,
+        reset: false,
+      };
+    }
+    return base(method, params);
+  };
+  await button.props.onClick();
+  assert.deepEqual(order.map((step) => step[0]), ['open', 'draft']);
+  assert.deepEqual(order[0], ['open', 'st-main', { intent: 'in-place' }]);
+  assert.equal(order[1][1], 'st-main');
+  assert.equal(order[1][2], DIGEST('what is a monad?', 'fresh side answer'));
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  const notice = findAll(expand(ctx.pane.render()), (n) => n.props?.children === MERGE_STAGED_TEXT)[0];
+  assert.equal(notice.props.style.userSelect, 'text');
+  assert.equal(notice.props['data-selectable-text'], 'true');
+  ctx.unload();
+});
+
+test('a false setDraft shows a notice and does not throw', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => false);
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 3);
+  await assert.doesNotReject(() => stageButton(ctx).props.onClick());
+  assert.deepEqual(
+    order.map((step) => step[0]),
+    ['open', 'draft', 'draft'],
+  );
+  assert.deepEqual(order[1].slice(0, 2), ['draft', 'st-main']);
+  assert.deepEqual(order[2].slice(0, 2), ['draft', 'rt-main']);
+  assert.match(order[1][2], /Question: q/);
+  assert.match(order[1][2], /side answer/);
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_HIDDEN_TEXT);
+  ctx.unload();
+});
+
+test('a thrown setDraft shows the same notice and does not throw', async () => {
+  const ctx = setup();
+  withComposer(ctx, () => {
+    throw new Error('composer gone');
+  });
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 3);
+  await assert.doesNotReject(() => stageButton(ctx).props.onClick());
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_HIDDEN_TEXT);
+  ctx.unload();
+});
+
+test('when session.transcript fails, Stage merge still uses the stored question and answer', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  await ask(ctx, 'stored question');
+  await ctx.clock.tick(POLL_MS * 3);
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.transcript') throw new Error('transcript down');
+    return base(method, params);
+  };
+  await stageButton(ctx).props.onClick();
+  assert.equal(order[1][2], DIGEST('stored question', 'side answer'));
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  ctx.unload();
+});
+
+test('Stage merge is disabled when there is no answer', async () => {
+  const asking = setup({ host: fakeHost({ script: () => {} }) });
+  await ask(asking, 'q');
+  assert.equal(stageButton(asking), undefined);
+  asking.unload();
+
+  const stored = [{ id: 'b9', question: 'q', session_id: 'b9', stored_session_id: 's9', status: 'answered', answer: '   ', at: 5 }];
+  const empty = setup({ storage: asyncStorage({ [listKey('st-main')]: stored }) });
+  await flush();
+  assert.equal(stageButton(empty).props.disabled, true);
+  empty.unload();
+});
+
+test('a missing composer draft API shows a notice and writes nothing', async () => {
+  const ctx = setup();
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 3);
+  const opened = ctx.host.opened.length;
+  await assert.doesNotReject(() => stageButton(ctx).props.onClick());
+  assert.equal(ctx.host.opened.length, opened);
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_NO_COMPOSER_TEXT);
+  ctx.unload();
 });

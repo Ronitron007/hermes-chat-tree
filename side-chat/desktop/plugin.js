@@ -19,6 +19,7 @@ const MessageTextContent = sdk.MessageTextContent
 // and shows the answer here. The main chat gets no new message.
 // Plain ESM with no imports: the SDK pieces, timers and clock are injected so it runs under node --test.
 // Spec: docs/research/2026-11-11-chat-tree/spec-side-chat.md
+// Cherry-pick merge-back: docs/research/2026-11-11-chat-tree/spec-merge-back.md
 
 const PLUGIN_ID = 'side-chat';
 const PANE_ID = 'pane';
@@ -29,6 +30,10 @@ const PAGE_LIMIT = 200;
 const MODEL_KEY = 'sideChat:model';
 const BUSY_TEXT = 'The main chat is busy. Ask again when the run ends.';
 const TIMEOUT_TEXT = 'No answer yet. Open the branch to see it.';
+const MERGE_STAGED_TEXT =
+  'The draft is in the main chat composer. Edit it and send. After sending, session.undo on an idle parent can drop that turn.';
+const MERGE_HIDDEN_TEXT = "The main chat's composer is not visible. Open the main chat and try again.";
+const MERGE_NO_COMPOSER_TEXT = 'The composer draft API is missing. Nothing was written.';
 
 const listKey = (chatId) => `sideChat:${chatId}`;
 const branchName = (question) => `Side: ${question.slice(0, 50)}`;
@@ -44,6 +49,42 @@ const errorText = (error) => str(error?.message) || str(error) || 'Unknown error
 // The canonical gateway refuses a mutation it cannot run now as reason `session_busy`
 // (hermes_state_mutation_guards.py busy_refusal); the desktop sends branch_whole as that mutation.
 const isBusy = (error) => /busy/i.test(`${error?.data?.reason ?? ''} ${errorText(error)}`);
+
+// Cherry-pick merge-back: a short plain-text digest of the side turn. Copied parent rows
+// (row_id at or under the fence) stay out. The user edits the digest and sends it.
+function rowsAfterFence(rows, maxRowId) {
+  if (!Number.isFinite(maxRowId) || !Array.isArray(rows)) return [];
+  return rows.filter((row) => {
+    const id = row?.row_id;
+    if (!Number.isFinite(id)) return true;
+    return id > maxRowId;
+  });
+}
+
+function formatSideDigest(question, answer) {
+  return `From side question:\n\nQuestion: ${question}\n\nAnswer:\n${answer}`;
+}
+
+function turnFromNewRows(rows) {
+  let question = '';
+  let answer = '';
+  for (const row of rows) {
+    const text = str(row?.text);
+    if (!text) continue;
+    if (row?.role === 'user') {
+      if (!question) question = text;
+    } else if (row?.role === 'assistant') answer = text;
+  }
+  if (!question || !answer) return null;
+  return { question, answer };
+}
+
+function digestFromRows(rows, maxRowId, fallback) {
+  const turn = turnFromNewRows(rowsAfterFence(rows, maxRowId));
+  const question = turn?.question ?? str(fallback?.question);
+  const answer = turn?.answer ?? str(fallback?.answer);
+  return formatSideDigest(question, answer);
+}
 
 // Poll readout, shown under each entry so a manual run can tell whether the host reports the
 // branch as busy (finding 2 of the review on PR #10).
@@ -76,6 +117,7 @@ function cleanEntry(e) {
     answer: opt(e.answer),
     error: opt(e.error),
     status: STATUSES.has(e.status) ? e.status : 'timeout',
+    maxRowId: Number.isFinite(e.maxRowId) ? e.maxRowId : null,
     at: typeof e.at === 'number' && Number.isFinite(e.at) ? e.at : 0,
     diag: cleanDiag(e.diag),
   };
@@ -317,6 +359,7 @@ function createSideChat(deps) {
       // No fence: the poll reads from the first page and matches the last question row it sees.
     }
     if (disposed) return;
+    if (Number.isFinite(start.maxRowId)) updateEntry(chatId, entry.id, { maxRowId: start.maxRowId });
 
     const params = { session_id: branch.session_id, text };
     // A blank model field keeps the session model: no override at all.
@@ -334,6 +377,86 @@ function createSideChat(deps) {
     Promise.resolve()
       .then(() => host.openSession(entry.stored_session_id, { intent: 'tab' }))
       .then(null, () => {});
+  }
+
+  // Pages the branch the same way the fence does, then the caller drops copied history.
+  async function transcriptRows(sessionId) {
+    const rows = [];
+    let cursor = null;
+    const seen = new Set();
+    for (let i = 0; i < 1000; i++) {
+      const result = await page(sessionId, cursor);
+      const batch = Array.isArray(result?.rows) ? result.rows : [];
+      rows.push(...batch);
+      const next = typeof result?.next_cursor === 'string' && result.next_cursor ? result.next_cursor : null;
+      if (batch.length === 0 || !next || next === cursor || seen.has(next)) break;
+      seen.add(next);
+      cursor = next;
+    }
+    return rows;
+  }
+
+  // Stages a digest in the parent composer. Never submits, and never writes the parent transcript.
+  async function stageMerge(entry) {
+    try {
+      if (disposed || entry?.status !== 'answered' || !str(entry?.answer)) return;
+      const parentId = listChatId();
+      const setDraft = host?.composer?.setDraft;
+      if (typeof setDraft !== 'function') {
+        setStatus(parentId, { notice: MERGE_NO_COMPOSER_TEXT });
+        return;
+      }
+      let digest = formatSideDigest(str(entry.question), str(entry.answer));
+      if (entry.session_id) {
+        try {
+          digest = digestFromRows(await transcriptRows(entry.session_id), entry.maxRowId, entry);
+        } catch {
+          digest = formatSideDigest(str(entry.question), str(entry.answer));
+        }
+      }
+      if (disposed) return;
+      if (typeof parentId !== 'string' || !parentId) {
+        setStatus(parentId, { notice: MERGE_HIDDEN_TEXT });
+        return;
+      }
+      if (typeof host?.openSession === 'function') {
+        try {
+          await host.openSession(parentId, { intent: 'in-place' });
+        } catch {
+          // setDraft is fail-closed when the parent composer is not mounted.
+        }
+      }
+      if (disposed) return;
+      let ok = false;
+      try {
+        ok = (await setDraft(parentId, digest)) === true;
+      } catch {
+        ok = false;
+      }
+      if (!ok) {
+        let runtimeId = null;
+        try {
+          runtimeId = atomOf('focusedSessionId').get();
+        } catch {
+          runtimeId = null;
+        }
+        if (typeof runtimeId === 'string' && runtimeId) {
+          try {
+            ok = (await setDraft(runtimeId, digest)) === true;
+          } catch {
+            ok = false;
+          }
+        }
+      }
+      if (disposed) return;
+      setStatus(parentId, { notice: ok ? MERGE_STAGED_TEXT : MERGE_HIDDEN_TEXT });
+    } catch {
+      try {
+        setStatus(listChatId(), { notice: MERGE_HIDDEN_TEXT });
+      } catch {
+        // A click must not throw into the pane.
+      }
+    }
   }
 
   function setField(key, value) {
@@ -378,6 +501,14 @@ function createSideChat(deps) {
           onClick: () => openBranch(entry),
           children: 'Open',
         }),
+        entry.status === 'answered'
+          ? jsx(Button, {
+              type: 'button',
+              disabled: !str(entry.answer),
+              onClick: () => stageMerge(entry),
+              children: 'Stage merge',
+            })
+          : null,
       ].filter(Boolean),
     });
   }
@@ -431,7 +562,14 @@ function createSideChat(deps) {
             onChange: (event) => setField('provider', event.target.value),
           }),
           jsx(Button, { type: 'button', disabled: !chatId || Boolean(status.pending), onClick: onAsk, children: 'Ask' }),
-          status.notice ? jsx('p', { className: 'text-xs', style: SELECTABLE, children: status.notice }) : null,
+          status.notice
+            ? jsx('p', {
+                className: 'text-xs',
+                style: SELECTABLE,
+                'data-selectable-text': 'true',
+                children: status.notice,
+              })
+            : null,
           ...entries.map((entry) => jsx(EntryRow, { entry }, entry.id)),
         ].filter(Boolean),
       }),
