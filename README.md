@@ -10,6 +10,8 @@ The entry uses only the public plugin framework of Hermes. It changes no Hermes 
 
 - **Ask on a cheaper model.** You can type a question when you branch, and pick the model and reasoning level for its answer in the model picker of Hermes. A side question on a cheaper model costs less, and the main chat stays on topic.
 
+- **Branch names and a Branches mode.** Each branch starts with a name row at its fork: the Hermes title of the chat and its model. The `Exchanges | Branches` switch beside the refresh icon shows one row for each chat instead, with its number of exchanges and a `merged` mark.
+
 - **Row actions.** When you point to a row, up to three icons show at its right edge: **Branch here** (the fork icon of Hermes), **Merge into**, and **Open in a tab**.
 
 - **Merge back.** Merge the open chat back into any ancestor chat on its path. **Merge into** opens a pick in two steps: first the ancestor (the parent comes first), then the mode. Each mode shows its size and whether it fits the context of the ancestor. You choose the mode:
