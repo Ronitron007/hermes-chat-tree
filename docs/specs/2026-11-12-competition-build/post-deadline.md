@@ -162,7 +162,7 @@ A research agent read the code. These findings are inferred from the code and ar
 
 ## Process `post.process`
 
-- Opus implements each unit in its own worktree from `eb94f10`. The units touch the same file, so they run one after another, and each one starts from the merge of the one before.
+- Opus implements each unit in its own worktree from `eb94f10`. The three units run at the same time. They change different functions of `chat-tree.js`: the marks and the status read, `submitBranch`, and the reveal. Merge them one at a time into `outbox/competition-entry`, and assemble `desktop/plugin.js` again after each merge.
 
 - A fresh Opus reviewer reviews all units together at the end (Rohan, 2026-11-12: "we do them in the end").
 
