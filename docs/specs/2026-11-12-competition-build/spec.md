@@ -38,7 +38,7 @@ Rebuild the `chat-tree` pane to `build.rules`. Files: `chat-tree/src/chat-tree.j
 
 - Fork point: the number of leading exchanges that a child shares with its parent. Draw the shared exchanges only on the parent lane.
 
-- Merge node: a parent exchange whose user message starts with `From side chat: `. Link it to the side chat whose title matches the text after the header. If no title matches, draw the merged node with no curve. Never guess a link.
+- Merge node: a parent exchange whose user message starts with `From side chat: `. Link it to the one side chat whose first own exchange has the same user text as the header, after whitespace normalization. If no chat or more than one chat matches, draw the merged node with no curve. Never guess a link.
 
 - Order: the oldest exchange is at the top.
 
@@ -64,7 +64,7 @@ Add the merge modes to the `side-chat` pane. Files: `side-chat/src/side-chat.js`
 
 - A mode picker on each side chat entry: Full text (default), Merge record, Digest. Remember the choice per side chat while the pane runs.
 
-- Every mode starts its text with the line `From side chat: <title>`, so that the tree can draw the merge.
+- Every mode starts its text with the line `From side chat: <side question>`, so that the tree can draw the merge. The side question is the first message that the side chat sent after the fork.
 
 - Full text: the current verbatim text (all You and Assistant pairs after the fork, with no tool rows).
 
