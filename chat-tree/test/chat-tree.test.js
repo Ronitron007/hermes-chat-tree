@@ -19,8 +19,10 @@ const MERGE_STAGED_TEXT =
   'The draft is in the main chat composer. Edit it and send. After sending, session.undo on an idle parent can drop that turn.';
 const MERGE_HIDDEN_TEXT = "The main chat's composer is not visible. Open the main chat and try again.";
 const MERGE_NO_COMPOSER_TEXT = 'The composer draft API is missing. Nothing was written.';
-const BLUE = '#3B82F6';
-const GREY = '#6B7280';
+// The theme colours the pane maps roles to: Hermes variables with the old fixed colours as fallbacks.
+const ACCENT = 'var(--ui-accent, #3B82F6)';
+const MUTED = 'var(--dt-muted-foreground, #6B7280)';
+const HOVER = 'var(--dt-foreground, currentColor)';
 
 // Side ids live on globalThis (shared with side-chat); every test starts with none.
 beforeEach(() => {
@@ -359,6 +361,10 @@ const planFor = (rows, focusedId, history, options = {}) => {
 };
 const keysOf = (plan) => plan.rows.map((r) => r.key);
 const blueOf = (plan) => plan.rows.filter((r) => r.blue).map((r) => r.key);
+const hoverOf = (plan) => plan.rows.filter((r) => r.hover).map((r) => r.key);
+// The graph's circles of a rendered pane, by shape key, as [stroke, fill].
+const circleColours = (tree) =>
+  Object.fromEntries(findAll(byAttr(tree, 'data-graph', 'true')[0], (n) => n.type === 'circle').map((c) => [c.key, [c.props.stroke, c.props.fill]]));
 const fakeEvent = (extra = {}) => ({
   stopped: 0,
   prevented: 0,
@@ -590,10 +596,40 @@ test('the open node defaults to the focused chat last exchange; a clicked node w
   assert.deepEqual(blueOf(clicked), ['root:0', 'root:1']);
   // A clicked node of another chat does not apply once focus moved on.
   assert.equal(planFor(ROWS, 'b1', HIST, { open: { chatId: 'root', index: 1 } }).plan.openKey, 'b1:2');
-  // A focused chat with nothing of its own opens the shared exchange on its parent lane.
+  // A focused fork with nothing of its own yet opens its stub, right after its fork node.
   const empty = planFor([...ROWS.slice(0, 3)], 'b2', { ...HIST, b2: HIST.b1 }).plan;
-  assert.equal(empty.openKey, 'b1:2');
-  assert.equal(empty.rows.some((r) => r.lane === 'b2'), false);
+  assert.equal(empty.openKey, 'b2:3');
+  assert.deepEqual(blueOf(empty), ['root:0', 'root:1', 'b1:2', 'b2:3']);
+  assert.deepEqual(empty.rows.filter((r) => r.lane === 'b2').map((r) => [r.key, r.stub]), [['b2:3', true]]);
+});
+
+test('a fork with no exchange of its own draws a stub node at its fork point, then a normal node', () => {
+  // nb forks root after q2 and has asked nothing yet: its history is the copied prefix only.
+  const rows = [...ROWS, row('nb', { _branched_from: 'root', started_at: 50, title: null })];
+  const history = { ...HIST, nb: msgs(['q1', 'a1'], ['q2', 'a2']) };
+  const { lanes, plan } = planFor(rows, 'b2', history);
+  assert.deepEqual(keysOf(plan), ['root:0', 'b3:1', 'root:1', 'b1:2', 'b2:3', 'nb:2', 'root:2']);
+  const stub = plan.rows.find((r) => r.key === 'nb:2');
+  assert.deepEqual([stub.stub, stub.label, stub.branchable, stub.open], [true, mod.NEW_BRANCH_TEXT, false, false]);
+  // Its fork elbow leaves root:1, the exact fork exchange, and runs to the stub.
+  const lane = plan.lanes.find((l) => l.id === 'nb');
+  assert.equal(plan.rows[lane.anchorRow].key, 'root:1');
+  assert.equal(lane.firstRow, keysOf(plan).indexOf('nb:2'));
+  const geo = mod.graphGeometry(plan);
+  assert.ok(geo.paths.some((p) => p.key === 'fork:nb'));
+  assert.ok(geo.circles.some((c) => c.key === 'nb:2'));
+  // The Hermes title once it has one; hover on the stub runs to the root.
+  const titled = planFor([...ROWS, row('nb', { _branched_from: 'root', started_at: 50, title: 'Why q2' })], 'nb', history, { hovered: 'nb:2' }).plan;
+  const open = titled.rows.find((r) => r.key === 'nb:2');
+  assert.deepEqual([open.label, open.open, open.hover], ['Why q2', true, true]);
+  assert.deepEqual(hoverOf(titled), ['root:0', 'root:1', 'nb:2']);
+  // Its first exchange lands: the same key, now a normal node.
+  const asked = planFor(rows, 'nb', { ...history, nb: msgs(['q1', 'a1'], ['q2', 'a2'], ['why?', null]) }).plan;
+  const node = asked.rows.find((r) => r.key === 'nb:2');
+  assert.deepEqual([node.stub, node.label, node.open], [false, 'why?', true]);
+  // A child that shares nothing (an unread history) gets no stub.
+  assert.equal(planFor(rows, 'b2', { ...HIST, nb: [] }).plan.rows.some((r) => r.lane === 'nb'), false);
+  assert.ok(lanes.some((l) => l.id === 'nb'));
 });
 
 test('columns: siblings that fork at one exchange get separate lanes; a finished lane frees its column', () => {
@@ -714,30 +750,30 @@ test('collapse keeps fork points, merge nodes and the open node, and the blue pa
 
 // ── Graph geometry ──────────────────────────────────────────────────────────────────────────
 
-test('geometry: hollow nodes on rows, lane lines between them, rounded fork elbows, colours by path', () => {
+test('geometry: hollow nodes on rows, lane lines between them, rounded fork elbows, roles by path', () => {
   const geo = mod.graphGeometry(planFor(ROWS, 'b2', HIST).plan);
   assert.equal(geo.width, 58);
   assert.equal(geo.height, 6 * 26);
   assert.deepEqual(
-    geo.circles.map((c) => [c.key, c.cx, c.cy, c.color, c.filled]),
+    geo.circles.map((c) => [c.key, c.cx, c.cy, c.role, c.filled]),
     [
-      ['root:0', 8, 13, BLUE, false],
-      ['b3:1', 22, 39, GREY, false],
-      ['root:1', 8, 65, BLUE, false],
-      ['b1:2', 22, 91, BLUE, false],
-      ['b2:3', 36, 117, BLUE, true],
-      ['root:2', 8, 143, GREY, false],
+      ['root:0', 8, 13, 'active', false],
+      ['b3:1', 22, 39, 'inactive', false],
+      ['root:1', 8, 65, 'active', false],
+      ['b1:2', 22, 91, 'active', false],
+      ['b2:3', 36, 117, 'active', true],
+      ['root:2', 8, 143, 'inactive', false],
     ],
   );
   assert.ok(geo.circles.every((c) => c.r === 4));
   assert.deepEqual(
-    geo.paths.map((p) => [p.key, p.d, p.color]),
+    geo.paths.map((p) => [p.key, p.d, p.role]),
     [
-      ['lane:root:0', 'M 8 17 V 61', BLUE],
-      ['lane:root:2', 'M 8 69 V 139', GREY],
-      ['fork:b3', 'M 12 13 H 17 A 5 5 0 0 1 22 18 V 35', GREY],
-      ['fork:b1', 'M 12 65 H 17 A 5 5 0 0 1 22 70 V 87', BLUE],
-      ['fork:b2', 'M 26 91 H 31 A 5 5 0 0 1 36 96 V 113', BLUE],
+      ['lane:root:0', 'M 8 17 V 61', 'active'],
+      ['lane:root:2', 'M 8 69 V 139', 'inactive'],
+      ['fork:b3', 'M 12 13 H 17 A 5 5 0 0 1 22 18 V 35', 'inactive'],
+      ['fork:b1', 'M 12 65 H 17 A 5 5 0 0 1 22 70 V 87', 'active'],
+      ['fork:b2', 'M 26 91 H 31 A 5 5 0 0 1 36 96 V 113', 'active'],
     ],
   );
   // Every shape stays inside the graph column: no line runs over the text.
@@ -747,11 +783,11 @@ test('geometry: hollow nodes on rows, lane lines between them, rounded fork elbo
   assert.ok(geo.circles.every((c) => c.cx + c.r <= geo.width));
 });
 
-test('geometry: a merge curve runs down from the side lane last node into the merge node, grey', () => {
+test('geometry: a merge curve runs down from the side lane last node into the merge node, inactive', () => {
   const geo = mod.graphGeometry(planFor(MERGE_ROWS, 'par', MERGE_HIST).plan);
   const merge = geo.paths.find((p) => p.key.startsWith('merge:'));
   assert.equal(merge.d, 'M 22 43 V 60 A 5 5 0 0 1 17 65 H 12');
-  assert.equal(merge.color, GREY);
+  assert.equal(merge.role, 'inactive');
   assert.equal(geo.circles.find((c) => c.key === 'par:2').filled, true);
 });
 
@@ -759,7 +795,58 @@ test('geometry: a +N row has no node and the lane line passes through it', () =>
   const geo = mod.graphGeometry(planFor([row('root')], 'root', { root: msgs(...TEN) }).plan);
   assert.deepEqual(geo.circles.map((c) => c.key), ['root:0', 'root:9']);
   assert.deepEqual(geo.paths.map((p) => p.d), ['M 8 17 V 39', 'M 8 39 V 61']);
-  assert.ok(geo.paths.every((p) => p.color === BLUE));
+  assert.ok(geo.paths.every((p) => p.role === 'active'));
+});
+
+test('geometry roles: the hovered node path to the root is hover, the open path active, the rest inactive', () => {
+  // b3:1 is hovered (the side chat), b2:3 is open. Both paths run through root:0: hover wins there.
+  const { plan } = planFor(ROWS, 'b2', HIST, { hovered: 'b3:1' });
+  assert.deepEqual(hoverOf(plan), ['root:0', 'b3:1']);
+  assert.deepEqual(blueOf(plan), ['root:0', 'root:1', 'b1:2', 'b2:3']);
+  const geo = mod.graphGeometry(plan);
+  assert.deepEqual(
+    geo.circles.map((c) => [c.key, c.role]),
+    [
+      ['root:0', 'hover'],
+      ['b3:1', 'hover'],
+      ['root:1', 'active'],
+      ['b1:2', 'active'],
+      ['b2:3', 'active'],
+      ['root:2', 'inactive'],
+    ],
+  );
+  assert.deepEqual(
+    geo.paths.map((p) => [p.key, p.role]),
+    [
+      ['lane:root:0', 'active'],
+      ['lane:root:2', 'inactive'],
+      ['fork:b3', 'hover'],
+      ['fork:b1', 'active'],
+      ['fork:b2', 'active'],
+    ],
+  );
+  // Hover on a deep node runs through its fork elbows and lane lines up to the root's first exchange.
+  const deep = mod.graphGeometry(planFor(ROWS, 'b3', HIST, { hovered: 'b2:3' }).plan);
+  assert.deepEqual(deep.circles.filter((c) => c.role === 'hover').map((c) => c.key), ['root:0', 'root:1', 'b1:2', 'b2:3']);
+  assert.deepEqual(deep.paths.filter((p) => p.role === 'hover').map((p) => p.key), ['lane:root:0', 'fork:b1', 'fork:b2']);
+  assert.deepEqual(deep.circles.filter((c) => c.role === 'active').map((c) => c.key), ['b3:1']);
+  // Hover on the open node: the whole open path is hover, the open node still filled.
+  const same = planFor(ROWS, 'b2', HIST, { hovered: 'b2:3' }).plan;
+  assert.deepEqual(hoverOf(same), blueOf(same));
+  const sameGeo = mod.graphGeometry(same);
+  assert.deepEqual(sameGeo.circles.filter((c) => c.role === 'active'), []);
+  assert.equal(sameGeo.circles.find((c) => c.key === 'b2:3').filled, true);
+  // A +N run on the hover path is hover too.
+  const runs = planFor([row('root')], 'root', { root: msgs(...TEN) }, { hovered: 'root:9' }).plan;
+  assert.deepEqual(hoverOf(runs), ['root:0', 'more:root:1', 'root:9']);
+});
+
+test('geometry roles: no hover, or a key that is not a node, gives the plain roles', () => {
+  const plain = mod.graphGeometry(planFor(ROWS, 'b2', HIST).plan);
+  assert.ok([...plain.circles, ...plain.paths].every((s) => s.role !== 'hover'));
+  for (const hovered of [null, undefined, '', 'b2', 'nope:1', 'b2:99', 'b2:-1', 'b2:x', 7]) {
+    assert.deepEqual(mod.graphGeometry(planFor(ROWS, 'b2', HIST, { hovered }).plan), plain, String(hovered));
+  }
 });
 
 test('geometry: more columns than fit in 58 px widen the graph column', () => {
@@ -789,21 +876,65 @@ test('register loads sessions for the owner profile, subagents for the runtime i
   ctx.unload();
 });
 
-test('a history is not read again on refresh while its chat is unchanged', async () => {
+test('a history is not read again on refresh while its chat is unchanged; the open chat always is', async () => {
   const ctx = setup();
   await flush();
   assert.equal(historyCalls(ctx.host), 4);
   await ctx.clock.tick(REFRESH_MS * 2);
   assert.equal(listCalls(ctx.host), 3);
-  assert.equal(historyCalls(ctx.host), 4);
-  // b1 got a new message: only b1 is read again.
+  for (const id of ['root', 'b1', 'b3']) assert.equal(historyCalls(ctx.host, id), 1, id);
+  // The open chat skips the cache: its message count lags a live turn.
+  assert.equal(historyCalls(ctx.host, 'b2'), 3);
+  ctx.host.history.b2 = [...HIST.b2, { role: 'user', text: 'live question' }];
+  await ctx.clock.tick(REFRESH_MS);
+  assert.ok(nodeKeys(ctx.pane.render()).includes('b2:4'));
+  // b1 got a new message: b1 is read again (and the open chat).
   ctx.host.rows = ROWS.map((r) => (r.id === 'b1' ? { ...r, message_count: 4 } : r));
   ctx.host.history.b1 = [...HIST.b1, { role: 'user', text: 'b1 more' }];
   await ctx.clock.tick(REFRESH_MS);
-  assert.equal(historyCalls(ctx.host), 5);
   assert.equal(historyCalls(ctx.host, 'b1'), 2);
+  assert.equal(historyCalls(ctx.host, 'root'), 1);
   assert.ok(nodeKeys(ctx.pane.render()).includes('b1:3'));
   ctx.unload();
+});
+
+test('a tree event reloads once, 300 ms after the last of a burst, and reads the chats it names', async () => {
+  const ctx = setup();
+  await flush();
+  for (const type of mod.RELOAD_EVENTS) assert.equal(ctx.listeners.get(type)?.size, 1, type);
+  const lists = listCalls(ctx.host);
+  ctx.host.emit('message.start', { type: 'message.start', session_id: 'rt-b2' });
+  await ctx.clock.tick(200);
+  ctx.host.emit('message.complete', { type: 'message.complete', session_id: 'b1' });
+  ctx.host.emit('sessions.changed', { type: 'sessions.changed' });
+  await ctx.clock.tick(mod.RELOAD_DEBOUNCE_MS - 1);
+  assert.equal(listCalls(ctx.host), lists);
+  await ctx.clock.tick(1);
+  assert.equal(listCalls(ctx.host), lists + 1);
+  // b1 was named: read again although its message count did not move. root and b3 were not.
+  assert.equal(historyCalls(ctx.host, 'b1'), 2);
+  assert.equal(historyCalls(ctx.host, 'root'), 1);
+  assert.equal(historyCalls(ctx.host, 'b3'), 1);
+  // A name is read once: the next load uses the cache for it again.
+  ctx.host.emit('session.title', { type: 'session.title', payload: {} });
+  await ctx.clock.tick(mod.RELOAD_DEBOUNCE_MS);
+  assert.equal(listCalls(ctx.host), lists + 2);
+  assert.equal(historyCalls(ctx.host, 'b1'), 2);
+  // A new fork shows at once: the event's reload draws its stub at the fork point.
+  ctx.host.rows = [...ROWS, row('nb', { _branched_from: 'b2', started_at: 50, title: null })];
+  ctx.host.history.nb = HIST.b2;
+  ctx.host.emit('sessions.changed', { type: 'sessions.changed' });
+  await ctx.clock.tick(mod.RELOAD_DEBOUNCE_MS);
+  const stub = nodeOf(ctx.pane.render(), 'nb:4');
+  assert.equal(stub.props['data-stub'], 'true');
+  assert.equal(stub.props.children[0].props.children, mod.NEW_BRANCH_TEXT);
+  // After unload, events do nothing.
+  ctx.unload();
+  const after = listCalls(ctx.host);
+  ctx.host.emit('sessions.changed', { type: 'sessions.changed' });
+  await ctx.clock.tick(mod.RELOAD_DEBOUNCE_MS * 2);
+  assert.equal(listCalls(ctx.host), after);
+  for (const type of mod.RELOAD_EVENTS) assert.equal(ctx.listeners.get(type)?.size ?? 0, 0, type);
 });
 
 test('the pane draws one row per exchange with the lane pills and the open node', async () => {
@@ -836,9 +967,18 @@ test('the pane draws one row per exchange with the lane pills and the open node'
     assert.equal(label.props.style.textOverflow, 'ellipsis');
     assert.equal(label.props.style.whiteSpace, 'nowrap');
   }
-  // Exactly two colours in the graph.
-  const colours = new Set(findAll(svg, (n) => n.type === 'path' || n.type === 'circle').map((n) => n.props.stroke));
-  assert.deepEqual([...colours].sort(), [BLUE, GREY].sort());
+  // Two theme colours with no hover: every stroke and fill is a Hermes variable with a fallback.
+  const shapes = findAll(svg, (n) => n.type === 'path' || n.type === 'circle');
+  const colours = new Set(shapes.map((n) => n.props.stroke));
+  assert.deepEqual([...colours].sort(), [ACCENT, MUTED].sort());
+  for (const n of shapes) {
+    assert.match(n.props.stroke, /^var\(--[a-z-]+, [^)]+\)$/);
+    if (n.props.fill !== 'none') assert.match(n.props.fill, /^var\(--[a-z-]+, [^)]+\)$/);
+  }
+  assert.equal(circles.find((c) => c.props.fill !== 'none').props.fill, ACCENT);
+  // The open row band and left accent are the theme accent too.
+  assert.equal(open.props.style.background, `color-mix(in srgb, ${ACCENT} 14%, transparent)`);
+  assert.equal(open.props.style.boxShadow, `inset 2px 0 0 ${ACCENT}`);
   ctx.unload();
 });
 
@@ -905,7 +1045,7 @@ test('a +N row expands its run on click, without opening a chat', async () => {
   ctx.unload();
 });
 
-test('a merged side chat shows a Merged node on the parent lane with a grey curve', async () => {
+test('a merged side chat shows a Merged node on the parent lane with a muted curve', async () => {
   const ctx = setup({ host: fakeHost({ rows: MERGE_ROWS, stored: 'par', runtime: 'rt-par', history: MERGE_HIST }) });
   await flush();
   const tree = ctx.pane.render();
@@ -913,7 +1053,42 @@ test('a merged side chat shows a Merged node on the parent lane with a grey curv
   assert.equal(merged.props['data-merge-node'], 'sd');
   assert.equal(merged.props.children[0].props.children, 'Merged: what is a monad?');
   const curve = findAll(byAttr(tree, 'data-graph', 'true')[0], (n) => n.type === 'path' && n.key === 'merge:sd:2')[0];
-  assert.equal(curve.props.stroke, GREY);
+  assert.equal(curve.props.stroke, MUTED);
+  ctx.unload();
+});
+
+test('the pointer on a row draws its path to the root in the hover colour; leaving restores it; nothing is read', async () => {
+  const ctx = setup();
+  await flush();
+  const before = circleColours(ctx.pane.render());
+  const rowsBefore = JSON.stringify(nodeRows(ctx.pane.render()));
+  const calls = ctx.host.calls.length;
+  assert.equal(ctx.tree.$hover.get().pointer, null);
+  nodeOf(ctx.pane.render(), 'b3:1').props.onMouseEnter();
+  const hovered = circleColours(ctx.pane.render());
+  assert.deepEqual(hovered['c:b3:1'], [HOVER, 'none']);
+  assert.deepEqual(hovered['c:root:0'], [HOVER, 'none']); // on both paths: hover wins
+  assert.deepEqual(hovered['c:root:1'], [ACCENT, 'none']);
+  assert.deepEqual(hovered['c:b2:3'], [ACCENT, ACCENT]);
+  assert.deepEqual(hovered['c:root:2'], [MUTED, 'none']);
+  const svg = byAttr(ctx.pane.render(), 'data-graph', 'true')[0];
+  const fork = findAll(svg, (n) => n.key === 'fork:b3')[0];
+  assert.equal(fork.props.stroke, HOVER);
+  assert.equal(fork.props['data-role'], 'hover');
+  // Only the SVG changed: the rows are the same (b3:1 has no Branch button), and nothing was read.
+  assert.equal(JSON.stringify(nodeRows(ctx.pane.render())), rowsBefore);
+  // A leave from another row keeps the hover; a leave from the hovered row clears it.
+  nodeOf(ctx.pane.render(), 'root:2').props.onMouseLeave();
+  assert.deepEqual(circleColours(ctx.pane.render()), hovered);
+  nodeOf(ctx.pane.render(), 'b3:1').props.onMouseLeave();
+  assert.deepEqual(circleColours(ctx.pane.render()), before);
+  // Hovering the open node: the open fill takes the hover colour while the pointer is there.
+  nodeOf(ctx.pane.render(), 'b2:3').props.onMouseEnter();
+  assert.deepEqual(circleColours(ctx.pane.render())['c:b2:3'], [HOVER, HOVER]);
+  nodeOf(ctx.pane.render(), 'b2:3').props.onMouseLeave();
+  assert.deepEqual(circleColours(ctx.pane.render()), before);
+  assert.equal(ctx.host.calls.length, calls);
+  assert.deepEqual(ctx.host.opened, []);
   ctx.unload();
 });
 
@@ -958,8 +1133,9 @@ test('the pane loads again on focus change, every 15 s, and on Refresh', async (
   findAll(ctx.pane.render(), (n) => n.type === 'Button' && n.props.children === 'Refresh')[0].props.onClick();
   await flush();
   assert.equal(listCalls(ctx.host), 6);
-  // The same tree: no history was read twice.
-  assert.equal(historyCalls(ctx.host), 4);
+  // The same tree: only the open chat (b1 since the focus change) was read again, once per load.
+  for (const id of ['root', 'b2', 'b3']) assert.equal(historyCalls(ctx.host, id), 1, id);
+  assert.equal(historyCalls(ctx.host, 'b1'), 6);
   ctx.unload();
 });
 
@@ -1066,7 +1242,7 @@ test('render never writes state and calls the host for nothing', async () => {
   const ctx = setup();
   await flush();
   let sets = 0;
-  for (const a of [ctx.tree.$data, ctx.tree.$status, ctx.tree.$ui]) {
+  for (const a of [ctx.tree.$data, ctx.tree.$status, ctx.tree.$ui, ctx.tree.$hover]) {
     const orig = a.set;
     a.set = (v) => {
       sets += 1;
@@ -1105,19 +1281,26 @@ test('each render calls the same hooks in the same order (React error 300)', asy
   states.push(order()); // tree with a subagent
   byAttr(ctx.pane.render(), 'data-node', 'root:0')[0].props.onClick();
   states.push(order()); // a clicked node
+  nodeOf(ctx.pane.render(), 'b3:1').props.onMouseEnter();
+  states.push(order()); // a hovered node
+  nodeOf(ctx.pane.render(), 'b1:2').props.onFocus({});
+  states.push(order()); // a hovered node and a focused row
+  nodeOf(ctx.pane.render(), 'b3:1').props.onMouseLeave();
+  states.push(order()); // the pointer left
   host.sessionsError = new Error('x');
   await ctx.clock.tick(REFRESH_MS);
   states.push(order()); // error
   host.state.focusedStoredSessionId.set('missing');
   await flush();
   states.push(order()); // not in list
-  // Four host atoms (busyBySession included), two data atoms, then the in-memory UI atom ($ui) last.
+  // Four host atoms (busyBySession included), two data atoms, then the in-memory $ui and $hover atoms.
   for (const s of states) {
-    assert.equal(s.length, 7);
+    assert.equal(s.length, 8);
     assert.deepEqual(s, states[0]);
   }
   assert.equal(states[0][3], host.state.busyBySession);
   assert.equal(states[0][6], ctx.tree.$ui);
+  assert.equal(states[0][7], ctx.tree.$hover);
   ctx.unload();
 });
 
@@ -1402,18 +1585,25 @@ test('mergeTargets lists the ancestors parent first; selectedTarget defaults to 
   assert.equal(mod.selectedTarget([], null, 'root'), null);
 });
 
-test('the merge target lane lights up in the plan and the geometry, in the same two colours', async () => {
+test('the merge target lane lights up in the plan and the geometry, dashed, in the accent role', async () => {
   const { plan } = planFor(ROWS, 'b2', HIST, { target: 'root' });
   assert.deepEqual(plan.rows.filter((r) => r.target).map((r) => r.key), ['root:0', 'root:1', 'root:2']);
   assert.deepEqual(plan.lanes.filter((l) => l.target).map((l) => l.id), ['root']);
   const geo = mod.graphGeometry(plan);
   assert.deepEqual(geo.paths.filter((p) => p.target).map((p) => p.key), ['lane:root:0', 'lane:root:2']);
   assert.deepEqual(geo.circles.filter((c) => c.target).map((c) => c.key), ['root:0', 'root:1', 'root:2']);
+  // The whole target lane is accent, also off the open path (root:2 and the line to it).
+  assert.ok([...geo.paths, ...geo.circles].filter((s) => s.target).every((s) => s.role === 'active'));
+  assert.equal(geo.circles.find((c) => c.key === 'root:2').role, 'active');
+  // A hover path that crosses the target lane still wins there.
+  const crossed = mod.graphGeometry(planFor(ROWS, 'b2', HIST, { target: 'root', hovered: 'b3:1' }).plan);
+  assert.equal(crossed.circles.find((c) => c.key === 'root:0').role, 'hover');
+  assert.equal(crossed.circles.find((c) => c.key === 'root:2').role, 'active');
   // No target, or an unknown one: nothing lights up.
   assert.equal(planFor(ROWS, 'b2', HIST).plan.rows.some((r) => r.target), false);
   assert.equal(planFor(ROWS, 'b2', HIST, { target: 'nope' }).plan.rows.some((r) => r.target), false);
 
-  // The pane: the parent lane by default, then the picked chip's lane. Dashed and thicker, never a third colour.
+  // The pane: the parent lane by default, then the picked chip's lane. Dashed, thicker, and accent.
   const ctx = setup();
   await flush();
   const lit = () => {
@@ -1430,9 +1620,10 @@ test('the merge target lane lights up in the plan and the geometry, in the same 
     assert.ok(p.props.strokeWidth > 2);
   }
   for (const c of shapes.filter((n) => n.type === 'circle')) assert.equal(c.props.strokeWidth, 2.5);
+  for (const n of shapes) assert.equal(n.props.stroke, ACCENT);
   const svg = byAttr(ctx.pane.render(), 'data-graph', 'true')[0];
   const colours = new Set(findAll(svg, (n) => n.type === 'path' || n.type === 'circle').map((n) => n.props.stroke));
-  assert.deepEqual([...colours].sort(), [BLUE, GREY].sort());
+  assert.deepEqual([...colours].sort(), [ACCENT, MUTED].sort());
   // The node rows of that lane say so too.
   assert.deepEqual(nodeRows(ctx.pane.render()).filter((n) => n.props['data-target-lane']).map((n) => n.props['data-node']), ['root:0', 'root:1', 'root:2']);
   ctx.unload();
@@ -1772,7 +1963,16 @@ test('Merge as-is never opens the merged chat itself, and a double click stages 
 
 // ── Branch here ─────────────────────────────────────────────────────────────────────────────
 
-const branchButton = (ctx, key) => byAttr(nodeOf(ctx.pane.render(), key), 'data-branch-here', key)[0];
+// The Branch button shows on the open row and under the pointer: point at the row first.
+const branchButton = (ctx, key) => {
+  nodeOf(ctx.pane.render(), key).props.onMouseEnter();
+  return byAttr(nodeOf(ctx.pane.render(), key), 'data-branch-here', key)[0];
+};
+// Rows with a Branch button, shown or hidden in place.
+const branchRows = (tree) =>
+  nodeRows(tree)
+    .filter((n) => byAttr(n, 'data-branch-here').length + byAttr(n, 'data-branch-slot').length > 0)
+    .map((n) => n.props['data-node']);
 const form = (ctx) => byAttr(ctx.pane.render(), 'data-branch-form')[0];
 const formField = (ctx, key) => byAttr(form(ctx), 'data-branch-field', key)[0];
 const typeInto = (ctx, key, value) => formField(ctx, key).props.onChange({ target: { value } });
@@ -1783,7 +1983,7 @@ test('Branch here sits on the answered exchanges of the open chat only', async (
   await flush();
   const tree = ctx.pane.render();
   // b2 is open: its exchanges are drawn on root, b1 and b2. b3 and root:2 are not b2's.
-  assert.deepEqual(byAttr(tree, 'data-branch-here').map((n) => n.props['data-branch-here']), ['root:0', 'root:1', 'b1:2', 'b2:3']);
+  assert.deepEqual(branchRows(tree), ['root:0', 'root:1', 'b1:2', 'b2:3']);
   // A click opens the form and does not open the node's chat.
   const event = fakeEvent();
   branchButton(ctx, 'root:1').props.onClick(event);
@@ -1792,6 +1992,55 @@ test('Branch here sits on the answered exchanges of the open chat only', async (
   assert.deepEqual(ctx.host.opened, []);
   assert.equal(form(ctx).props['data-branch-form'], 'b2:1');
   assert.match(textOf(form(ctx)), /Branch here: q2/);
+  ctx.unload();
+});
+
+test('Branch shows on the open row and on the row under the pointer or keyboard focus only, with no layout shift', async () => {
+  const ctx = setup();
+  await flush();
+  const shown = () => byAttr(ctx.pane.render(), 'data-branch-here').map((n) => n.props['data-branch-here']);
+  const hidden = () => byAttr(ctx.pane.render(), 'data-branch-slot').map((n) => n.props['data-branch-slot']);
+  // No hover: only the open row has a Branch button.
+  assert.deepEqual(shown(), ['b2:3']);
+  assert.deepEqual(hidden(), ['root:0', 'root:1', 'b1:2']);
+  // The pointer on another branchable row shows exactly one more.
+  nodeOf(ctx.pane.render(), 'root:1').props.onMouseEnter();
+  assert.deepEqual(shown(), ['root:1', 'b2:3']);
+  assert.deepEqual(hidden(), ['root:0', 'b1:2']);
+  // A hidden button keeps its place: the same element and style, only hidden and inert.
+  const slot = byAttr(nodeOf(ctx.pane.render(), 'root:0'), 'data-branch-slot')[0];
+  const button = byAttr(nodeOf(ctx.pane.render(), 'root:1'), 'data-branch-here')[0];
+  assert.equal(slot.type, button.type);
+  assert.equal(slot.key, button.key);
+  assert.equal(slot.props.children, button.props.children);
+  assert.deepEqual({ ...slot.props.style, visibility: undefined }, { ...button.props.style, visibility: undefined });
+  assert.equal(slot.props.style.visibility, 'hidden');
+  assert.equal(button.props.style.visibility, undefined);
+  assert.equal(slot.props.tabIndex, -1);
+  assert.equal(slot.props['aria-hidden'], 'true');
+  assert.equal(slot.props.disabled, true);
+  assert.equal(slot.props.onClick, undefined);
+  // A row that cannot branch reserves nothing, hovered or not.
+  nodeOf(ctx.pane.render(), 'b3:1').props.onMouseEnter();
+  assert.deepEqual(branchRows(ctx.pane.render()), ['root:0', 'root:1', 'b1:2', 'b2:3']);
+  assert.deepEqual(shown(), ['b2:3']);
+  nodeOf(ctx.pane.render(), 'b3:1').props.onMouseLeave();
+  // Keyboard focus shows it too, and draws no hover path.
+  const before = circleColours(ctx.pane.render());
+  nodeOf(ctx.pane.render(), 'b1:2').props.onFocus({});
+  assert.deepEqual(shown(), ['b1:2', 'b2:3']);
+  assert.deepEqual(circleColours(ctx.pane.render()), before);
+  // Focus that moves onto the row's own button keeps it; focus that leaves the row hides it.
+  const inside = {};
+  nodeOf(ctx.pane.render(), 'b1:2').props.onBlur({ relatedTarget: inside, currentTarget: { contains: (n) => n === inside } });
+  assert.deepEqual(shown(), ['b1:2', 'b2:3']);
+  nodeOf(ctx.pane.render(), 'b1:2').props.onBlur({ relatedTarget: null, currentTarget: { contains: () => false } });
+  assert.deepEqual(shown(), ['b2:3']);
+  // Pointer and focus on two rows: both show.
+  nodeOf(ctx.pane.render(), 'root:0').props.onFocus({});
+  nodeOf(ctx.pane.render(), 'b1:2').props.onMouseEnter();
+  assert.deepEqual(shown(), ['root:0', 'b1:2', 'b2:3']);
+  assert.equal(ctx.host.opened.length, 0);
   ctx.unload();
 });
 
@@ -1815,9 +2064,10 @@ test('Branch here: session.branch with the count and no name, prompt.submit with
     model_override: { model: 'cheap-model' },
   });
   assert.deepEqual(ctx.host.opened, [['nb', OPEN_HERE]]);
-  // Order: read, branch, ask, then the fork digest (after the open).
-  assert.deepEqual(ctx.host.calls.slice(ctx.mark).map(([m]) => m).filter((m) => m !== 'session.transcript'), [
-    'session.history',
+  // Order: read, branch, a reload right after the branch, ask, then the fork digest (after the open).
+  const seq = ctx.host.calls.slice(ctx.mark).map(([m]) => m).filter((m) => m !== 'session.transcript');
+  assert.deepEqual(seq.slice(0, 3), ['session.history', 'session.branch', 'listPersistedSessions']);
+  assert.deepEqual(seq.filter((m) => ['session.branch', 'prompt.submit', mod.DIGEST_METHOD].includes(m)), [
     'session.branch',
     'prompt.submit',
     'plugin.chat-tree.digest.write',
@@ -1897,6 +2147,7 @@ test('Branch here is disabled with a reason while the open chat runs', async () 
   typeInto(ctx, 'question', 'q?');
   ctx.host.state.busyBySession.set({ 'rt-b2': true });
   const tree = ctx.pane.render();
+  assert.ok(byAttr(tree, 'data-branch-here').length > 0);
   for (const b of byAttr(tree, 'data-branch-here')) {
     assert.equal(b.props.disabled, true);
     assert.equal(b.props.title, mod.BRANCH_BUSY_TEXT);
@@ -2055,13 +2306,14 @@ test('history.read asks again only for the chats whose history key moved', async
   const ctx = setup({ host: fakeHost({ backend: true }) });
   await flush();
   await ctx.clock.tick(REFRESH_MS * 2);
-  assert.equal(storeCalls(ctx.host).length, 1); // nothing moved: no request at all
+  // Nothing moved: each refresh asks for the open chat only (its key lags live turns).
+  assert.deepEqual(storeCalls(ctx.host).slice(1).map(([, p]) => p.session_ids), [['b2'], ['b2']]);
   ctx.host.rows = ROWS.map((r) => (r.id === 'b1' ? { ...r, message_count: 4 } : r));
   ctx.host.history.b1 = [...HIST.b1, { role: 'user', text: 'b1 more' }];
   await ctx.clock.tick(REFRESH_MS);
   const calls = storeCalls(ctx.host);
-  assert.equal(calls.length, 2);
-  assert.deepEqual(calls[1][1].session_ids, ['b1']);
+  assert.equal(calls.length, 4);
+  assert.deepEqual(calls[3][1].session_ids, ['b1', 'b2']);
   assert.equal(historyCalls(ctx.host), 0);
   assert.ok(nodeKeys(ctx.pane.render()).includes('b1:3'));
   ctx.unload();

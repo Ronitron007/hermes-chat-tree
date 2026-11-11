@@ -1,6 +1,6 @@
 // Screenshots of the rendered panes with headless Google Chrome. Runs after dev/render.mjs:
 //
-//   npm run render:png     # writes dev/out/chat-tree.png and dev/out/side-chat.png
+//   npm run render:png     # writes dev/out/chat-tree.png, chat-tree-hover.png and side-chat.png
 //
 // Skips the PNG files, with a message and exit 0, when Chrome is not installed.
 import { spawnSync } from 'node:child_process';
@@ -10,7 +10,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const PANES = ['chat-tree', 'side-chat'];
+const PANES = ['chat-tree', 'chat-tree-hover', 'side-chat'];
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = join(root, 'dev/out');
 

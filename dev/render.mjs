@@ -1,13 +1,18 @@
 // Render harness: renders the real chat-tree and side-chat panes with fixture chats to static HTML.
 //
-//   node dev/render.mjs        # writes dev/out/chat-tree.html and dev/out/side-chat.html
+//   node dev/render.mjs        # writes dev/out/chat-tree.html, chat-tree-hover.html and side-chat.html
 //
 // Each pane runs its own factory (createChatTree, createSideChat) with stub SDK pieces and a fake
 // host that answers from dev/fixtures/chats.json. register(ctx) runs as in Desktop, the async load
 // settles, then react-dom/server renders the pane. No network, no model, no Hermes.
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+// chat-tree-hover.html is the chat tree with the pointer on the fixture's hover node: the harness
+// sets the pane's $hover atom before the render. The pages load the CSS that Hermes Desktop ships
+// (HERMES_CSS), not a CSS generator: a class works in a render only if it works in the app. Over
+// it, THEME_VARS sets the variables of a real Hermes dark theme.
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createElement, useSyncExternalStore } from 'react';
 import { jsx, jsxs } from 'react/jsx-runtime';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -17,6 +22,16 @@ import { createSideChat } from '../side-chat/src/side-chat.js';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = JSON.parse(readFileSync(join(root, 'dev/fixtures/chats.json'), 'utf8'));
 const outDir = join(root, 'dev/out');
+
+// The shipped Hermes Desktop CSS: $HERMES_CSS, else the built main-*.css of the local Hermes.
+// Hermes builds Tailwind once over its own source, so only the classes it uses exist in this file.
+function findHermesCss() {
+  if (process.env.HERMES_CSS) return existsSync(process.env.HERMES_CSS) ? process.env.HERMES_CSS : null;
+  const dir = join(homedir(), '.hermes/hermes-agent/apps/desktop/dist/assets');
+  const name = existsSync(dir) ? readdirSync(dir).find((f) => /^main-.*\.css$/.test(f)) : null;
+  return name ? join(dir, name) : null;
+}
+const HERMES_CSS = findHermesCss();
 
 // nanostores-like atom, the shape the SDK atoms have: get, set, listen (changes only), subscribe
 // (current value first, then changes).
@@ -149,10 +164,39 @@ const sdk = (host) => ({
   now: () => Date.now(),
 });
 
+// file: the output name. pane: the fixture keys (focus, hover, expect) when they differ from file.
 const PANES = [
-  { id: 'chat-tree', title: 'Chat tree', create: (deps) => createChatTree(deps) },
-  { id: 'side-chat', title: 'Side chat', create: (deps) => createSideChat(deps) },
+  { file: 'chat-tree', title: 'Chat tree', create: (deps) => createChatTree(deps) },
+  { file: 'chat-tree-hover', pane: 'chat-tree', hover: true, title: 'Chat tree', create: (deps) => createChatTree(deps) },
+  { file: 'side-chat', title: 'Side chat', create: (deps) => createSideChat(deps) },
 ];
+
+// Hermes Desktop dark-theme variables, as the app paints them. The seeds are the Catppuccin dark
+// palette (hermes-agent apps/shared/src/theme-presets.ts, catppuccin.darkColors: foreground
+// #cdd6f4, midground #cba6f7, primary #cba6f7, background #1e1e2e, card #181825), set as
+// apps/desktop/src/themes/context.tsx:340-352 sets them, with the dark chrome mix and neutral of
+// context.tsx:275-286. The derived tokens copy apps/desktop/src/styles.css (:root, lines 239-240,
+// 297-301, 325-329, 364-366, 380-384, 421-426, 440).
+const THEME_VARS = `
+    --theme-foreground: #cdd6f4;
+    --theme-midground: #cba6f7;
+    --theme-primary: #cba6f7;
+    --theme-background-seed: #1e1e2e;
+    --theme-card-seed: #181825;
+    --theme-neutral-chrome: #0d0d0e;
+    --theme-mix-chrome: 74%;
+    --ui-base: var(--theme-foreground);
+    --ui-accent: var(--theme-midground);
+    --ui-bg-chrome: color-mix(in srgb, var(--theme-background-seed) var(--theme-mix-chrome), var(--theme-neutral-chrome));
+    --ui-bg-tertiary: color-mix(in srgb, var(--ui-accent) 8%, color-mix(in srgb, var(--ui-base) 5%, transparent));
+    --ui-text-primary: color-mix(in srgb, var(--ui-base) 94%, transparent);
+    --ui-text-tertiary: color-mix(in srgb, var(--ui-base) 54%, transparent);
+    --ui-stroke-secondary: color-mix(in srgb, var(--ui-accent) 16%, color-mix(in srgb, var(--ui-base) 7%, transparent));
+    --dt-background: var(--ui-bg-chrome);
+    --dt-foreground: var(--ui-text-primary);
+    --dt-muted: var(--ui-bg-tertiary);
+    --dt-muted-foreground: var(--ui-text-tertiary);
+    --dt-border: var(--ui-stroke-secondary);`;
 
 const escapeHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 
@@ -163,19 +207,18 @@ function page(title, width, markup) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-  tailwind.config = { darkMode: 'class', theme: { extend: { colors: { muted: '#27272a', destructive: '#f87171' } } } };
-</script>
+${HERMES_CSS ? `<link rel="stylesheet" href="${escapeHtml(pathToFileURL(HERMES_CSS).href)}">` : '<!-- No Hermes CSS found: set HERMES_CSS. -->'}
 <style>
+  :root {${THEME_VARS}
+  }
   /* The pane sits at the left edge and the body is exactly as wide as the pane, so a narrow
      headless screenshot (npm run render:png, 380 px) holds the whole pane. */
-  html, body { margin: 0; padding: 0; background: #09090b; }
-  body { width: ${width}; color: #e4e4e7; font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif; }
-  .pane { box-sizing: border-box; width: ${width}; min-height: 100vh; margin: 0; background: #18181b; overflow-wrap: anywhere; }
-  .pane-title { padding: 8px 12px; font-weight: 600; border-bottom: 1px solid #27272a; }
-  .pane button { border: 1px solid #3f3f46; border-radius: 4px; padding: 1px 6px; background: #27272a; color: inherit; font: inherit; }
-  .pane input { width: 100%; box-sizing: border-box; border: 1px solid #3f3f46; border-radius: 4px; padding: 4px 6px; background: #09090b; color: inherit; font: inherit; }
+  html, body { margin: 0; padding: 0; background: var(--dt-background); }
+  body { width: ${width}; color: var(--dt-foreground); font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  .pane { box-sizing: border-box; width: ${width}; min-height: 100vh; margin: 0; background: var(--dt-background); overflow-wrap: anywhere; }
+  .pane-title { padding: 8px 12px; font-weight: 600; border-bottom: 1px solid var(--dt-border); }
+  .pane button { border: 1px solid var(--dt-border); border-radius: 4px; padding: 1px 6px; background: var(--dt-muted); color: inherit; font: inherit; }
+  .pane input { width: 100%; box-sizing: border-box; border: 1px solid var(--dt-border); border-radius: 4px; padding: 4px 6px; background: var(--dt-background); color: inherit; font: inherit; }
 </style>
 </head>
 <body>
@@ -189,23 +232,33 @@ ${markup}
 }
 
 async function renderPane(spec) {
-  const focusId = fixture.focus?.[spec.id];
+  const id = spec.pane ?? spec.file;
+  const focusId = fixture.focus?.[id];
   const host = fakeHost(focusId);
   const plugin = spec.create(sdk(host));
   const { ctx, registered, dispose } = fakeCtx();
   plugin.register(ctx);
   await settle(host);
   const pane = registered.find((c) => c.area === 'panes');
-  if (!pane || typeof pane.render !== 'function') throw new Error(`${spec.id}: register() added no pane`);
+  if (!pane || typeof pane.render !== 'function') throw new Error(`${spec.file}: register() added no pane`);
+  // The hover render: the pointer on the fixture's hover node, as a mouseenter on its row sets it.
+  const hoverKey = spec.hover ? fixture.hover?.[id] : null;
+  if (spec.hover) {
+    if (!hoverKey || typeof plugin.$hover?.set !== 'function') throw new Error(`${spec.file}: no hover node or no $hover atom`);
+    plugin.$hover.set({ pointer: hoverKey, focus: null });
+  }
   const markup = renderToStaticMarkup(createElement(pane.render));
   dispose();
-  if (!markup) throw new Error(`${spec.id}: the pane rendered nothing`);
+  if (!markup) throw new Error(`${spec.file}: the pane rendered nothing`);
+  if (hoverKey && !(markup.includes(`data-node="${escapeHtml(hoverKey)}"`) && markup.includes('data-role="hover"'))) {
+    throw new Error(`${spec.file}: the hover node ${hoverKey} drew no hover path`);
+  }
   const width = typeof pane.data?.width === 'string' ? pane.data.width : '300px';
-  const file = join(outDir, `${spec.id}.html`);
+  const file = join(outDir, `${spec.file}.html`);
   writeFileSync(file, page(pane.title || spec.title, width, markup));
-  const missing = (fixture.expect?.[spec.id] ?? []).filter((text) => !markup.includes(escapeHtml(text)));
-  console.log(`wrote ${file} (${markup.length} chars of markup, focus ${focusId})`);
-  if (missing.length) console.warn(`  ${spec.id}: not in the markup: ${missing.join(' | ')}`);
+  const missing = (fixture.expect?.[id] ?? []).filter((text) => !markup.includes(escapeHtml(text)));
+  console.log(`wrote ${file} (${markup.length} chars of markup, focus ${focusId}${hoverKey ? `, hover ${hoverKey}` : ''})`);
+  if (missing.length) console.warn(`  ${spec.file}: not in the markup: ${missing.join(' | ')}`);
 }
 
 // React dev warnings repeat once per element. Print each distinct one in full once, then a count.
@@ -222,5 +275,7 @@ globalThis.__hermesSideChatBranchIds = new Set(fixture.sideBranchIds ?? []);
 globalThis.__hermesSideChatMergedIds = new Set(fixture.mergedIds ?? []);
 
 mkdirSync(outDir, { recursive: true });
+if (HERMES_CSS) console.log(`Hermes CSS: ${HERMES_CSS}`);
+else console.warn('No Hermes Desktop CSS found (set HERMES_CSS): the pages render with no app classes.');
 for (const spec of PANES) await renderPane(spec);
 for (const [head, n] of repeats) if (n > 1) printError(`(the warning "${head}" repeated ${n - 1} more times)`);
