@@ -1090,7 +1090,7 @@ test('a side exchange that does not fit is not opened, drafted, or submitted', a
   await assert.doesNotReject(() => stageButton(ctx).props.onClick());
   assert.deepEqual(order, []);
   assert.equal(ctx.host.opened.length, opened);
-  const notice = ctx.chat.$status.get()['st-main'].notice;
+  const notice = ctx.chat.$status.get()['st-main'].heldNotice;
   const verbatim = VERBATIM('q', [['q', 'side answer']]);
   assert.match(notice, /Doesn't fit/);
   assert.match(notice, new RegExp(commas(roughTokens(verbatim))));
@@ -1185,7 +1185,7 @@ test('session.stats supplies the window when session.usage has no context max', 
   };
   await assert.doesNotReject(() => stageButton(ctx).props.onClick());
   assert.deepEqual(order, []);
-  assert.match(ctx.chat.$status.get()['st-main'].notice, /127,990 used of 128,000/);
+  assert.match(ctx.chat.$status.get()['st-main'].heldNotice, /127,990 used of 128,000/);
   ctx.unload();
 });
 
@@ -1428,5 +1428,408 @@ test('side cards follow the focused chat and come back with it', async () => {
   ctx.host.state.focusedSessionId.set('rt-main');
   await flush();
   assert.match(shown(), /only on main/);
+  ctx.unload();
+});
+
+// ── Merge modes `unit.merge_modes` ────────────────────────────────────────────────────────────
+// The header is always the side question exactly as prompt.submit sent it: the tree links a merge
+// by matching it to the side chat's first own user message.
+
+const RECORD = (question, id) => `From side chat: ${question}\n\nSide chat id: ${id}`;
+const DIGEST_TEXT = (question, answer) => `From side chat: ${question}\n\n${answer}`;
+
+function entryNode(ctx, id) {
+  return findAll(expand(ctx.pane.render()), (n) => n.props?.['data-side-chat'] === id)[0];
+}
+
+function modeButtons(ctx, id) {
+  return findAll(entryNode(ctx, id), (n) => n.type === 'Button' && typeof n.props?.['data-merge-mode'] === 'string');
+}
+
+const pressedModes = (ctx, id) => modeButtons(ctx, id).filter((n) => n.props['aria-pressed'] === true).map((n) => n.props['data-merge-mode']);
+
+function pickMode(ctx, id, mode) {
+  modeButtons(ctx, id).find((n) => n.props['data-merge-mode'] === mode).props.onClick();
+}
+
+function mergeButtonOf(ctx, id) {
+  return findAll(entryNode(ctx, id), (n) => n.type === 'Button' && n.props.children === 'Merge into parent')[0];
+}
+
+// Answers every session.transcript read with these rows, and every session.usage with this window.
+function withBranchRows(ctx, rows, usage = { context_used: 1000, context_max: 128000 }) {
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.transcript') {
+      ctx.host.calls.push([method, params]);
+      return { rows, next_cursor: null };
+    }
+    if (method === 'session.usage') {
+      ctx.host.calls.push([method, params]);
+      return usage;
+    }
+    return base(method, params);
+  };
+}
+
+async function answered(ctx, question) {
+  await ask(ctx, question);
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+  return entryOf(ctx);
+}
+
+test('the three merge modes, Full text by default, each text starting with the side question header', () => {
+  assert.deepEqual(sideChat.MERGE_MODES.map((m) => [m.id, m.label]), [
+    ['full', 'Full text'],
+    ['record', 'Merge record'],
+    ['digest', 'Digest'],
+  ]);
+  assert.equal(sideChat.DEFAULT_MERGE_MODE, 'full');
+  assert.equal(sideChat.mergeModeOf('digest'), 'digest');
+  assert.equal(sideChat.mergeModeOf('nope'), 'full');
+  assert.equal(sideChat.mergeModeOf(undefined), 'full');
+  assert.equal(sideChat.mergeModeLabel('record'), 'Merge record');
+  assert.equal(sideChat.mergeModeLabel(null), 'Full text');
+  assert.equal(sideChat.mergeHeader('  what is a monad?  '), 'From side chat: what is a monad?');
+  assert.equal(sideChat.mergeHeader('   '), 'From side chat: Side chat');
+
+  const parts = {
+    question: '  what is a monad?  ',
+    sideId: 'side-1',
+    turns: [{ question: 'q1', answer: 'a1a\na1b' }, { question: 'q2', answer: 'a2' }],
+    answer: '  a1b  ',
+  };
+  assert.equal(sideChat.formatMergeText('full', parts), VERBATIM('what is a monad?', [['q1', 'a1a\na1b'], ['q2', 'a2']]));
+  assert.equal(sideChat.formatMergeText('full', parts), sideChat.formatSideVerbatim(parts.question, parts.turns));
+  assert.equal(sideChat.formatMergeText('record', parts), RECORD('what is a monad?', 'side-1'));
+  assert.equal(sideChat.formatSideRecord(' t ', ' id-9 '), RECORD('t', 'id-9'));
+  // Digest: the header already holds the question, so the body is the final answer only.
+  assert.equal(sideChat.formatMergeText('digest', parts), DIGEST_TEXT('what is a monad?', 'a1b'));
+  assert.equal(sideChat.formatSideDigestText(' q ', ' a '), DIGEST_TEXT('q', 'a'));
+  assert.equal(sideChat.formatMergeText(undefined, parts), sideChat.formatMergeText('full', parts));
+  for (const mode of ['full', 'record', 'digest']) {
+    const lines = sideChat.formatMergeText(mode, parts).split('\n');
+    assert.equal(lines[0], 'From side chat: what is a monad?', mode);
+    assert.equal(lines[1], '', mode);
+    assert.equal(sideChat.formatMergeText(mode, { ...parts, question: '' }).split('\n')[0], 'From side chat: Side chat', mode);
+  }
+  // The old digest format is unchanged.
+  assert.equal(sideChat.formatSideDigest('q', 'a'), DIGEST('q', 'a'));
+});
+
+test('digestTurn is the question and final answer that digestFromRows formats', () => {
+  const rows = [
+    { role: 'user', text: 'parent q', row_id: 43 },
+    { role: 'assistant', text: 'parent a', row_id: 44 },
+    { role: 'user', text: 'side q', row_id: 45 },
+    { role: 'assistant', text: 'Let me check.', row_id: 46 },
+    { role: 'tool', text: 'hit', row_id: 47 },
+    { role: 'assistant', text: 'final side a', row_id: 48 },
+    { role: 'user', text: 'follow-up', row_id: 49 },
+    { role: 'assistant', text: 'follow-up a', row_id: 50 },
+  ];
+  const fallback = { question: 'stored q', answer: 'stored a' };
+  assert.deepEqual(sideChat.digestTurn(rows, 44, fallback), { question: 'side q', answer: 'final side a' });
+  assert.equal(digestFromRows(rows, 44, fallback), DIGEST('side q', 'final side a'));
+  assert.deepEqual(sideChat.digestTurn(rows, null, { question: 'side q' }), { question: 'side q', answer: 'final side a' });
+  assert.deepEqual(sideChat.digestTurn(null, 44, fallback), { question: 'stored q', answer: 'stored a' });
+  assert.deepEqual(sideChat.digestTurn([], null, fallback), { question: 'stored q', answer: 'stored a' });
+});
+
+test('stripConceptMarkup: a termline becomes its v sentence, unescaped, with inline markdown kept', () => {
+  const strip = sideChat.stripConceptMarkup;
+  assert.equal(
+    strip('::termline{v="In Haskell, a **monad** sequences `IO` effects." t="monad=A pattern;;IO=Input and output"}'),
+    'In Haskell, a **monad** sequences `IO` effects.',
+  );
+  // Escaped quotes inside a double-quoted or single-quoted value.
+  assert.equal(strip('::termline{v="She said \\"monad\\" twice." t="monad=it\\"s a pattern"}'), 'She said "monad" twice.');
+  assert.equal(strip("::termline{v='It\\'s a \"monad\".' t='monad=x'}"), 'It\'s a "monad".');
+  // The host's markdown escapes are undone; a `}` or `;;` inside a quoted value does not end it.
+  assert.equal(strip('::termline{v="Use \\*stars\\* and {braces}." t="a=b\;\;c;;d=e\\\\"}'), 'Use *stars* and {braces}.');
+  // Legacy markers inside v become their names, as the termline renderer shows them.
+  assert.equal(strip('::termline{v="A [[monoid|combines values]] folds a list; a \\[\\[functor\\]\\] maps it."}'), 'A monoid folds a list; a functor maps it.');
+  // The legacy text attribute, and a termline with no sentence.
+  assert.equal(strip('::termline{text="Old form." t="x=y"}'), 'Old form.');
+  assert.equal(strip('before\n\n::termline{t="x=y"}\n\nafter'), 'before\n\n\n\nafter');
+});
+
+test('stripConceptMarkup: several termlines, ::term and [[name|def]] in one text', () => {
+  const strip = sideChat.stripConceptMarkup;
+  const text = [
+    'Assistant:',
+    '::termline{v="A **monad** sequences effects." t="monad=A design pattern"}',
+    '',
+    "::termline{v='An idempotent call is safe to retry.' t='idempotent=Same effect when repeated'}",
+    '',
+    'A ::term{name="functor" def="maps over a value"} and a ::term{name=unit def=wraps} and [[bind|chains steps]].',
+  ].join('\n');
+  assert.equal(strip(text), [
+    'Assistant:',
+    'A **monad** sequences effects.',
+    '',
+    'An idempotent call is safe to retry.',
+    '',
+    'A functor and a unit and bind.',
+  ].join('\n'));
+});
+
+test('stripConceptMarkup: code, wiki links, and markup that does not parse stay as written', () => {
+  const strip = sideChat.stripConceptMarkup;
+  const fenced = [
+    'Write it like this:',
+    '```markdown',
+    '::termline{v="A monad." t="monad=x"}',
+    'A [[monoid|combines]] marker.',
+    '```',
+    '::termline{v="Outside the fence." t="a=b"}',
+  ].join('\n');
+  assert.equal(strip(fenced), fenced.replace('::termline{v="Outside the fence." t="a=b"}', 'Outside the fence.'));
+  assert.equal(strip('~~~~\n::term{name=x}\n~~~\nstill code\n~~~~\n[[a|b]]'), '~~~~\n::term{name=x}\n~~~\nstill code\n~~~~\na');
+  assert.equal(strip('Run `[[ -f x || -d y ]]` or ``::termline{v="x"}`` and [[a|b]].'), 'Run `[[ -f x || -d y ]]` or ``::termline{v="x"}`` and a.');
+  // Outside a termline only [[name|def]] (with a pipe) is markup.
+  assert.equal(strip('See [[Monad laws]] and [[ | empty]].'), 'See [[Monad laws]] and [[ | empty]].');
+  // A directive that does not parse is left alone.
+  assert.equal(strip('::termline{v="unclosed'), '::termline{v="unclosed');
+  assert.equal(strip('::termline{v="a" t="b"'), '::termline{v="a" t="b"');
+  assert.equal(strip('::term{def="no name"} stays'), '::term{def="no name"} stays');
+  assert.equal(strip('a `lone backtick ::term{name=x} here'), 'a `lone backtick x here');
+  assert.equal(strip(''), '');
+  assert.equal(strip(undefined), '');
+  assert.equal(strip('plain text\r\nwith CRLF'), 'plain text\r\nwith CRLF');
+});
+
+test('markup removal leaves the header line exactly as the side question', () => {
+  const question = 'why [[monad|x]] and ::term{name=y}?';
+  for (const mode of ['full', 'record', 'digest']) {
+    const text = sideChat.formatMergeText(mode, {
+      question,
+      sideId: 's',
+      turns: [{ question: 'q [[a|b]]', answer: '::termline{v="Plain." t="p=q"}' }],
+      answer: '::termline{v="Plain." t="p=q"}',
+    });
+    assert.equal(text.split('\n')[0], `From side chat: ${question}`, mode);
+    assert.equal(text.slice(text.indexOf('\n')).includes('::termline'), false, mode);
+  }
+  assert.equal(
+    sideChat.formatMergeText('full', { question, turns: [{ question: 'q [[a|b]]', answer: '::termline{v="Plain." t="p=q"}' }] }),
+    VERBATIM(question, [['q a', 'Plain.']]),
+  );
+});
+
+test('each answered side chat has a mode picker; Full text is the default and a pick is kept per side chat', async () => {
+  const ctx = setup();
+  const first = await answered(ctx, 'first');
+  const second = await answered(ctx, 'second');
+  const labels = modeButtons(ctx, first.id).map((n) => n.props.children);
+  assert.deepEqual(labels, ['Full text', 'Merge record', 'Digest']);
+  assert.deepEqual(pressedModes(ctx, first.id), ['full']);
+  assert.deepEqual(pressedModes(ctx, second.id), ['full']);
+
+  pickMode(ctx, first.id, 'digest');
+  assert.deepEqual(pressedModes(ctx, first.id), ['digest']);
+  assert.deepEqual(pressedModes(ctx, second.id), ['full']);
+
+  // A third question polls and re-renders the pane; the pick stays.
+  await answered(ctx, 'third');
+  assert.deepEqual(pressedModes(ctx, first.id), ['digest']);
+  // Focus away and back.
+  ctx.host.state.focusedStoredSessionId.set('st-other');
+  ctx.host.state.focusedSessionId.set('rt-other');
+  await flush();
+  assert.equal(entryNode(ctx, first.id), undefined);
+  ctx.host.state.focusedStoredSessionId.set('st-main');
+  ctx.host.state.focusedSessionId.set('rt-main');
+  await flush();
+  assert.deepEqual(pressedModes(ctx, first.id), ['digest']);
+  // While the pane runs only: the pick is not stored.
+  assert.equal(JSON.stringify(ctx.storage.data).includes('digest'), false);
+  ctx.unload();
+});
+
+test('an entry with no answer has no mode picker', async () => {
+  const ctx = setup({ host: fakeHost({ script: () => {} }) });
+  await ask(ctx, 'q');
+  assert.ok(entryNode(ctx, entryOf(ctx).id));
+  assert.equal(modeButtons(ctx, entryOf(ctx).id).length, 0);
+  ctx.unload();
+});
+
+test('Full text is staged when no mode was picked', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  const entry = await answered(ctx, 'q');
+  await mergeButtonOf(ctx, entry.id).props.onClick();
+  assert.equal(order[1][2], VERBATIM('q', [['q', 'side answer']]));
+  ctx.unload();
+});
+
+test('Merge record stages the header and the side chat id only, after the fit check, with no side read', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  const entry = await answered(ctx, 'what is a monad?');
+  pickMode(ctx, entry.id, 'record');
+  const before = ctx.host.calls.length;
+  await mergeButtonOf(ctx, entry.id).props.onClick();
+  assert.deepEqual(order.map((step) => step[0]), ['open', 'draft']);
+  assert.deepEqual(order[0], ['open', 'st-main', { intent: 'in-place' }]);
+  assert.equal(order[1][2], RECORD('what is a monad?', 'branch-1'));
+  const after = ctx.host.calls.slice(before).map(([method]) => method);
+  assert.equal(after.includes('session.transcript'), false);
+  assert.ok(after.includes('session.usage'));
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_STAGED_TEXT);
+  ctx.unload();
+});
+
+test('Digest stages the side question header and the final answer only, and calls no model', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  const entry = await answered(ctx, 'seed question');
+  const fence = entry.maxRowId;
+  // Hermes may store the user row with other text; the header still is the text side-chat sent.
+  withBranchRows(ctx, [
+    { role: 'user', text: 'main question', row_id: fence - 1 },
+    { role: 'assistant', text: 'main answer', row_id: fence },
+    { role: 'user', text: 'seed question (stored)', row_id: fence + 1 },
+    { role: 'assistant', text: 'Let me check.', row_id: fence + 2 },
+    { role: 'tool', text: 'search hit', row_id: fence + 3 },
+    { role: 'assistant', text: 'final side a', row_id: fence + 4 },
+    { role: 'user', text: 'follow-up q', row_id: fence + 5 },
+    { role: 'assistant', text: 'follow-up a', row_id: fence + 6 },
+  ]);
+  pickMode(ctx, entry.id, 'digest');
+  const submits = () => methods(ctx.host).filter((m) => m === 'prompt.submit').length;
+  const before = submits();
+  await mergeButtonOf(ctx, entry.id).props.onClick();
+  assert.equal(order[1][2], DIGEST_TEXT('seed question', 'final side a'));
+  assert.equal(submits(), before);
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  ctx.unload();
+});
+
+test('Digest falls back to the stored answer when the side read fails', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  const entry = await answered(ctx, 'stored question');
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.transcript') throw new Error('transcript down');
+    return base(method, params);
+  };
+  pickMode(ctx, entry.id, 'digest');
+  await mergeButtonOf(ctx, entry.id).props.onClick();
+  assert.equal(order[1][2], DIGEST_TEXT('stored question', 'side answer'));
+  ctx.unload();
+});
+
+test('concept-link markup is removed from every mode before the fit check', async () => {
+  const longDef = 'x'.repeat(4000);
+  const answer = `::termline{v="A **monad** sequences effects." t="monad=${longDef}"}\n\nUse [[bind|chains steps]] and ::term{name="unit" def="${longDef}"} here.`;
+  const plain = 'A **monad** sequences effects.\n\nUse bind and unit here.';
+  const cases = [
+    ['full', (question) => VERBATIM(question, [[question, plain]])],
+    ['digest', (question) => DIGEST_TEXT(question, plain)],
+  ];
+  for (const [mode, expected] of cases) {
+    const ctx = setup();
+    const order = withComposer(ctx, () => true);
+    const entry = await answered(ctx, 'what is a monad?');
+    const clean = expected('what is a monad?');
+    // Room for the clean text only: the raw text, with two long definitions, would not fit.
+    const available = roughTokens(clean) + 5;
+    withBranchRows(
+      ctx,
+      [
+        { role: 'user', text: 'what is a monad?', row_id: entry.maxRowId + 1 },
+        { role: 'assistant', text: answer, row_id: entry.maxRowId + 2 },
+      ],
+      { context_used: 128000 - available, context_max: 128000 },
+    );
+    pickMode(ctx, entry.id, mode);
+    await mergeButtonOf(ctx, entry.id).props.onClick();
+    assert.deepEqual(order.map((step) => step[0]), ['open', 'draft'], mode);
+    assert.equal(order[1][2], clean, mode);
+    assert.equal(ctx.chat.$status.get()['st-main'].heldNotice ?? null, null, mode);
+    ctx.unload();
+  }
+});
+
+test('every mode goes through the fit check: a no-fit names the mode and the numbers, and stages nothing', async () => {
+  const cases = [
+    ['full', 'Full text', VERBATIM('q', [['q', 'side answer']])],
+    ['record', 'Merge record', RECORD('q', 'branch-1')],
+    ['digest', 'Digest', DIGEST_TEXT('q', 'side answer')],
+  ];
+  for (const [mode, label, text] of cases) {
+    const ctx = setup();
+    const order = withComposer(ctx, () => true);
+    const entry = await answered(ctx, 'q');
+    const opened = ctx.host.opened.length;
+    const base = ctx.host.request.bind(ctx.host);
+    ctx.host.request = async (method, params) => {
+      if (method === 'session.usage') return { context_used: 127998, context_max: 128000 };
+      return base(method, params);
+    };
+    pickMode(ctx, entry.id, mode);
+    await assert.doesNotReject(() => mergeButtonOf(ctx, entry.id).props.onClick());
+    assert.deepEqual(order, [], mode);
+    assert.equal(ctx.host.opened.length, opened, mode);
+    assert.equal(
+      ctx.chat.$status.get()['st-main'].heldNotice,
+      `Doesn't fit (${label}): side chat is ${commas(roughTokens(text))} tokens (estimated), parent has 2 available (127,998 used of 128,000).`,
+    );
+    ctx.unload();
+  }
+});
+
+test('a no-fit notice stays through polls, a new question, focus changes and a later merge, until Dismiss', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  await answered(ctx, 'q');
+  let tight = true;
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.usage') return { context_used: tight ? 127990 : 1000, context_max: 128000 };
+    return base(method, params);
+  };
+  await stageButton(ctx).props.onClick();
+  assert.deepEqual(order, []);
+  const heldShown = () => findAll(expand(ctx.pane.render()), (n) => (
+    n.type === 'p' && typeof n.props.children === 'string' && n.props.children.startsWith("Doesn't fit")
+  ));
+  assert.equal(heldShown().length, 1);
+  assert.equal(heldShown()[0].props.style.userSelect, 'text');
+  assert.equal(heldShown()[0].props['data-selectable-text'], 'true');
+
+  // A new question forks and polls: the pane re-renders on each tick, and ask() resets its own notice.
+  await ask(ctx, 'next');
+  assert.equal(heldShown().length, 1);
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+  assert.equal(heldShown().length, 1);
+  // Focus away and back.
+  ctx.host.state.focusedStoredSessionId.set('st-other');
+  ctx.host.state.focusedSessionId.set('rt-other');
+  await flush();
+  assert.equal(heldShown().length, 0);
+  ctx.host.state.focusedStoredSessionId.set('st-main');
+  ctx.host.state.focusedSessionId.set('rt-main');
+  await flush();
+  assert.equal(heldShown().length, 1);
+  // A later merge that fits stages its draft; the held notice stays.
+  tight = false;
+  await stageButton(ctx).props.onClick();
+  assert.deepEqual(order.map((step) => step[0]), ['open', 'draft']);
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_STAGED_TEXT);
+  assert.equal(heldShown().length, 1);
+
+  const dismiss = findAll(expand(ctx.pane.render()), (n) => n.type === 'Button' && n.props.children === 'Dismiss');
+  assert.equal(dismiss.length, 1);
+  dismiss[0].props.onClick();
+  assert.equal(heldShown().length, 0);
+  assert.equal(findAll(expand(ctx.pane.render()), (n) => n.type === 'Button' && n.props.children === 'Dismiss').length, 0);
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_STAGED_TEXT);
   ctx.unload();
 });
