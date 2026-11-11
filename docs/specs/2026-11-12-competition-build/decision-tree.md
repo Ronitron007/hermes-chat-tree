@@ -1,6 +1,6 @@
 # Decision tree: the competition build
 
-Updated: 2026-11-12 01:10 IST. Green is chosen. Grey is dropped. Yellow is open.
+Updated: 2026-11-12 01:40 IST. Green is chosen. Grey is dropped. Yellow is open.
 
 ```mermaid
 flowchart TD
@@ -81,11 +81,16 @@ flowchart TD
   LN -->|chosen| LN1[Lanes stay put, from PR 27]
   LN -->|deferred| LN2[Port VS Code lane code]
 
+  W1 --> SC{Node click}
+  SC -->|chosen, Rohan 01:38| SC1[Open the chat, then reveal the exchange: hermes:timeline-reveal with rowId on the workspace viewport]
+  SC -->|dropped| SC2[Open the chat only]
+  SC1 --> SC3[Fallback: chat opened, no error, when the viewport or row is not found]
+
   classDef chosen fill:#d1fae5,stroke:#059669,color:#064e3b
   classDef dropped fill:#f3f4f6,stroke:#9ca3af,color:#6b7280
   classDef open fill:#fef3c7,stroke:#d97706,color:#78350f
-  class B1,H1,T1,V1,O,C,M1,M2,M6,M9,M8,P1,Q1,W1,RV1,F2,MS,MT1,NM1,FD,LN1,BM1,CS1 chosen
-  class B2,H2,T2,T3,V2,M3,M5,M10,P2,R2,W2,RV2,MT2,NM2,BM2 dropped
+  class B1,H1,T1,V1,O,C,M1,M2,M6,M9,M8,P1,Q1,W1,RV1,F2,MS,MT1,NM1,FD,LN1,BM1,CS1,SC1,SC3 chosen
+  class B2,H2,T2,T3,V2,M3,M5,M10,P2,R2,W2,RV2,MT2,NM2,BM2,SC2 dropped
   class Q2 open
   classDef deferred fill:#e0e7ff,stroke:#6366f1,color:#312e81
   class R1,TC,LN2 deferred
