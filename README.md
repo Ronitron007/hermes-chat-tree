@@ -6,7 +6,7 @@ The entry uses only the public plugin framework of Hermes. It changes no Hermes 
 
 ## What the entry does
 
-- **Branch here.** Start a branch from a node of the tree. The branch is a new chat that continues after that exchange. Hermes names the branch.
+- **Branch here.** Start a branch from a node of the tree. The branch is a new chat that continues after that exchange. Hermes names the branch. The new branch shows at its fork point at once.
 
 - **Ask on a cheaper model.** A branch can use a cheaper model. A side question then costs less, and the main chat stays on topic.
 
@@ -18,7 +18,13 @@ The entry uses only the public plugin framework of Hermes. It changes no Hermes 
 
 - **Digests by the model.** The model writes each digest through the plugin LLM access of Hermes (`ctx.llm.complete_structured`). At a fork, the model also writes a short digest of the chat up to the fork. A digest uses only facts from the exchanges.
 
-- **Lanes and colours.** Each chat has its own lane. A branch leaves its parent lane at the exchange where it starts. A merge curves back into a node on the ancestor lane. Blue marks the path from the first exchange to the open node. Grey marks all other nodes.
+- **Lanes and colours.** Each chat has its own lane. A branch leaves its parent lane at the exchange where it starts. A merge curves back into a node on the ancestor lane. The tree uses the colours of the Hermes theme:
+
+  - The path from the first exchange to the open node has the theme accent (`--ui-accent`).
+
+  - When you point to a node, its path to the first exchange has the theme text colour (`--dt-foreground`).
+
+  - All other nodes have the muted text colour (`--dt-muted-foreground`).
 
 - **Folded runs.** A long run of exchanges folds into one `+N` row. A click on the row opens the run.
 
@@ -70,9 +76,9 @@ The script copies files only. It runs no `hermes` command. It writes these files
 | chat-tree | `desktop-plugins/chat-tree/plugin.js`, `plugins/chat-tree/` (`plugin.yaml`, `__init__.py`) |
 | concept-links | `desktop-plugins/concept-links/plugin.js`, `plugins/concept-links/`, `skills/concept-links/SKILL.md` |
 
-The Python half of chat-tree serves one plugin RPC method, `plugin.chat-tree.digest.write`. Hermes loads the Python half only for a plugin in `plugins.enabled`. The command `hermes plugins enable chat-tree` puts it there.
+The Python half of chat-tree serves two plugin RPC methods, `plugin.chat-tree.digest.write` and `plugin.chat-tree.history.read`. Hermes loads the Python half only for a plugin in `plugins.enabled`. The command `hermes plugins enable chat-tree` puts it there.
 
-Privacy: the plugin reads the messages of the chats in the lineage of the open chat. It reads them read-only from the local session store of Hermes, to draw the tree (`plugin.chat-tree.history.read`). Nothing leaves the machine.
+Privacy: to draw the tree, `plugin.chat-tree.history.read` opens the local session store of Hermes (`state.db` in the profile home) read-only. It reads only the chats in the lineage of the open chat. It never reads a hidden or archived chat. This text stays on the machine, and no model gets it. Only a digest sends text to your model.
 
 ## How to use
 
@@ -82,9 +88,9 @@ Privacy: the plugin reads the messages of the chats in the lineage of the open c
 
 3. Point to a node to see the chat title and its model.
 
-4. Click a node to open its chat. Click a `+N` row to show the exchanges in it.
+4. Click a node to open its chat at that exchange. Click a `+N` row to show the exchanges in it.
 
-5. To ask a side question, choose **Branch here** on a node. To use a cheaper model, choose it for the branch.
+5. To ask a side question, choose **Branch here** on a node. The button shows on the node that you point to and on the open node. To use a cheaper model, choose it for the branch.
 
 6. To bring the branch back, choose the ancestor chat and the mode, **Merge as-is** or **Digest**.
 
@@ -105,15 +111,20 @@ Open the files in a browser. `render:png` needs Google Chrome in `/Applications`
 ```bash
 npm test
 <hermes venv>/bin/python chat-tree/tests_py/test_digest.py
+<hermes venv>/bin/python chat-tree/tests_py/test_history.py
 ```
 
-The Python tests import `agent.redact` and `agent.plugin_llm` from the Hermes source. No test calls a model.
+The Python tests import `agent.redact`, `agent.plugin_llm`, and `hermes_state` from the Hermes source. No test calls a model, and no test opens a real Hermes home.
 
 ## Limits
 
-- Hermes has no API to scroll a chat to one message. A click on a node opens the chat of that node, at its usual scroll position.
+- A click on a node opens its chat and scrolls the main chat to that exchange. The Desktop SDK has no scroll API. Thus the pane sends the app event `hermes:timeline-reveal` to the main chat, as the timeline rail of the chat does. It finds the chat and the exchange through the markup of the app (`data-session-anchor`, `data-slot`, `data-message-id`).
+
+- Catalog rule 8 keeps a listed plugin inside the SDK surface, and the scroll goes outside it. We chose this on purpose, and `hermes plugins validate` warns about it for the reviewer. A Desktop update can break the scroll without notice. Then a click only opens the chat.
 
 - The tree reads the newest 500 chats and at most 30 chats of one lineage.
+
+- One `plugin.chat-tree.history.read` reply holds at most 400,000 characters of text. Past that, the oldest exchanges lose their text first, and the reply says `truncated`.
 
 - Hermes refuses to branch a busy chat. Wait until the chat is idle.
 
@@ -128,7 +139,7 @@ The Python tests import `agent.redact` and `agent.plugin_llm` from the Hermes so
 | | study-tree | This entry |
 |---|---|---|
 | Where you ask | In the main chat, through an agent tool | On a branch, from the tree pane |
-| Parts | Agent tools, hooks, a skill, and a Desktop half | A Desktop pane and a Python RPC method |
+| Parts | Agent tools, hooks, a skill, and a Desktop half | A Desktop pane and two Python RPC methods |
 | What comes back | The plugin adds one checked takeaway | Merge as-is or a model Digest, into any ancestor chat |
 | Tree | Side threads as a tree | One node for each exchange, with exact fork points and merge curves |
 

@@ -46,16 +46,29 @@ def handler():
     return ctx.rpcs["history.read"]
 
 
-def seed(home, sessions):
-    """Write sessions {id: [(role, content, extra)]} to <home>/state.db with SessionDB's own API."""
+def seed(home, sessions, meta=None):
+    """Write sessions {id: [(role, content, extra)]} to <home>/state.db with SessionDB's own API.
+
+    meta: {id: create_session kwargs (parent_session_id, model_config), plus hidden=True or archived=True}.
+    Parents come before their children in ``sessions``."""
     db = hermes_state.SessionDB(db_path=Path(home) / "state.db")
     try:
         for sid, rows in sessions.items():
-            db.create_session(session_id=sid, source="cli", model="test/model")
-            for role, content, extra in rows:
-                db.append_message(session_id=sid, role=role, content=content, **extra)
+            extra = dict((meta or {}).get(sid, {}))
+            hidden, archived = extra.pop("hidden", False), extra.pop("archived", False)
+            db.create_session(session_id=sid, source="cli", model="test/model", **extra)
+            for role, content, kwargs in rows:
+                db.append_message(session_id=sid, role=role, content=content, **kwargs)
+            if hidden:
+                db.set_session_hidden(sid, True)
+            if archived:
+                db.set_session_archived(sid, True, notify=False)
     finally:
         db.close()
+
+
+def branch_of(parent, **flags):
+    return {"parent_session_id": parent, "model_config": {"_branched_from": parent}, **flags}
 
 
 CALL = {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}
@@ -75,13 +88,31 @@ CHATS = {
         ("assistant", "Branch answer", {}),
     ],
     "chat-empty": [],
+    "chat-c": [("user", "Grandchild question", {}), ("assistant", "Grandchild answer", {})],
+    "chat-hidden": [("user", "Hidden question", {}), ("assistant", "Hidden answer", {})],
+    "chat-archived": [("user", "Archived question", {}), ("assistant", "Archived answer", {})],
+    "chat-reset": [("user", "After /new", {}), ("assistant", "A new conversation", {})],
+    "other": [("user", "Unrelated question", {}), ("assistant", "Unrelated answer", {})],
+    "other-kid": [("user", "Unrelated branch", {}), ("assistant", "Unrelated branch answer", {})],
+}
+# One lineage: chat-a and its branches chat-b, chat-empty, chat-c (an older fork with only
+# parent_session_id), chat-hidden and chat-archived. chat-reset (/new from chat-a) and other with
+# other-kid are other lineages.
+META = {
+    "chat-b": branch_of("chat-a"),
+    "chat-empty": branch_of("chat-a"),
+    "chat-c": {"parent_session_id": "chat-b"},
+    "chat-hidden": branch_of("chat-a", hidden=True),
+    "chat-archived": branch_of("chat-a", archived=True),
+    "chat-reset": {"parent_session_id": "chat-a", "model_config": {"_reset_from": "chat-a"}},
+    "other-kid": branch_of("other"),
 }
 
 
 class HistoryReadTest(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="chat-tree-history-profile-")
-        seed(self.home, CHATS)
+        seed(self.home, CHATS, META)
         self.token = set_hermes_home_override(self.home)  # the profile scope a plugin RPC runs in
 
     def tearDown(self):
@@ -100,18 +131,64 @@ class HistoryReadTest(unittest.TestCase):
         ids = [r["row_id"] for r in rows_a]
         self.assertEqual(ids, sorted(ids))  # oldest first
         self.assertTrue(all(isinstance(i, int) for i in ids))
+        # session.branch counts the [System: notice (branch index 2) that the tree never shows, so a
+        # branch after "And borrowing?" keeps 4 + 1 = 5 rows, not 4.
+        self.assertEqual([r["branch_index"] for r in rows_a], [0, 1, 3, 4])
         self.assertEqual([(r["role"], r["text"]) for r in result["histories"]["chat-b"]],
                          [("user", "Branch question"), ("assistant", "Branch answer")])
 
-    def test_accepts_the_open_chat_session_id(self):
-        result = handler()({"session_ids": ["chat-b"], "session_id": "local-runtime"}, session_id="local-runtime")
-        self.assertEqual(len(result["histories"]["chat-b"]), 2)
+    def test_reads_only_the_lineage_of_the_open_chat(self):
+        ids = ["chat-a", "chat-b", "chat-c", "other", "other-kid", "chat-reset"]
+        result = handler()({"session_ids": ids, "session_id": "chat-c"}, session_id="chat-c")
+        self.assertEqual(list(result["histories"]), ["chat-a", "chat-b", "chat-c"])
+        self.assertEqual(result["skipped"], ["other", "other-kid", "chat-reset"])
+        self.assertEqual(result["missing"], [])
+        self.assertFalse(result["truncated"])
+
+    def test_the_lineage_of_another_open_chat(self):
+        ids = ["chat-a", "chat-b", "other", "other-kid"]
+        result = handler()({"session_ids": ids, "session_id": "other"}, session_id="other")
+        self.assertEqual(list(result["histories"]), ["other", "other-kid"])
+        self.assertEqual(result["skipped"], ["chat-a", "chat-b"])
+
+    def test_skips_hidden_and_archived_chats(self):
+        ids = ["chat-hidden", "chat-archived", "chat-b"]
+        result = handler()({"session_ids": ids, "session_id": "chat-a"}, session_id="chat-a")
+        self.assertEqual(list(result["histories"]), ["chat-b"])
+        self.assertEqual(result["skipped"], ["chat-hidden", "chat-archived"])
+
+    def test_an_open_chat_that_is_not_stored_reads_nothing(self):
+        result = handler()({"session_ids": ["chat-a", "chat-b", "nope"], "session_id": "local-runtime"},
+                           session_id="local-runtime")
+        self.assertEqual(result["histories"], {})
+        self.assertEqual(result["skipped"], ["chat-a", "chat-b"])
+        self.assertEqual(result["missing"], ["nope"])
+
+    def test_a_sessionless_call_reads_the_lineage_of_its_first_readable_chat(self):
+        ids = ["nope", "chat-hidden", "other", "chat-a", "other-kid"]
+        result = handler()({"session_ids": ids}, session_id=None)
+        self.assertEqual(list(result["histories"]), ["other", "other-kid"])
+        self.assertEqual(result["skipped"], ["chat-hidden", "chat-a"])
+        self.assertEqual(result["missing"], ["nope"])
 
     def test_reports_missing_ids_and_an_empty_chat(self):
         result = handler()({"session_ids": ["nope", "chat-empty", "chat-b"]}, session_id=None)
         self.assertEqual(result["missing"], ["nope"])
+        self.assertEqual(result["skipped"], [])
         self.assertEqual(result["histories"]["chat-empty"], [])
         self.assertEqual(sorted(result["histories"]), ["chat-b", "chat-empty"])
+
+    def test_the_reply_text_is_capped_and_says_so(self):
+        with mock.patch.object(plugin, "MAX_REPLY_CHARS", 60):
+            result = handler()({"session_ids": ["chat-a", "chat-b"], "session_id": "chat-a"}, session_id="chat-a")
+        self.assertTrue(result["truncated"])
+        rows = [row for chat in result["histories"].values() for row in chat]
+        self.assertLessEqual(sum(len(row["text"]) for row in rows), 60)
+        self.assertEqual(len(result["histories"]["chat-a"]), 4)  # every row stays, with its row id
+        self.assertTrue(all(isinstance(row["row_id"], int) for row in rows))
+        self.assertEqual([row["text"] for row in result["histories"]["chat-a"]],
+                         ["", "", "And borrowing?", "A borrow is a reference."])
+        self.assertEqual([row["text"] for row in result["histories"]["chat-b"]], ["", ""])
 
     def test_dedupes_ignores_non_strings_and_caps_at_30(self):
         ids = ["chat-b", "chat-b", 7, None, {"x": 1}, "", "  ", "x" * 201] + [f"gone-{i}" for i in range(40)]
@@ -128,14 +205,13 @@ class HistoryReadTest(unittest.TestCase):
 
     def test_one_read_only_open_per_call_in_the_calling_profile(self):
         opened = []
-        real = hermes_state.SessionDB
 
-        def spy(*args, **kwargs):
-            db = real(*args, **kwargs)
-            opened.append((args, kwargs, db.db_path))
-            return db
+        class Spy(hermes_state.SessionDB):  # a subclass: Hermes code reads class helpers off the module name
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                opened.append((args, kwargs, self.db_path))
 
-        with mock.patch.object(hermes_state, "SessionDB", spy):
+        with mock.patch.object(hermes_state, "SessionDB", Spy):
             handler()({"session_ids": ["chat-a", "chat-b", "nope"]}, session_id=None)
         self.assertEqual(len(opened), 1)
         self.assertEqual(opened[0][:2], ((), {"read_only": True}))
@@ -160,7 +236,8 @@ class HistoryReadTest(unittest.TestCase):
 
     def test_empty_list_opens_nothing(self):
         with mock.patch.object(hermes_state, "SessionDB", side_effect=AssertionError("opened")):
-            self.assertEqual(handler()({"session_ids": []}, session_id=None), {"histories": {}, "missing": []})
+            self.assertEqual(handler()({"session_ids": []}, session_id=None),
+                             {"histories": {}, "missing": [], "skipped": [], "truncated": False})
 
 
 class ProjectionTest(unittest.TestCase):
@@ -172,9 +249,94 @@ class ProjectionTest(unittest.TestCase):
             "not a row",
             {"role": "user", "content": None},
         ])
-        self.assertEqual(rows, [{"role": "user", "text": "kept", "row_id": 3},
-                                {"role": "assistant", "text": "dict text"}])
+        self.assertEqual(rows, [{"role": "user", "text": "kept", "branch_index": 0, "row_id": 3},
+                                {"role": "assistant", "text": "dict text", "branch_index": 2}])
         self.assertEqual(plugin.project_history(None), [])
+
+    def test_branch_index_counts_the_rows_that_session_branch_keeps(self):
+        rows = plugin.project_history([
+            {"role": "user", "content": "q1"},  # 0
+            {"role": "assistant", "content": "a1"},  # 1
+            {"role": "assistant", "content": "scaffold", "display_kind": "hidden"},  # 2, not returned
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]},  # 3, no text
+            {"role": "tool", "content": "tool output"},  # not a user or assistant row
+            {"role": "user", "content": "[System: model switched]"},  # 4, not returned
+            {"role": "user", "content": "q2"},  # 5
+            {"role": "assistant", "content": "   "},  # blank: session.branch drops it too
+            {"role": "assistant", "content": [{"type": "text", "text": "a2"}]},  # 6
+        ])
+        self.assertEqual([(r["text"], r["branch_index"]) for r in rows], [("q1", 0), ("a1", 1), ("q2", 5), ("a2", 6)])
+
+    def test_branch_text_blank_tests(self):
+        for content, blank in (("", True), ("  ", True), (None, True), ([], True), ({"type": "text", "text": ""}, True),
+                               ("x", False), ([{"type": "input_image"}], False), ({"type": "input_audio"}, False),
+                               ({"note": 1}, False), ([{"text": " "}, {"unknown": 1}], True)):
+            with self.subTest(content=content):
+                self.assertEqual(not plugin.branch_text(content).strip(), blank)
+
+
+class FakeDb:
+    """get_session over a dict, to walk parent links that a real store refuses to hold."""
+
+    def __init__(self, rows):
+        self.rows, self.reads = rows, []
+
+    def get_session(self, sid):
+        self.reads.append(sid)
+        return self.rows.get(sid)
+
+
+class LineageRootTest(unittest.TestCase):
+    def root(self, rows, sid):
+        return plugin.lineage_root(FakeDb(rows), sid, {}, {})
+
+    def test_parent_rules(self):
+        rows = {
+            "root": {},
+            "branch": {"_branched_from": "root", "parent_session_id": "elsewhere"},
+            "old-fork": {"parent_session_id": "branch"},
+            "reset": {"_reset_from": "root", "parent_session_id": "root"},
+            "orphan": {"parent_session_id": "deleted"},
+        }
+        self.assertEqual(self.root(rows, "old-fork"), "root")
+        self.assertEqual(self.root(rows, "reset"), "reset")  # /new starts its own lineage
+        self.assertEqual(self.root(rows, "orphan"), "orphan")  # a parent not in the store ends the walk
+
+    def test_a_cycle_has_no_root(self):
+        rows = {"x": {"parent_session_id": "y"}, "y": {"parent_session_id": "x"}, "z": {"parent_session_id": "x"}}
+        self.assertIsNone(self.root(rows, "z"))
+
+    def test_a_walk_past_the_cap_has_no_root(self):
+        rows = {"n0": {}}
+        for i in range(1, plugin.MAX_PARENT_LINKS + 3):
+            rows[f"n{i}"] = {"parent_session_id": f"n{i - 1}"}
+        self.assertIsNone(self.root(rows, f"n{plugin.MAX_PARENT_LINKS + 2}"))
+        self.assertEqual(self.root(rows, f"n{plugin.MAX_PARENT_LINKS}"), "n0")
+
+    def test_a_shared_ancestor_is_read_once(self):
+        db = FakeDb({"root": {}, "a": {"parent_session_id": "root"}, "b": {"parent_session_id": "root"}})
+        rows, roots = {}, {}
+        self.assertEqual([plugin.lineage_root(db, sid, rows, roots) for sid in ("a", "b")], ["root", "root"])
+        self.assertEqual(sorted(db.reads), ["a", "b", "root"])
+
+
+class CapTest(unittest.TestCase):
+    def test_the_oldest_exchanges_lose_their_text_in_every_chat_at_once(self):
+        def chat(*texts):
+            roles = ("assistant",) + ("user", "assistant") * 3
+            return [{"role": role, "text": text, "row_id": i} for i, (role, text) in enumerate(zip(roles, texts))]
+
+        # 36 characters: exchange 0 holds 24 (the greeting goes with it), exchange 1 holds 8, exchange 2 holds 4.
+        histories = {"parent": chat("greeting", "q0", "a0", "q1", "a1", "q2", "a2"),
+                     "branch": chat("greeting", "q0", "a0", "q1", "b1")}
+        with mock.patch.object(plugin, "MAX_REPLY_CHARS", 11):
+            self.assertTrue(plugin.cap_histories(histories))
+        # A row before the first user row goes with exchange 0. Rows and row ids all stay.
+        self.assertEqual([r["text"] for r in histories["parent"]], ["", "", "", "", "", "q2", "a2"])
+        self.assertEqual([r["text"] for r in histories["branch"]], ["", "", "", "", ""])
+        self.assertEqual([r["row_id"] for r in histories["parent"]], list(range(7)))
+        with mock.patch.object(plugin, "MAX_REPLY_CHARS", 1000):
+            self.assertFalse(plugin.cap_histories(histories))
 
 
 if __name__ == "__main__":

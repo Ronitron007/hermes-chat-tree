@@ -6,7 +6,9 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
 
 - Each node is one exchange, one user message and its replies.
 
-- **Branch here** starts a branch from a node. The branch is a new chat that continues after that exchange. Hermes names the branch.
+- **Branch here** starts a branch from a node. The branch is a new chat that continues after that exchange. Hermes names the branch. The button shows on the node that you point to and on the open node.
+
+- A new branch shows at its fork point at once.
 
 - A branch can use a cheaper model for a side question.
 
@@ -18,11 +20,17 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
 
 - Each chat has its own lane. A branch leaves its parent lane at the exchange where it starts. A merge curves back into a node on the ancestor lane.
 
-- Blue marks the path from the first exchange to the open node. Grey marks all other nodes.
+- The tree uses the colours of the Hermes theme:
+
+  - The path from the first exchange to the open node has the theme accent (`--ui-accent`).
+
+  - When you point to a node, its path to the first exchange has the theme text colour (`--dt-foreground`).
+
+  - All other nodes have the muted text colour (`--dt-muted-foreground`).
 
 - A long run of exchanges folds into one `+N` row. Click the row to show the exchanges in it.
 
-- Point to a node to see the chat title and its model. Click a node to open its chat.
+- Point to a node to see the chat title and its model. Click a node to open its chat at that exchange.
 
 ## Parts
 
@@ -61,7 +69,7 @@ The method sends at most 24,000 characters of exchanges to the model. It cuts ea
 
 The pane draws the tree from the messages of each chat in the lineage of the open chat. The `session.history` method of Hermes answers only for a chat that the gateway holds in memory. Thus the Python half reads the other chats from the local session store of Hermes.
 
-Privacy: the plugin reads the messages of the chats in the lineage of the open chat. It reads them from the local session store of Hermes, to draw the tree. It reads only. Nothing leaves the machine, and no model gets this text.
+Privacy: the method opens the local session store of Hermes (`state.db` in the profile home) read-only. It reads only the chats in the lineage of the open chat. It never reads a hidden or archived chat. Nothing leaves the machine, and no model gets this text.
 
 On each refresh, the pane sends one call for all chats with new messages:
 
@@ -71,11 +79,19 @@ host.request('plugin.chat-tree.history.read', { session_ids, session_id })
 
 - `session_ids` is a list of stored chat ids. The method reads the first 30 different ids. It ignores an item that is not a string.
 
-- `session_id` is the runtime id of the open chat. The call can also come without it.
+- `session_id` is the id of the open chat. The call can also come without it.
 
-- The call answers `{ histories, missing }`. `histories` maps each stored id to its rows, oldest first. Each row is `{ role, text, row_id }`, and `role` is `user` or `assistant`. `missing` lists the ids that are not in the store.
+- The method reads only the chats of one lineage. Two chats are in one lineage when their parent links go up to the same first chat. A `/new` reset starts a new lineage. With `session_id`, it is the lineage of the open chat. Without `session_id`, it is the lineage of the first chat that the method can read.
 
-- The method opens the store of the profile of the call one time, read-only (`hermes_state.SessionDB(read_only=True)`). It reads the active rows with `get_messages_as_conversation`, as `session.history` does.
+- The method skips hidden and archived chats. If `session_id` is not in the store, it reads no chat.
+
+- The call answers `{ histories, missing, skipped, truncated }`. The `histories` object maps each stored id to its rows, oldest first. Each row is `{ role, text, branch_index, row_id }`, and `role` is `user` or `assistant`. The `missing` list holds the ids that are not in the store. The `skipped` list holds the ids that the method did not read.
+
+- The `branch_index` of a row gives its place in the list that `session.branch` cuts with `count`. That list also has rows that the tree does not show, such as `[System:` notes. Thus **Branch here** sends `count` = `branch_index` + 1 of the last answer of the exchange. Without `branch_index`, the pane counts the rows that it reads.
+
+- One reply holds at most 400,000 characters of text. Past that, the oldest exchanges lose their text first, in every chat at the same time, and `truncated` is `true`. The rows stay, so the exchange numbers do not change.
+
+- The method opens the store of the profile of the call one time, read-only (`hermes_state.SessionDB(read_only=True)`). It reads the rows that `session.branch` copies, with `get_resume_conversations`.
 
 - A bad request fails the call with the reason `plugin_rpc_failed`.
 
@@ -128,7 +144,9 @@ The digest tests import `agent.redact` and `agent.plugin_llm` from the Hermes so
 
 ## Limits
 
-- Hermes has no API to scroll a chat to one message. A click on a node opens the chat of that node, at its usual scroll position.
+- A click on a node opens its chat and scrolls the main chat to that exchange. The Desktop SDK has no scroll API. Thus the pane sends the app event `hermes:timeline-reveal` to the main chat, as the timeline rail of the chat does. It finds the chat and the exchange through the markup of the app (`data-session-anchor`, `data-slot`, `data-message-id`).
+
+- Catalog rule 8 keeps a listed plugin inside the SDK surface, and the scroll goes outside it. We chose this on purpose, and `hermes plugins validate` warns about it for the reviewer. A Desktop update can break the scroll without notice. Then a click only opens the chat.
 
 - The tree reads the newest 500 chats and at most 30 chats of one lineage.
 

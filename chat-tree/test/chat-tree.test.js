@@ -1515,6 +1515,25 @@ test('branchCount: user and assistant rows with text, through the exchange last 
   assert.deepEqual(mod.branchCount([...msgs(['q', 'a']), { role: 'assistant', text: 'a more' }], 0), { count: 3, through: null });
 });
 
+test('branchCount: a branch_index from history.read gives the exact count; rows without one keep the rule', () => {
+  // history.read leaves out a hidden [System: row that session.branch still counts (branch index 2).
+  const rows = [
+    { role: 'user', text: 'q1', row_id: 11, branch_index: 0 },
+    { role: 'assistant', text: 'a1', row_id: 12, branch_index: 1 },
+    { role: 'user', text: 'q2', row_id: 14, branch_index: 3 },
+    { role: 'assistant', text: 'a2', row_id: 15, branch_index: 4 },
+    { role: 'user', text: 'q3', row_id: 16, branch_index: 5 },
+    { role: 'assistant', text: '', row_id: 17, branch_index: 6 }, // text emptied by the reply cap: still an answer
+  ];
+  assert.deepEqual(mod.branchCount(rows, 0), { count: 2, through: 12 });
+  assert.deepEqual(mod.branchCount(rows, 1), { count: 5, through: 15 });
+  assert.deepEqual(mod.branchCount(rows, 2), { count: 7, through: 17 });
+  // The same rows with no branch_index: the old rule, which comes out one short at exchange 1.
+  const plain = rows.map(({ branch_index, ...rest }) => rest);
+  assert.deepEqual(mod.branchCount(plain, 1), { count: 4, through: 15 });
+  assert.equal(mod.branchCount(plain, 2), null);
+});
+
 // ── Merge section ───────────────────────────────────────────────────────────────────────────
 
 const SHARED = [
@@ -2138,6 +2157,26 @@ test('Branch here: session.branch with the count and no name, prompt.submit with
   await flush();
   assert.ok(pills(nodeOf(again.pane.render(), 'nb:2')).includes('side:side'));
   again.unload();
+});
+
+test('Branch here counts with the branch_index of history.read rows: a hidden [System: row before the cut', async () => {
+  const host = fakeHost({ backend: true });
+  // b2 in the store: session.branch also counts a [System: row after a1 (branch index 2), which
+  // history.read does not return. So q2 is 3 and a2 is 4.
+  host.store = { ...HIST, b2: HIST.b2.map((r, i) => ({ ...r, branch_index: i < 2 ? i : i + 1 })) };
+  const ctx = setup({ host });
+  await flush();
+  branchButton(ctx, 'root:1').props.onClick(fakeEvent());
+  typeInto(ctx, 'question', 'why q2?');
+  ctx.mark = ctx.host.calls.length;
+  await submitForm(ctx);
+  await flush();
+  const branch = ctx.host.order.find(([k]) => k === 'branch');
+  assert.deepEqual(branch[1], { session_id: 'rt-b2', count: 5 }); // the old rule gives 4
+  const reads = ctx.host.calls.slice(ctx.mark).map(([m]) => m);
+  assert.deepEqual(reads.slice(0, 2), [mod.HISTORY_METHOD, 'session.branch']);
+  assert.equal(reads.includes('session.history'), false);
+  ctx.unload();
 });
 
 test('Branch here sends through_message_id when the rows carry row ids, and no override for a blank model', async () => {
