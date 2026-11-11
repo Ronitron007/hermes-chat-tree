@@ -20,7 +20,7 @@ The user opens the "Side chat" pane beside a chat. The user types a side questio
 
 5. If `session.branch_whole` fails, the pane shows the error text. If the text says that the session is busy, the pane shows "The main chat is busy. Ask again when the run ends."
 
-6. The pane keeps a list of side questions for each main chat in `ctx.storage`, under the key `sideChat:<main session id>`. Each entry holds the question, the branch `session_id`, the branch `stored_session_id`, the model, the answer, and the time. The list keeps the newest 50 entries.
+6. The pane keeps a list of side questions for each main chat in `ctx.storage`, under the key `sideChat:<main stored session id>`. Use `host.state.focusedStoredSessionId`, because a runtime id does not stay the same after a reload. Each entry holds the question, the branch `session_id`, the branch `stored_session_id`, the model, the answer, and the time. The list keeps the newest 50 entries.
 
 7. Each entry has an "Open" button. The button calls `host.openSession(stored_session_id, { intent: 'tab' })`.
 
