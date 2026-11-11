@@ -64,12 +64,19 @@ function setup({ host = {}, registry, storage, fetch = offline } = {}) {
 }
 
 // Depth-first collection of every node (and string) in a mock tree.
+const rendered = new WeakMap();
 function walk(node, out = []) {
   out.push(node);
   if (node && typeof node === 'object') {
     const kids = node.props?.children;
     for (const k of Array.isArray(kids) ? kids : kids === undefined ? [] : [kids]) walk(k, out);
     if (node.props?.label) walk(node.props.label, out);
+    // Render function components, as React would. The mock host components return nothing.
+    // Cached so repeat walks of one tree see the same nodes.
+    if (typeof node.type === 'function') {
+      if (!rendered.has(node)) rendered.set(node, node.type(node.props));
+      if (rendered.get(node) !== undefined) walk(rendered.get(node), out);
+    }
   }
   return out;
 }
@@ -784,4 +791,18 @@ test('lookup ctx carries rest captured at register time and the injected fetch',
   assert.equal(seen[0].rest, rest);
   assert.equal(seen[0].fetch, fetch);
   assert.equal(seen[0].sessionId, 's9');
+});
+
+test('renderPane calls the same hooks with and without a selected term', () => {
+  const seen = [];
+  const plugin = createPlugin({
+    host: {}, jsx: el, jsxs: el, atom, useValue: (s) => { seen.push(s); return s.get(); },
+    Tip, Button, ScrollArea, EmptyState, Badge, Switch, Separator,
+    registry: createDefaultRegistry(), fetch: offline,
+  });
+  plugin.renderPane();
+  const empty = seen.splice(0);
+  plugin.$selectedTerm.set({ name: 'monad', sessionId: 's1', definition: null });
+  plugin.renderPane();
+  assert.deepEqual(seen, empty);
 });
