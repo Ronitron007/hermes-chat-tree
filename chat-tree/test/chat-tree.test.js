@@ -3289,3 +3289,23 @@ test('renaming a chat that is not open opens it first, then renames it once it i
   assert.deepEqual(call?.[1], { session_id: 'rt-b1', title: 'Setup questions' });
   ctx.unload();
 });
+
+test('in the merge pick, a hovered target lights its path even while the row pointer is set, and the item shows a hover fill', async () => {
+  const ctx = await mergeCtx();
+  const where = openPickOf(ctx);
+  // The pointer is still on the open row (the popover is its React child).
+  const openRow = nodeRows(ctx.pane.render()).find((n) => n.props['data-open'] === 'true');
+  openRow.props.onMouseEnter();
+  const items = byAttr(where, 'data-merge-target');
+  const last = items[items.length - 1];
+  last.props.onMouseEnter();
+  const svg = byAttr(ctx.pane.render(), 'data-graph', 'true')[0];
+  const roles = findAll(svg, (n) => n.type === 'circle').map((c) => c.props['data-role']);
+  assert.ok(roles.includes('hover'), 'the target path takes the hover colour');
+  const hovered = byAttr(pickOf(ctx), 'data-pick-item').find((n) => n.props['data-pick-item'] === last.props['data-pick-item']);
+  assert.ok(String(hovered.props.style.background || '').includes('color-mix'));
+  hovered.props.onMouseLeave();
+  const after = byAttr(pickOf(ctx), 'data-pick-item').find((n) => n.props['data-pick-item'] === last.props['data-pick-item']);
+  assert.ok(!String(after.props.style.background || '').includes('color-mix'));
+  ctx.unload();
+});
