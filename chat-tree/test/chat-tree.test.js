@@ -374,6 +374,8 @@ const planFor = (rows, focusedId, history, options = {}) => {
   return { lanes, plan: mod.planGraph(lanes, { focusedId: tree.focused.id, ...options }) };
 };
 const keysOf = (plan) => plan.rows.map((r) => r.key);
+// The exchange rows only: every row but the name rows at the start of child lanes.
+const exKeysOf = (plan) => plan.rows.filter((r) => r.kind !== 'name').map((r) => r.key);
 const blueOf = (plan) => plan.rows.filter((r) => r.blue).map((r) => r.key);
 const hoverOf = (plan) => plan.rows.filter((r) => r.hover).map((r) => r.key);
 // The graph's circles of a rendered pane, by shape key, as [stroke, fill].
@@ -569,8 +571,9 @@ test('historyKey moves with the message count or last activity; no metadata mean
 test('rows: oldest first, depth first, shared exchanges only on the parent lane', () => {
   const { lanes, plan } = planFor(ROWS, 'b2', HIST);
   assert.deepEqual(lanes.map((l) => [l.id, l.fork]), [['root', 0], ['b3', 1], ['b1', 2], ['b2', 3]]);
-  assert.deepEqual(keysOf(plan), MAIN_KEYS);
-  assert.deepEqual(plan.rows.map((r) => r.label), ['q1', 'what is x?', 'q2', 'b1q', 'b2q', 'q3']);
+  assert.deepEqual(exKeysOf(plan), MAIN_KEYS);
+  assert.deepEqual(keysOf(plan), ['root:0', 'name:b3', 'b3:1', 'root:1', 'name:b1', 'b1:2', 'name:b2', 'b2:3', 'root:2']);
+  assert.deepEqual(plan.rows.map((r) => r.label), ['q1', 'Side: what is x?', 'what is x?', 'q2', 'b1', 'b1q', 'b2', 'b2q', 'q3']);
   // The first row of each lane carries the lane pills.
   assert.deepEqual(plan.rows.filter((r) => r.first).map((r) => r.key), ['root:0', 'b3:1', 'b1:2', 'b2:3']);
 });
@@ -595,7 +598,7 @@ test('a fork leaves the parent lane at the last shared exchange', () => {
 test('the blue path runs from the root first exchange through fork points to the open node', () => {
   const { plan } = planFor(ROWS, 'b2', HIST);
   assert.equal(plan.openKey, 'b2:3');
-  assert.deepEqual(blueOf(plan), ['root:0', 'root:1', 'b1:2', 'b2:3']);
+  assert.deepEqual(blueOf(plan), ['root:0', 'root:1', 'name:b1', 'b1:2', 'name:b2', 'b2:3']);
   // Main-chat rows after the fork and the side chat are grey.
   assert.equal(plan.rows.find((r) => r.key === 'root:2').blue, false);
   assert.equal(plan.rows.find((r) => r.key === 'b3:1').blue, false);
@@ -613,8 +616,8 @@ test('the open node defaults to the focused chat last exchange; a clicked node w
   // A focused fork with nothing of its own yet opens its stub, right after its fork node.
   const empty = planFor([...ROWS.slice(0, 3)], 'b2', { ...HIST, b2: HIST.b1 }).plan;
   assert.equal(empty.openKey, 'b2:3');
-  assert.deepEqual(blueOf(empty), ['root:0', 'root:1', 'b1:2', 'b2:3']);
-  assert.deepEqual(empty.rows.filter((r) => r.lane === 'b2').map((r) => [r.key, r.stub]), [['b2:3', true]]);
+  assert.deepEqual(blueOf(empty), ['root:0', 'root:1', 'name:b1', 'b1:2', 'name:b2', 'b2:3']);
+  assert.deepEqual(empty.rows.filter((r) => r.lane === 'b2').map((r) => [r.key, r.stub]), [['name:b2', undefined], ['b2:3', true]]);
 });
 
 test('a fork with no exchange of its own draws a stub node at its fork point, then a normal node', () => {
@@ -622,13 +625,15 @@ test('a fork with no exchange of its own draws a stub node at its fork point, th
   const rows = [...ROWS, row('nb', { _branched_from: 'root', started_at: 50, title: null })];
   const history = { ...HIST, nb: msgs(['q1', 'a1'], ['q2', 'a2']) };
   const { lanes, plan } = planFor(rows, 'b2', history);
-  assert.deepEqual(keysOf(plan), ['root:0', 'b3:1', 'root:1', 'b1:2', 'b2:3', 'nb:2', 'root:2']);
+  assert.deepEqual(exKeysOf(plan), ['root:0', 'b3:1', 'root:1', 'b1:2', 'b2:3', 'nb:2', 'root:2']);
+  // The stub comes right after its lane's name row.
+  assert.equal(keysOf(plan).indexOf('nb:2'), keysOf(plan).indexOf('name:nb') + 1);
   const stub = plan.rows.find((r) => r.key === 'nb:2');
   assert.deepEqual([stub.stub, stub.label, stub.branchable, stub.open], [true, mod.NEW_BRANCH_TEXT, false, false]);
   // Its fork elbow leaves root:1, the exact fork exchange, and runs to the stub.
   const lane = plan.lanes.find((l) => l.id === 'nb');
   assert.equal(plan.rows[lane.anchorRow].key, 'root:1');
-  assert.equal(lane.firstRow, keysOf(plan).indexOf('nb:2'));
+  assert.equal(lane.firstRow, keysOf(plan).indexOf('name:nb'));
   const geo = mod.graphGeometry(plan);
   assert.ok(geo.paths.some((p) => p.key === 'fork:nb'));
   assert.ok(geo.circles.some((c) => c.key === 'nb:2'));
@@ -636,7 +641,7 @@ test('a fork with no exchange of its own draws a stub node at its fork point, th
   const titled = planFor([...ROWS, row('nb', { _branched_from: 'root', started_at: 50, title: 'Why q2' })], 'nb', history, { hovered: 'nb:2' }).plan;
   const open = titled.rows.find((r) => r.key === 'nb:2');
   assert.deepEqual([open.label, open.open, open.hover], ['Why q2', true, true]);
-  assert.deepEqual(hoverOf(titled), ['root:0', 'root:1', 'nb:2']);
+  assert.deepEqual(hoverOf(titled), ['root:0', 'root:1', 'name:nb', 'nb:2']);
   // Its first exchange lands: the same key, now a normal node.
   const asked = planFor(rows, 'nb', { ...history, nb: msgs(['q1', 'a1'], ['q2', 'a2'], ['why?', null]) }).plan;
   const node = asked.rows.find((r) => r.key === 'nb:2');
@@ -660,7 +665,7 @@ test('columns: siblings that fork at one exchange get separate lanes; a finished
     c3: msgs(['q1', 'a1'], ['q2', 'a2'], ['c3 a', 'x']),
   };
   const { plan } = planFor(rows, 'p', history);
-  assert.deepEqual(keysOf(plan), ['p:0', 'c1:1', 'c1:2', 'c2:1', 'p:1', 'c3:2', 'p:2']);
+  assert.deepEqual(keysOf(plan), ['p:0', 'name:c1', 'c1:1', 'c1:2', 'name:c2', 'c2:1', 'p:1', 'name:c3', 'c3:2', 'p:2']);
   const col = (id) => plan.lanes.find((l) => l.id === id).col;
   assert.deepEqual([col('p'), col('c1'), col('c2'), col('c3')], [0, 1, 2, 1]);
   assert.ok(plan.rows.every((r) => r.col === col(r.lane)));
@@ -679,11 +684,11 @@ const MERGE_HIST = {
 
 test('a merge message links to the one child chat whose first own exchange is the side question', () => {
   const { plan } = planFor(MERGE_ROWS, 'par', MERGE_HIST);
-  assert.deepEqual(keysOf(plan), ['par:0', 'sd:1', 'par:1', 'par:2']);
-  const merged = plan.rows[2];
+  assert.deepEqual(keysOf(plan), ['par:0', 'name:sd', 'sd:1', 'par:1', 'par:2']);
+  const merged = plan.rows[3];
   assert.equal(merged.label, 'Merged: what is a monad?');
   assert.equal(merged.mergeFrom, 'sd');
-  assert.deepEqual(plan.merges, [{ from: 'sd', fromRow: 1, to: 'par', toRow: 2 }]);
+  assert.deepEqual(plan.merges, [{ from: 'sd', fromRow: 2, to: 'par', toRow: 3 }]);
   // The merged side chat is grey; the main path through the merge node is blue.
   assert.deepEqual(blueOf(plan), ['par:0', 'par:1', 'par:2']);
   // The side lane holds its column down to the merge node.
@@ -748,9 +753,9 @@ test('collapse keeps fork points, merge nodes and the open node, and the blue pa
   const rows = [row('root', { started_at: 1 }), row('c', { _branched_from: 'root', started_at: 2 })];
   const history = { root: msgs(...TEN), c: msgs(...TEN.slice(0, 5), ['c5', 'x'], ['c6', 'x'], ['c7', 'x']) };
   const { plan } = planFor(rows, 'c', history);
-  assert.deepEqual(keysOf(plan), ['root:0', 'more:root:1', 'root:4', 'c:5', 'c:6', 'c:7', 'more:root:5', 'root:9']);
-  assert.deepEqual(blueOf(plan), ['root:0', 'more:root:1', 'root:4', 'c:5', 'c:6', 'c:7']);
-  assert.equal(plan.rows[6].count, 4);
+  assert.deepEqual(keysOf(plan), ['root:0', 'more:root:1', 'root:4', 'name:c', 'c:5', 'c:6', 'c:7', 'more:root:5', 'root:9']);
+  assert.deepEqual(blueOf(plan), ['root:0', 'more:root:1', 'root:4', 'name:c', 'c:5', 'c:6', 'c:7']);
+  assert.equal(plan.rows[7].count, 4);
   // A clicked node in a run stays visible and splits the run.
   const clicked = planFor([row('root')], 'root', { root: msgs(...TEN) }, { open: { chatId: 'root', index: 3 } }).plan;
   assert.deepEqual(keysOf(clicked), ['root:0', 'root:1', 'root:2', 'root:3', 'more:root:4', 'root:9']);
@@ -767,27 +772,41 @@ test('collapse keeps fork points, merge nodes and the open node, and the blue pa
 test('geometry: hollow nodes on rows, lane lines between them, rounded fork elbows, roles by path', () => {
   const geo = mod.graphGeometry(planFor(ROWS, 'b2', HIST).plan);
   assert.equal(geo.width, 58);
-  assert.equal(geo.height, 6 * 26);
+  // Six exchange rows and three name rows (b3, b1, b2).
+  assert.equal(geo.height, 9 * 26);
   assert.deepEqual(
     geo.circles.map((c) => [c.key, c.cx, c.cy, c.role, c.filled]),
     [
       ['root:0', 8, 13, 'active', false],
-      ['b3:1', 22, 39, 'inactive', false],
-      ['root:1', 8, 65, 'active', false],
-      ['b1:2', 22, 91, 'active', false],
-      ['b2:3', 36, 117, 'active', true],
-      ['root:2', 8, 143, 'inactive', false],
+      ['b3:1', 22, 65, 'inactive', false],
+      ['root:1', 8, 91, 'active', false],
+      ['b1:2', 22, 143, 'active', false],
+      ['b2:3', 36, 195, 'active', true],
+      ['root:2', 8, 221, 'inactive', false],
     ],
   );
   assert.ok(geo.circles.every((c) => c.r === 4));
+  // Each fork elbow lands on its lane's name row (no circle there); the lane line runs on from it.
   assert.deepEqual(
     geo.paths.map((p) => [p.key, p.d, p.role]),
     [
-      ['lane:root:0', 'M 8 17 V 61', 'active'],
-      ['lane:root:2', 'M 8 69 V 139', 'inactive'],
-      ['fork:b3', 'M 12 13 H 17 A 5 5 0 0 1 22 18 V 35', 'inactive'],
-      ['fork:b1', 'M 12 65 H 17 A 5 5 0 0 1 22 70 V 87', 'active'],
-      ['fork:b2', 'M 26 91 H 31 A 5 5 0 0 1 36 96 V 113', 'active'],
+      ['lane:root:0', 'M 8 17 V 87', 'active'],
+      ['lane:root:3', 'M 8 95 V 217', 'inactive'],
+      ['lane:b3:1', 'M 22 39 V 61', 'inactive'],
+      ['fork:b3', 'M 12 13 H 17 A 5 5 0 0 1 22 18 V 39', 'inactive'],
+      ['lane:b1:4', 'M 22 117 V 139', 'active'],
+      ['fork:b1', 'M 12 91 H 17 A 5 5 0 0 1 22 96 V 117', 'active'],
+      ['lane:b2:6', 'M 36 169 V 191', 'active'],
+      ['fork:b2', 'M 26 143 H 31 A 5 5 0 0 1 36 148 V 169', 'active'],
+    ],
+  );
+  // A small square marks each name row, centred on its lane, in its path colour.
+  assert.deepEqual(
+    geo.marks.map((m) => [m.key, m.x + m.size / 2, m.y + m.size / 2, m.role]),
+    [
+      ['name:b3', 22, 39, 'inactive'],
+      ['name:b1', 22, 117, 'active'],
+      ['name:b2', 36, 169, 'active'],
     ],
   );
   // Every shape stays inside the graph column: no line runs over the text.
@@ -800,7 +819,7 @@ test('geometry: hollow nodes on rows, lane lines between them, rounded fork elbo
 test('geometry: a merge curve runs down from the side lane last node into the merge node, inactive', () => {
   const geo = mod.graphGeometry(planFor(MERGE_ROWS, 'par', MERGE_HIST).plan);
   const merge = geo.paths.find((p) => p.key.startsWith('merge:'));
-  assert.equal(merge.d, 'M 22 43 V 60 A 5 5 0 0 1 17 65 H 12');
+  assert.equal(merge.d, 'M 22 69 V 86 A 5 5 0 0 1 17 91 H 12');
   assert.equal(merge.role, 'inactive');
   assert.equal(geo.circles.find((c) => c.key === 'par:2').filled, true);
 });
@@ -815,8 +834,8 @@ test('geometry: a +N row has no node and the lane line passes through it', () =>
 test('geometry roles: the hovered node path to the root is hover, the open path active, the rest inactive', () => {
   // b3:1 is hovered (the side chat), b2:3 is open. Both paths run through root:0: hover wins there.
   const { plan } = planFor(ROWS, 'b2', HIST, { hovered: 'b3:1' });
-  assert.deepEqual(hoverOf(plan), ['root:0', 'b3:1']);
-  assert.deepEqual(blueOf(plan), ['root:0', 'root:1', 'b1:2', 'b2:3']);
+  assert.deepEqual(hoverOf(plan), ['root:0', 'name:b3', 'b3:1']);
+  assert.deepEqual(blueOf(plan), ['root:0', 'root:1', 'name:b1', 'b1:2', 'name:b2', 'b2:3']);
   const geo = mod.graphGeometry(plan);
   assert.deepEqual(
     geo.circles.map((c) => [c.key, c.role]),
@@ -833,16 +852,19 @@ test('geometry roles: the hovered node path to the root is hover, the open path 
     geo.paths.map((p) => [p.key, p.role]),
     [
       ['lane:root:0', 'active'],
-      ['lane:root:2', 'inactive'],
+      ['lane:root:3', 'inactive'],
+      ['lane:b3:1', 'hover'],
       ['fork:b3', 'hover'],
+      ['lane:b1:4', 'active'],
       ['fork:b1', 'active'],
+      ['lane:b2:6', 'active'],
       ['fork:b2', 'active'],
     ],
   );
   // Hover on a deep node runs through its fork elbows and lane lines up to the root's first exchange.
   const deep = mod.graphGeometry(planFor(ROWS, 'b3', HIST, { hovered: 'b2:3' }).plan);
   assert.deepEqual(deep.circles.filter((c) => c.role === 'hover').map((c) => c.key), ['root:0', 'root:1', 'b1:2', 'b2:3']);
-  assert.deepEqual(deep.paths.filter((p) => p.role === 'hover').map((p) => p.key), ['lane:root:0', 'fork:b1', 'fork:b2']);
+  assert.deepEqual(deep.paths.filter((p) => p.role === 'hover').map((p) => p.key), ['lane:root:0', 'lane:b1:4', 'fork:b1', 'lane:b2:6', 'fork:b2']);
   assert.deepEqual(deep.circles.filter((c) => c.role === 'active').map((c) => c.key), ['b3:1']);
   // Hover on the open node: the whole open path is hover, the open node still filled.
   const same = planFor(ROWS, 'b2', HIST, { hovered: 'b2:3' }).plan;
@@ -1066,7 +1088,7 @@ test('a merged side chat shows a Merged node on the parent lane with a muted cur
   const merged = nodeOf(tree, 'par:1');
   assert.equal(merged.props['data-merge-node'], 'sd');
   assert.equal(merged.props.children[0].props.children, 'Merged: what is a monad?');
-  const curve = findAll(byAttr(tree, 'data-graph', 'true')[0], (n) => n.type === 'path' && n.key === 'merge:sd:2')[0];
+  const curve = findAll(byAttr(tree, 'data-graph', 'true')[0], (n) => n.type === 'path' && n.key === 'merge:sd:3')[0];
   assert.equal(curve.props.stroke, MUTED);
   ctx.unload();
 });
@@ -1154,7 +1176,7 @@ test('the pane loads again on focus change, every 15 s, and on Refresh', async (
   ctx.unload();
 });
 
-test('one view only: no view toggle, breadcrumb, minimap, or disclosure', async () => {
+test('one graph only: no breadcrumb, minimap, or disclosure (the view toggle is the only switch)', async () => {
   const ctx = setup();
   await flush();
   const tree = ctx.pane.render();
@@ -1344,7 +1366,7 @@ test('register after dispose (disable, then enable) works again with fresh UI st
   const disposers = [];
   ctx.tree.register({ register: () => {}, setTimeout: clock.setTimeout, onDispose: (fn) => disposers.push(fn) });
   await flush();
-  assert.deepEqual(ctx.tree.$ui.get(), { open: null, expanded: {}, pick: null, result: null, branch: null, forkNotice: null });
+  assert.deepEqual(ctx.tree.$ui.get(), { open: null, expanded: {}, pick: null, result: null, branch: null, forkNotice: null, mode: 'exchanges' });
   assert.deepEqual(nodeKeys(ctx.pane.render()), ['root:0', 'root:9']);
   const before = listCalls(host);
   host.state.focusedStoredSessionId.set('root2');
@@ -2997,6 +3019,176 @@ test('with the SDK Popover, Branch here opens its form at the row; Escape or a c
   assert.equal(byAttr(ctx.pane.render(), 'data-branch-form').length, 1);
   root().props.onOpenChange(false);
   assert.equal(ctx.tree.$ui.get().branch, null);
+  ctx.unload();
+});
+
+// ── Branch names: a name row at each fork, and the Branches view ─────────────────────────────
+
+const nameRows = (tree) => byAttr(tree, 'data-name-row');
+
+test('name rows: one per child lane, right after its fork, with the Hermes title; the elbow lands on it', () => {
+  const { lanes, plan } = planFor(ROWS, 'b2', HIST);
+  const names = plan.rows.filter((r) => r.kind === 'name');
+  // Every lane with a parent, none for the root.
+  assert.deepEqual(names.map((r) => r.lane), ['b3', 'b1', 'b2']);
+  for (const name of names) {
+    const lane = lanes.find((l) => l.id === name.lane);
+    const at = plan.rows.indexOf(name);
+    const entry = plan.lanes.find((l) => l.id === name.lane);
+    assert.equal(name.label, lane.title);
+    assert.equal(name.model, lane.model);
+    // Right after the fork node, right before the lane's first own exchange.
+    assert.equal(entry.anchorRow, at - 1);
+    assert.equal(entry.firstRow, at);
+    assert.equal(plan.rows[at + 1].key, `${name.lane}:${name.index}`);
+    assert.equal(name.col, entry.col);
+  }
+  // Not a node: no circle, a small square; the fork elbow ends at the name row's centre.
+  const geo = mod.graphGeometry(plan);
+  assert.ok(!geo.circles.some((c) => c.key.startsWith('name:')));
+  assert.deepEqual(geo.marks.map((m) => m.key), ['name:b3', 'name:b1', 'name:b2']);
+  const b1 = plan.lanes.find((l) => l.id === 'b1');
+  assert.ok(geo.paths.find((p) => p.key === 'fork:b1').d.endsWith(`V ${b1.firstRow * 26 + 13}`));
+  // The blue path and the hover path run through it in their colours.
+  assert.deepEqual([names[1].blue, names[0].blue], [true, false]);
+  const hovered = planFor(ROWS, 'b2', HIST, { hovered: 'name:b3' }).plan;
+  assert.deepEqual(hoverOf(hovered), ['root:0', 'name:b3', 'b3:1']);
+  // A stub lane gets its name row too; a lane with no rows of its own gets none.
+  const rows = [...ROWS, row('nb', { _branched_from: 'root', started_at: 50, title: 'Why q2' }), row('dry', { _branched_from: 'root', started_at: 60 })];
+  const stubbed = planFor(rows, 'b2', { ...HIST, nb: msgs(['q1', 'a1'], ['q2', 'a2']), dry: [] }).plan;
+  const keys = keysOf(stubbed);
+  assert.equal(keys.indexOf('nb:2'), keys.indexOf('name:nb') + 1);
+  assert.equal(stubbed.rows.find((r) => r.key === 'name:nb').label, 'Why q2');
+  assert.ok(!keys.includes('name:dry'));
+});
+
+test('collapse never takes a name row: a long child lane keeps it before its +N run', () => {
+  const rows = [row('root', { started_at: 1 }), row('c', { _branched_from: 'root', started_at: 2, title: 'Long branch' })];
+  const history = { root: msgs(...TEN.slice(0, 2)), c: msgs(...TEN.slice(0, 1), ...TEN.slice(1).map(([q, a]) => [`c ${q}`, a])) };
+  const { plan } = planFor(rows, 'root', history);
+  assert.deepEqual(keysOf(plan), ['root:0', 'name:c', 'c:1', 'more:c:2', 'c:9', 'root:1']);
+  const geo = mod.graphGeometry(plan);
+  // The lane line runs from the name row through the first node and the run.
+  assert.deepEqual(geo.paths.filter((p) => p.key.startsWith('lane:c')).map((p) => p.d), ['M 22 39 V 61', 'M 22 69 V 91', 'M 22 91 V 113']);
+});
+
+test('a name row: 12 px muted title with the fork icon and model; a click opens its first exchange in place', async () => {
+  const ctx = setup();
+  await flush();
+  const tree = ctx.pane.render();
+  assert.deepEqual(nameRows(tree).map((n) => n.props['data-name-row']), ['b3', 'b1', 'b2']);
+  const b1 = nameRows(tree).find((n) => n.props['data-name-row'] === 'b1');
+  const label = byAttr(b1, 'data-label')[0];
+  assert.equal(label.props.children, 'b1');
+  assert.equal(label.props.style.fontSize, 12);
+  assert.equal(label.props.style.color, MUTED);
+  // Narrow-pane rules: the label ellipsizes, every other child keeps its size.
+  assert.deepEqual([label.props.style.flex, label.props.style.minWidth, label.props.style.textOverflow, label.props.style.whiteSpace], ['1 1 auto', 0, 'ellipsis', 'nowrap']);
+  for (const c of b1.props.children.filter((x) => x?.props && x !== label)) assert.equal(c.props.style.flex, '0 0 auto');
+  assert.equal(byAttr(b1, 'data-name-model')[0].props.children, 'm1');
+  assert.equal(byAttr(b1, 'data-name-glyph').length, 1);
+  assert.equal(b1.props['data-selectable-text'], 'true');
+  assert.equal(b1.props.style.userSelect, 'text');
+  // Not a node: no Branch, Merge or tab icons.
+  assert.equal(byAttr(b1, 'data-branch-slot').length + byAttr(b1, 'data-tab-slot').length, 0);
+  b1.props.onClick();
+  await flush();
+  assert.deepEqual(ctx.host.opened, [['b1', { intent: 'in-place', profile: 'default' }]]);
+  assert.deepEqual(ctx.tree.$ui.get().open, { chatId: 'b1', index: 2 });
+  // The pointer on it lights its path in the hover colour.
+  b1.props.onMouseEnter();
+  assert.equal(ctx.tree.$hover.get().pointer, 'name:b1');
+  assert.equal(circleColours(ctx.pane.render())['c:root:1'][0], HOVER);
+  ctx.unload();
+});
+
+test('Branches view: one row per chat with its title, exchange count and merged; the open chat is open and active', () => {
+  const { plan } = planFor(ROWS, 'b2', HIST, { mode: mod.BRANCHES_MODE });
+  assert.deepEqual(keysOf(plan), ['name:root', 'name:b3', 'name:b1', 'name:b2']);
+  assert.ok(plan.rows.every((r) => r.kind === 'name'));
+  assert.deepEqual(plan.rows.map((r) => [r.label, r.count]), [['root', 3], ['Side: what is x?', 1], ['b1', 1], ['b2', 1]]);
+  assert.deepEqual(plan.rows.filter((r) => r.open).map((r) => r.key), ['name:b2']);
+  assert.deepEqual(blueOf(plan), ['name:root', 'name:b1', 'name:b2']);
+  // Fork elbows connect the chat rows: each child leaves its parent's row.
+  const lane = (id) => plan.lanes.find((l) => l.id === id);
+  assert.deepEqual(['b3', 'b1', 'b2'].map((id) => plan.rows[lane(id).anchorRow].key), ['name:root', 'name:root', 'name:b1']);
+  const geo = mod.graphGeometry(plan);
+  assert.deepEqual(geo.paths.map((p) => [p.key, p.role]), [['fork:b3', 'inactive'], ['fork:b1', 'active'], ['fork:b2', 'active']]);
+  // An outline: each child one column right of its parent; its elbow runs down the parent's column
+  // and turns right into its row. Siblings share a column.
+  assert.deepEqual(['root', 'b3', 'b1', 'b2'].map((id) => lane(id).col), [0, 1, 1, 2]);
+  assert.equal(geo.paths.find((p) => p.key === 'fork:b1').d, 'M 8 13 V 60 A 5 5 0 0 0 13 65 H 22');
+  assert.equal(geo.circles.length, 0);
+  // merged: a merge node in an ancestor names the chat.
+  const merged = planFor(MERGE_ROWS, 'par', MERGE_HIST, { mode: mod.BRANCHES_MODE }).plan;
+  assert.deepEqual(merged.rows.map((r) => [r.key, r.merged, r.count]), [['name:par', false, 3], ['name:sd', true, 1]]);
+});
+
+test('the view toggle: Exchanges by default, Branches shows one row per chat, a click opens that chat, and back', async () => {
+  const ctx = setup();
+  await flush();
+  let tree = ctx.pane.render();
+  const toggle = byAttr(tree, 'data-mode-toggle')[0];
+  assert.ok(toggle);
+  const button = (t, mode) => byAttr(t, 'data-mode', mode)[0];
+  assert.deepEqual([button(tree, 'exchanges').props['aria-pressed'], button(tree, 'branches').props['aria-pressed']], [true, false]);
+  assert.deepEqual(nodeKeys(tree), MAIN_KEYS);
+  button(tree, 'branches').props.onClick();
+  tree = ctx.pane.render();
+  assert.equal(ctx.tree.$ui.get().mode, 'branches');
+  assert.equal(ctx.storage.map.get(mod.MODE_KEY), 'branches');
+  assert.deepEqual(button(tree, 'branches').props['aria-pressed'], true);
+  assert.deepEqual(nodeKeys(tree), []);
+  assert.deepEqual(nameRows(tree).map((n) => n.props['data-name-row']), ['root', 'b3', 'b1', 'b2']);
+  const open = nameRows(tree).find((n) => n.props['data-open']);
+  assert.equal(open.props['data-name-row'], 'b2');
+  assert.equal(open.props.style.background, `color-mix(in srgb, ${ACCENT} 14%, transparent)`);
+  assert.match(textOf(nameRows(tree)[0]), /\(3 exchanges\)/);
+  nameRows(tree).find((n) => n.props['data-name-row'] === 'b3').props.onClick();
+  await flush();
+  assert.deepEqual(ctx.host.opened, [['b3', { intent: 'in-place', profile: 'default' }]]);
+  assert.equal(ctx.tree.$ui.get().open, null);
+  button(ctx.pane.render(), 'exchanges').props.onClick();
+  assert.deepEqual(nodeKeys(ctx.pane.render()), MAIN_KEYS);
+  // The stored mode comes back on the next activation.
+  ctx.unload();
+  const again = setup({ storage: ctx.storage });
+  await flush();
+  assert.equal(again.tree.$ui.get().mode, 'exchanges');
+  again.unload();
+  ctx.storage.map.set(mod.MODE_KEY, 'branches');
+  const third = setup({ storage: ctx.storage });
+  await flush();
+  assert.equal(third.tree.$ui.get().mode, 'branches');
+  third.unload();
+});
+
+test('name rows and the Branches view keep the hook order (React error 300)', async () => {
+  const log = [];
+  const useValue = (a) => {
+    log.push(a);
+    return a.get();
+  };
+  const ctx = setup({ useValue });
+  await flush();
+  const order = () => {
+    log.length = 0;
+    ctx.pane.render();
+    return [...log];
+  };
+  const states = [order()];
+  nameRows(ctx.pane.render())[0].props.onMouseEnter();
+  states.push(order()); // a hovered name row
+  byAttr(ctx.pane.render(), 'data-mode', 'branches')[0].props.onClick();
+  states.push(order()); // the Branches view
+  nameRows(ctx.pane.render())[1].props.onMouseEnter();
+  states.push(order());
+  byAttr(ctx.pane.render(), 'data-mode', 'exchanges')[0].props.onClick();
+  states.push(order()); // back
+  for (const s of states) {
+    assert.equal(s.length, 8);
+    assert.deepEqual(s, states[0]);
+  }
   ctx.unload();
 });
 

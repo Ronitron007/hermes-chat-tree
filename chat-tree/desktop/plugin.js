@@ -83,6 +83,14 @@ const GRAPH_PAD = 8;
 const LANE_GAP = 14;
 const NODE_R = 4;
 const CURVE_R = 5;
+// A name row's marker: a small square on the lane, where the fork elbow lands.
+const MARK_SIZE = 4;
+// Name row keys start with this; no exchange key does (exchange keys end in `:<index>`).
+const NAME_PREFIX = 'name:';
+// The pane's two views: one row per exchange (the default), or one row per chat.
+const EXCHANGES_MODE = 'exchanges';
+const BRANCHES_MODE = 'branches';
+const MODE_KEY = 'mode';
 // Graph colours are Hermes theme variables, each with the old fixed colour as its fallback, so the
 // pane still draws where the variables are missing. A role takes the token Hermes uses for that job
 // (paths in hermes-agent/apps/desktop/src):
@@ -851,11 +859,19 @@ function drawer(byId) {
 // fork digest } (each goes to the node that draws that exchange), hovered: the node key under the
 // pointer (its path gets hover: true) }. branchable: an answered
 // exchange of the focused chat, where Branch here applies.
+//
+// Name rows: { kind: 'name', key: 'name:<chat id>', lane, index, label, model, count, merged, blue,
+// hover, open, first, target }. In the exchanges view (the default) every child lane starts with
+// one name row: its Hermes title, right after its fork elbow and before its first own row. The
+// elbow lands on it. index is the lane's first own exchange (or its stub). options.mode
+// 'branches' plans every lane fully collapsed: one name row per chat (the root too), with
+// count (its own exchanges), merged (a merge node in an ancestor names it) and open (the focused chat).
 function planGraph(lanes, options = {}) {
   const list = Array.isArray(lanes) ? lanes : [];
   const byId = new Map(list.map((lane) => [lane.id, lane]));
   const start = (lane) => (lane.parentId ? Math.min(lane.fork, lane.exchanges.length) : 0);
   const nodeKey = (id, index) => `${id}:${index}`;
+  const branchesMode = options.mode === BRANCHES_MODE;
   const resolve = drawer(byId);
   const mergeLane = typeof options.target === 'string' && byId.has(options.target) ? options.target : null;
   // A child with no exchange of its own yet (a fork just made) draws one stub node at index
@@ -914,7 +930,11 @@ function planGraph(lanes, options = {}) {
   // Blue: the path of the open node. Hover: the path of options.hovered, the node key under the pointer.
   const blue = pathFrom(target);
   let hoverAt = null;
-  if (typeof options.hovered === 'string') {
+  if (typeof options.hovered === 'string' && options.hovered.startsWith(NAME_PREFIX)) {
+    // A name row under the pointer: the path of its lane's first own exchange (or stub).
+    const lane = byId.get(options.hovered.slice(NAME_PREFIX.length));
+    if (lane) hoverAt = nodeAt(lane.id, start(lane));
+  } else if (typeof options.hovered === 'string') {
     const cut = options.hovered.lastIndexOf(':');
     if (cut > 0) hoverAt = nodeAt(options.hovered.slice(0, cut), Number(options.hovered.slice(cut + 1)));
   }
@@ -995,11 +1015,41 @@ function planGraph(lanes, options = {}) {
       stub: true,
     });
   };
+  // The chats from the focused chat up to the root: the open path of the branches view.
+  const pathLanes = new Set();
+  for (let lane = focused; lane && !pathLanes.has(lane.id); lane = lane.parentId ? byId.get(lane.parentId) : null) pathLanes.add(lane.id);
+  const pushName = (lane) => {
+    const first = nodeKey(lane.id, start(lane));
+    rows.push({
+      kind: 'name',
+      key: `${NAME_PREFIX}${lane.id}`,
+      lane: lane.id,
+      index: start(lane),
+      label: lane.title,
+      model: lane.model,
+      count: Math.max(0, lane.exchanges.length - start(lane)),
+      merged: false,
+      blue: branchesMode ? pathLanes.has(lane.id) : blue.has(first),
+      hover: hover.has(first),
+      open: branchesMode && lane.id === focused?.id,
+      first: false,
+      target: lane.id === mergeLane,
+    });
+  };
   const emit = (lane) => {
     if (visited.has(lane.id)) return;
     visited.add(lane.id);
     const n = lane.exchanges.length;
     const s = start(lane);
+    if (branchesMode) {
+      // Every lane fully collapsed: its name row, then its children in fork order.
+      pushName(lane);
+      for (let i = 0; i < n; i++) for (const kid of anchored.get(nodeKey(lane.id, i)) ?? []) emit(kid);
+      for (const kid of loose.get(lane.id) ?? []) emit(kid);
+      return;
+    }
+    // A child lane with rows of its own starts with its name row. Collapse never takes it.
+    if (lane.parentId && (stubbed(lane) || s < n)) pushName(lane);
     if (stubbed(lane)) pushStub(lane);
     const keep = new Set([s, n - 1]);
     for (let i = s; i < n; i++) {
@@ -1037,7 +1087,8 @@ function planGraph(lanes, options = {}) {
     entry.end = index;
     info.set(row.lane, entry);
   });
-  for (const entry of info.values()) rows[entry.firstRow].first = true;
+  // first: the lane's first exchange row (its side pill), the name row only in the branches view.
+  for (const entry of info.values()) rows[entry.rows.find((i) => rows[i].kind !== 'name') ?? entry.firstRow].first = true;
 
   // Merge links: the header text carries the side question. Link only when exactly one chat
   // below the merge node's chat has a first own exchange with that text. Titles never count:
@@ -1064,12 +1115,28 @@ function planGraph(lanes, options = {}) {
     entry.end = Math.max(entry.end, index);
     merges.push({ from: pick.id, fromRow: entry.lastRow, to: row.lane, toRow: index });
   });
+  // The branches view has no merge nodes: a chat that a merge node in an ancestor names is merged.
+  if (branchesMode) {
+    const merged = new Set();
+    for (const lane of list) {
+      for (let i = start(lane); i < lane.exchanges.length; i++) {
+        const text = lane.exchanges[i].merge;
+        if (!text) continue;
+        const matches = list.filter((kid) => {
+          const first = kid.exchanges[start(kid)];
+          return kid.parentId && first && normalizeText(first.user) === text && below(kid.id, lane.id);
+        });
+        if (matches.length === 1) merged.add(matches[0].id);
+      }
+    }
+    for (const row of rows) row.merged = merged.has(row.lane);
+  }
 
   // Columns: a lane holds its column from its fork node to its last row (or its last merge).
   // A child sits right of the lane it forks from; the lowest free column wins.
   for (const [id, entry] of info) {
     const at = anchorOf.get(id);
-    if (at) entry.anchorRow = rowOf.get(nodeKey(at.lane, at.index)) ?? -1;
+    if (at) entry.anchorRow = rowOf.get(branchesMode ? `${NAME_PREFIX}${at.lane}` : nodeKey(at.lane, at.index)) ?? -1;
   }
   const order = [...info.values()].sort((a, b) => (a.anchorRow >= 0 ? a.anchorRow : a.firstRow) - (b.anchorRow >= 0 ? b.anchorRow : b.firstRow) || a.firstRow - b.firstRow);
   const placed = [];
@@ -1078,7 +1145,8 @@ function planGraph(lanes, options = {}) {
     const from = entry.anchorRow >= 0 ? info.get(anchorOf.get(entry.id).lane) : lane.parentId ? info.get(lane.parentId) : null;
     const begin = entry.anchorRow >= 0 ? entry.anchorRow : entry.firstRow;
     let col = from ? from.col + 1 : 0;
-    while (placed.some((p) => p.col === col && p.begin <= entry.end && begin <= p.end)) col += 1;
+    // The branches view is an outline: a chat sits one column right of its parent, always.
+    while (!branchesMode && placed.some((p) => p.col === col && p.begin <= entry.end && begin <= p.end)) col += 1;
     entry.col = col;
     if (entry.anchorRow >= 0) entry.anchorCol = from.col;
     placed.push({ col, begin, end: entry.end });
@@ -1086,7 +1154,7 @@ function planGraph(lanes, options = {}) {
   for (const row of rows) row.col = info.get(row.lane).col;
 
   const laneList = [...info.values()].map(({ end, ...entry }) => entry);
-  return { rows, lanes: laneList, merges, openKey };
+  return { rows, lanes: laneList, merges, openKey, ...(branchesMode ? { mode: BRANCHES_MODE } : {}) };
 }
 
 // The plan with `span` spacer rows after row `after` (the merge result line under its row). Every
@@ -1133,6 +1201,7 @@ function graphGeometry(plan) {
   const height = rows.length * ROW_H;
   const roleOf = (row, target) => (row.hover ? 'hover' : row.blue || target ? 'active' : 'inactive');
   const edge = (index) => (rows[index].kind === 'node' ? NODE_R : 0);
+  const outline = plan?.mode === BRANCHES_MODE;
   const paths = [];
   for (const lane of lanes) {
     const x = laneX(lane.col);
@@ -1141,10 +1210,17 @@ function graphGeometry(plan) {
       const b = lane.rows[k];
       paths.push({ key: `lane:${lane.id}:${a}`, d: `M ${x} ${rowY(a) + edge(a)} V ${rowY(b) - edge(b)}`, role: roleOf(rows[b], lane.target === true), target: lane.target === true });
     }
-    if (lane.anchorRow >= 0) {
+    if (lane.anchorRow >= 0 && outline) {
+      // The branches view: down the parent's column, then a rounded turn right into the chat's row.
+      const xa = laneX(lane.anchorCol);
+      const yc = rowY(lane.firstRow);
+      const d = `M ${xa} ${rowY(lane.anchorRow)} V ${yc - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 0 ${xa + CURVE_R} ${yc} H ${x}`;
+      paths.push({ key: `fork:${lane.id}`, d, role: roleOf(rows[lane.firstRow], lane.target === true), target: lane.target === true });
+    } else if (lane.anchorRow >= 0) {
       const xa = laneX(lane.anchorCol);
       const ya = rowY(lane.anchorRow);
-      const d = `M ${xa + NODE_R} ${ya} H ${x - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 1 ${x} ${ya + CURVE_R} V ${rowY(lane.firstRow) - NODE_R}`;
+      // The elbow lands on the lane's first row: its name row (no circle), else its first node.
+      const d = `M ${xa + edge(lane.anchorRow)} ${ya} H ${x - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 1 ${x} ${ya + CURVE_R} V ${rowY(lane.firstRow) - edge(lane.firstRow)}`;
       paths.push({ key: `fork:${lane.id}`, d, role: roleOf(rows[lane.firstRow], lane.target === true), target: lane.target === true });
     }
   }
@@ -1163,7 +1239,19 @@ function graphGeometry(plan) {
     if (row.kind !== 'node') return;
     circles.push({ key: row.key, cx: laneX(row.col), cy: rowY(index), r: NODE_R, role: roleOf(row, row.target === true), filled: row.open === true, target: row.target === true });
   });
-  return { width, height, circles, paths };
+  // Outline elbows of one parent share its column: the open and hover paths draw last, on top.
+  if (outline) {
+    const rank = { inactive: 0, active: 1, hover: 2 };
+    paths.sort((a, b) => rank[a.role] - rank[b.role]);
+  }
+  // Name rows: a small filled square on the lane line (larger on the open chat's row).
+  const marks = [];
+  rows.forEach((row, index) => {
+    if (row.kind !== 'name') return;
+    const size = row.open ? MARK_SIZE + 2 : MARK_SIZE;
+    marks.push({ key: row.key, x: laneX(row.col) - size / 2, y: rowY(index) - size / 2, size, role: roleOf(row, row.target === true) });
+  });
+  return { width, height, circles, paths, marks };
 }
 
 // subagent.list rows are untrusted: keep only well-typed fields.
@@ -1261,6 +1349,13 @@ const CHIP = { ...SELECTABLE, maxWidth: 140, minWidth: 0, justifyContent: 'flex-
 // The row icons: Hermes's own Branch in new chat button draws GitForkIcon at size-3.5, 14 px
 // (components/assistant-ui/thread/assistant-message.tsx:1418); the SDK exports it as icons.GitForkIcon.
 const BRANCH_GLYPH = { flex: '0 0 auto', width: 14, height: 14 };
+// A name row: the fork icon at 12 px, the chat title in 12 px muted text, then its model, muted.
+const NAME_GLYPH = { flex: '0 0 auto', width: 12, height: 12, color: MUTED };
+const NAME_TEXT = { fontSize: 12, color: MUTED };
+const NAME_MODEL = { ...SELECTABLE, flex: '0 0 auto', maxWidth: 72, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: MUTED };
+// The view toggle in the pane header: two small segmented buttons.
+const MODE_BUTTON = { ...SELECTABLE, flex: '0 0 auto', fontSize: 11, lineHeight: '16px', padding: '1px 6px', border: `1px solid ${MUTED}`, background: 'transparent', color: 'inherit', cursor: 'pointer' };
+const MODE_ON = { background: `color-mix(in srgb, ${ACCENT} 14%, transparent)`, borderColor: ACCENT, color: ACCENT };
 // One icon slot at a row's right edge. Every node row reserves all three slots, so the icons line
 // up in columns and a row never changes width when they show.
 const ICON_SLOT = { ...SELECTABLE, flex: '0 0 auto', width: 20, height: 20, minWidth: 20, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' };
@@ -1335,7 +1430,7 @@ function createChatTree(deps) {
   // title, anchor, fit, sideTokens, available }, shown under its row until Dismiss or the next
   // merge. branch: the Branch here form { chatId, index, label, question, model, busy, error }.
   // forkNotice: a failed fork digest, until Dismiss.
-  const freshUi = () => ({ open: null, expanded: {}, pick: null, result: null, branch: null, forkNotice: null });
+  const freshUi = () => ({ open: null, expanded: {}, pick: null, result: null, branch: null, forkNotice: null, mode: EXCHANGES_MODE });
   const $ui = atom(freshUi());
   // The node rows under the pointer and under keyboard focus: { pointer, focus } node keys, in
   // memory only. The pointer's node gets the hover path; either one reveals its Branch button.
@@ -1709,6 +1804,12 @@ function createChatTree(deps) {
       // Markup that changed under us: the chat stays opened.
     }
   }
+  // The view toggle: remembered in $ui and in ctx.storage (best effort).
+  const setMode = (mode) => {
+    if ($ui.get().mode === mode) return;
+    setUi({ mode, pick: null });
+    write(MODE_KEY, mode);
+  };
   const expandRun = (runKey) => setUi({ expanded: { ...$ui.get().expanded, [runKey]: true } });
   // Enter or Space on a focused row acts like a click.
   const onKey = (fn) => (event) => {
@@ -2039,20 +2140,22 @@ function createChatTree(deps) {
   // A new form has nothing picked: the branch keeps this chat's model until the user picks one.
   // model: the picked choice (EMPTY_CHOICE). picking: the model picker is open.
   // A Tabler outline icon, drawn when the SDK has no icon for it (an older Hermes).
-  const drawn = (paths) =>
+  const drawn = (paths, style = BRANCH_GLYPH) =>
     jsx(
       'svg',
       {
-        viewBox: '0 0 24 24', style: BRANCH_GLYPH, fill: 'none', stroke: 'currentColor', strokeWidth: 2,
+        viewBox: '0 0 24 24', style, fill: 'none', stroke: 'currentColor', strokeWidth: 2,
         strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true',
         children: paths.map((d, i) => jsx('path', { d }, i)),
       },
       'icon',
     );
-  const sdkIcon = (Icon, paths) => (Icon ? jsx(Icon, { size: 14, style: BRANCH_GLYPH, 'aria-hidden': 'true' }, 'icon') : drawn(paths));
+  const sdkIcon = (Icon, paths, style = BRANCH_GLYPH) => (Icon ? jsx(Icon, { size: style.width, style, 'aria-hidden': 'true' }, 'icon') : drawn(paths, style));
   // Tabler's git-fork, the icon Hermes's own Branch button uses.
-  const forkGlyph = () =>
-    sdkIcon(BranchIcon, ['M10 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M5 6a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M15 6a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M7 8v2a2 2 0 0 0 2 2h6a2 2 0 0 0 2 -2v-2', 'M12 12l0 4']);
+  const FORK_PATHS = ['M10 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M5 6a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M15 6a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M7 8v2a2 2 0 0 0 2 2h6a2 2 0 0 0 2 -2v-2', 'M12 12l0 4'];
+  const forkGlyph = () => sdkIcon(BranchIcon, FORK_PATHS);
+  // The same icon at 12 px on a name row.
+  const nameGlyph = () => sdkIcon(BranchIcon, FORK_PATHS, NAME_GLYPH);
   // The codicon git-merge (the SDK has no Tabler merge icon), else Tabler's git-merge.
   const mergeGlyph = () =>
     MergeCodicon
@@ -2672,6 +2775,61 @@ function createChatTree(deps) {
     );
   }
 
+  // A name row: the chat's Hermes title at the start of its lane (never a node). A click opens the
+  // chat in place: on the lane's first own exchange (or its stub) in the exchanges view, on the
+  // chat's last exchange in the branches view.
+  function nameLine(row, lane, lanesById, indent, actions) {
+    const branches = actions.mode === BRANCHES_MODE;
+    const children = [
+      jsx('span', { style: { ...SELECTABLE, flex: '0 0 auto', display: 'inline-flex', color: MUTED }, 'data-name-glyph': 'true', children: nameGlyph() }, 'glyph'),
+      jsx(
+        'span',
+        {
+          style: { ...LABEL_STYLE, ...(branches ? {} : NAME_TEXT), ...(branches && !row.blue ? { opacity: 0.72 } : {}), ...(row.open ? { fontWeight: 600 } : {}) },
+          'data-selectable-text': 'true',
+          'data-label': 'true',
+          children: row.label,
+        },
+        'label',
+      ),
+    ];
+    if (branches) {
+      children.push(jsx('span', { style: { ...NAME_MODEL, maxWidth: 110 }, 'data-selectable-text': 'true', 'data-count': row.count, children: `(${row.count} ${row.count === 1 ? 'exchange' : 'exchanges'})` }, 'count'));
+      if (row.merged) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'merged', children: 'merged' }, 'merged'));
+    }
+    // The model in the exchanges view; the branches view keeps the row for the title (the tooltip has it).
+    if (lane?.model && !branches) children.push(jsx('span', { style: NAME_MODEL, 'data-selectable-text': 'true', 'data-name-model': 'true', children: modelName(lane.model) }, 'model'));
+    const select = () => {
+      if (!branches) return selectNode(row.lane, row.index);
+      setUi({ open: null });
+      openChat(row.lane, 'in-place');
+    };
+    return jsx(
+      'div',
+      {
+        role: 'button',
+        tabIndex: 0,
+        title: lane ? tooltip(lane, lanesById, null) : row.label,
+        className: row.open ? '' : 'hover:bg-muted',
+        style: { ...ROW_STYLE, paddingLeft: indent, ...(row.open ? OPEN_ROW : {}) },
+        'data-selectable-text': 'true',
+        'data-name-row': row.lane,
+        'data-chat-id': row.lane,
+        ...(row.blue ? { 'data-blue': 'true' } : {}),
+        ...(row.open ? { 'data-open': 'true', 'aria-current': 'true' } : {}),
+        ...(row.target ? { 'data-target-lane': 'true' } : {}),
+        onClick: () => {
+          if (!selecting()) select();
+        },
+        onKeyDown: onKey(select),
+        onMouseEnter: () => hoverSet('pointer', row.key),
+        onMouseLeave: () => hoverClear('pointer', row.key),
+        children,
+      },
+      row.key,
+    );
+  }
+
   // The rows, with one decorative SVG over them. The SVG takes no clicks; the graph column is
   // the rows' left padding, so no line runs over text. The merge target lane is drawn thicker
   // with a dashed line, in the accent colour. Each shape's role maps to a theme colour here only.
@@ -2694,6 +2852,9 @@ function createChatTree(deps) {
           },
           p.key,
         ),
+      ),
+      ...geo.marks.map((m) =>
+        jsx('rect', { x: m.x, y: m.y, width: m.size, height: m.size, fill: ROLE_COLOURS[m.role], 'data-role': m.role, 'data-mark': 'name' }, `m:${m.key}`),
       ),
       ...geo.circles.map((c) =>
         jsx(
@@ -2722,6 +2883,7 @@ function createChatTree(deps) {
           ...plan.rows
             .map((row) => {
               if (row.kind === 'more') return moreLine(row, indent);
+              if (row.kind === 'name') return nameLine(row, lanesById.get(row.lane), lanesById, indent, actions);
               // The result line spans its spacer rows: the first one draws it, the rest hold its height.
               if (row.kind === 'spacer') return row.spanIndex === 0 && actions.result ? resultLine(actions.result, indent, row.span) : null;
               return nodeLine(row, lanesById.get(row.lane), lanesById, indent, actions);
@@ -2979,6 +3141,36 @@ function createChatTree(deps) {
   // The last two are the in-memory UI and hover atoms. Render only reads state; loading happens on focus change
   // and on the timer, in register(); branching and merging happen in click handlers. Row builders
   // have no hooks.
+  // Exchanges | Branches: two segmented buttons, the pressed one in the accent.
+  function modeToggle(mode) {
+    const button = (value, text, radius) =>
+      jsx(
+        'button',
+        {
+          type: 'button',
+          'aria-pressed': mode === value,
+          style: { ...MODE_BUTTON, borderRadius: radius, ...(value === BRANCHES_MODE ? { marginLeft: -1 } : {}), ...(mode === value ? MODE_ON : {}) },
+          'data-selectable-text': 'true',
+          'data-mode': value,
+          onClick: () => setMode(value),
+          children: text,
+        },
+        value,
+      );
+    return jsxs(
+      'div',
+      {
+        role: 'group',
+        'aria-label': 'View',
+        style: { ...SELECTABLE, flex: '0 0 auto', display: 'inline-flex' },
+        'data-selectable-text': 'true',
+        'data-mode-toggle': 'true',
+        children: [button(EXCHANGES_MODE, 'Exchanges', '4px 0 0 4px'), button(BRANCHES_MODE, 'Branches', '0 4px 4px 0')],
+      },
+      'mode',
+    );
+  }
+
   function renderPane() {
     const stored = useValue(atomOf('focusedStoredSessionId'));
     const focused = useValue(atomOf('focusedSessionId'));
@@ -3003,7 +3195,8 @@ function createChatTree(deps) {
     const pick = ui.pick && open && ui.pick.chatId === open.id ? ui.pick : null;
     const previewLane = pick && hover.target ? lanes.find((lane) => lane.id === hover.target) : null;
     const preview = previewLane && previewLane.exchanges.length ? `${previewLane.id}:${previewLane.exchanges.length - 1}` : null;
-    let plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded, digests: data.digests, hovered: hover.pointer ?? preview });
+    const mode = ui.mode === BRANCHES_MODE ? BRANCHES_MODE : EXCHANGES_MODE;
+    let plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded, digests: data.digests, hovered: hover.pointer ?? preview, mode });
     // The result line takes spacer rows under its row (else the open row, else the last row), so
     // the graph's lines run on through it: one row, two for a failure.
     const result = ui.result;
@@ -3028,6 +3221,7 @@ function createChatTree(deps) {
       open,
       result,
       form,
+      mode,
     };
     // The form shows under the graph when no row holds it in a popover.
     const formAnchored = Boolean(pop && form && plan.rows.some((row) => row.kind === 'node' && row.branchable && row.branchFrom === form.chatId && row.index === form.index));
@@ -3063,6 +3257,7 @@ function createChatTree(deps) {
               'data-pane-head': 'true',
               children: [
                 iconButton({ label: 'Refresh', glyph: refreshGlyph, key: 'refresh', disabled: disposed, attrs: { 'data-refresh': 'true' }, onClick: () => reload() }),
+                modeToggle(mode),
                 status.loading ? jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: 'Loading...' }, 'loading') : null,
               ].filter(Boolean),
             },
@@ -3163,7 +3358,7 @@ function createChatTree(deps) {
       }
     }
     $status.set({ loading: false, error: null, note: null });
-    $ui.set(freshUi());
+    $ui.set({ ...freshUi(), mode: read(MODE_KEY) === BRANCHES_MODE ? BRANCHES_MODE : EXCHANGES_MODE });
     $hover.set(freshHover());
     $data.set({ ...$data.get(), branchIds: storedBranchIds() });
     // ctx.setTimeout: the host clears it on unload (apps/desktop/src/contrib/plugin.ts).

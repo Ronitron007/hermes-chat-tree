@@ -1,6 +1,6 @@
 // Render harness: renders the real chat-tree and side-chat panes with fixture chats to static HTML.
 //
-//   node dev/render.mjs        # writes dev/out/chat-tree.html, chat-tree-hover.html and side-chat.html
+//   node dev/render.mjs        # writes dev/out/chat-tree.html, chat-tree-hover.html, chat-tree-branches.html and side-chat.html
 //
 // Each pane runs its own factory (createChatTree, createSideChat) with stub SDK pieces and a fake
 // host that answers from dev/fixtures/chats.json. register(ctx) runs as in Desktop, the async load
@@ -188,6 +188,8 @@ const PANES = [
   // A narrow pane (260 px): a long label, the model pill, a long note (the chat is running) and a
   // failed merge line. No text may leave the pane.
   { file: 'chat-tree-narrow', pane: 'chat-tree', narrow: true, width: '260px', title: 'Chat tree', create: (deps) => createChatTree(deps) },
+  // The Branches view: one row per chat, the open chat in the accent.
+  { file: 'chat-tree-branches', pane: 'chat-tree', branches: true, title: 'Chat tree', create: (deps) => createChatTree(deps) },
   { file: 'side-chat', title: 'Side chat', create: (deps) => createSideChat(deps) },
 ];
 
@@ -285,6 +287,7 @@ async function renderPane(spec) {
     });
     plugin.$hover.set({ ...plugin.$hover.get(), target: parentId });
   }
+  if (spec.branches) plugin.$ui.set({ ...plugin.$ui.get(), mode: 'branches' });
   if (spec.narrow) {
     plugin.$ui.set({
       ...plugin.$ui.get(),

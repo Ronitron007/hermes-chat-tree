@@ -10,7 +10,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const PANES = ['chat-tree', 'chat-tree-hover', 'chat-tree-merge', 'chat-tree-narrow', 'side-chat'];
+const PANES = ['chat-tree', 'chat-tree-hover', 'chat-tree-merge', 'chat-tree-narrow', 'chat-tree-branches', 'side-chat'];
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = join(root, 'dev/out');
 
