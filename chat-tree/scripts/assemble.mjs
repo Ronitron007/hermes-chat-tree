@@ -24,6 +24,7 @@ const host = sdk.host
 const atom = sdk.atom
 const useValue = sdk.useValue
 const Button = sdk.Button || 'button'
+const Input = sdk.Input || 'input'
 const ScrollArea = sdk.ScrollArea || 'div'
 
 `
@@ -36,6 +37,7 @@ const _plugin = createChatTree({
   atom,
   useValue,
   Button,
+  Input,
   ScrollArea,
   setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
   clearTimeout: (id) => globalThis.clearTimeout(id),
