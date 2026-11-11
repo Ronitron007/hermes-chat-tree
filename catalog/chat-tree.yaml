@@ -6,7 +6,7 @@ subdir: chat-tree
 description: >-
   One window for branching chats in Hermes Desktop. A side pane draws the open
   chat and its branches as a git graph, one node for each exchange. Branch
-  from a node, ask on a cheaper model, and merge back into any ancestor chat
+  from a node, ask on a model you pick, and merge back into any ancestor chat
   with Merge as-is or Digest. The model writes each digest through ctx.llm
   (auxiliary task chat_tree_digest, which follows the title generation model
   unless you set auxiliary.chat_tree_digest). Disclosure: the desktop half
@@ -22,9 +22,8 @@ description: >-
   viewport and the exchange through app markup (data-session-anchor,
   data-slot, data-message-id). This is outside the Desktop SDK surface
   (catalog rule 8), because the SDK has no scroll API. The pane keeps its
-  branch ids, digests and branch model in its plugin storage. It also shares
-  its list of branch ids with the side-chat plugin (localStorage key
-  __hermesSideChatBranchIds) and reads the side model that side-chat saved.
+  branch ids and digests in its plugin storage. It also shares
+  its list of branch ids with the side-chat plugin (localStorage key __hermesSideChatBranchIds).
   The Python half serves two plugin RPC methods.
   plugin.chat-tree.digest.write sends the exchanges of one chat (at most
   24,000 characters, secrets redacted) to your configured model and returns
