@@ -1,5 +1,5 @@
 {
-  "about": "Fixture chats for dev/render.mjs. sessions: rows as host.listPersistedSessions returns them. history: session.history messages per chat id. storage: ctx.storage values of the side-chat pane. The side chat \"Side: Explain virtualenv\" forked after exchange 3 and was merged back as exchange 4 of the main chat. \"Token scopes\" forked after exchange 5 on another model. \"Side: Pre-release tags\" forked after exchange 7.",
+  "about": "Fixture chats for dev/render.mjs. sessions: rows as host.listPersistedSessions returns them. history: session.history messages per chat id. storage: ctx.storage values of the side-chat pane. The side chat \"Side: Explain virtualenv\" forked after exchange 3 and was merged back as exchange 4 of the main chat. \"Token scopes\" forked after exchange 5 on another model. \"Side: Pre-release tags\" forked after exchange 7. hover: the node the hover render (dev/out/chat-tree-hover.html) points at, the last exchange of \"Side: Pre-release tags\".",
   "owner": {
     "connectionId": "local",
     "profile": "default"
@@ -7,6 +7,9 @@
   "focus": {
     "chat-tree": "20261112_005322_c9171f",
     "side-chat": "20261112_003012_a41c7e"
+  },
+  "hover": {
+    "chat-tree": "20261112_010640_5d8e44:8"
   },
   "sideBranchIds": [
     "20261112_004105_3be0d2",
