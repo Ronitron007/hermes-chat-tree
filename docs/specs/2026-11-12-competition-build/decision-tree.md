@@ -1,6 +1,6 @@
 # Decision tree: the competition build
 
-Updated: 2026-11-12 02:05 IST. Green is chosen. Grey is dropped. Yellow is open.
+Updated: 2026-11-12 02:16 IST. Green is chosen. Grey is dropped. Yellow is open.
 
 ```mermaid
 flowchart TD
@@ -92,11 +92,26 @@ flowchart TD
   UI -->|today| UI3[Section below the graph]
   SC1 --> IS[Asked Hermes for host.revealMessage: hermes-agent issue 153905]
 
+  W1 --> LF[A fork shows at once: stub node, reload on Hermes events, Rohan 01:52]
+  W1 --> AC{Active colour}
+  AC -->|dropped 02:00| AC1[--ui-accent: a neutral midground]
+  AC -->|chosen 02:00| AC2[--dt-primary: the theme primary and the user's accent]
+  W1 --> BA{Where Branch shows}
+  BA -->|dropped 02:05| BA1[Only exchanges of the open chat]
+  BA -->|chosen, Rohan 02:05| BA2[Every answered node; another chat opens first]
+  BA2 --> BQ[Question optional: no question just forks and opens, Rohan 02:08]
+  BA2 --> BI[GitForkIcon, the icon of Hermes's own branch action, Rohan 02:08]
+  MT1 --> TD{Target picker}
+  TD -->|dropped 02:06| TD1[Chips, a standing dashed lane]
+  TD -->|chosen, Rohan 02:06| TD2[Dropdown; its path lights in the hover colour only while in use]
+  HR2 --> HL[history.read: one lineage, no hidden or archived chats, a size cap]
+  HR2 --> BX[Exact cut: branch_index from the rows Hermes branches from]
+
   classDef chosen fill:#d1fae5,stroke:#059669,color:#064e3b
   classDef dropped fill:#f3f4f6,stroke:#9ca3af,color:#6b7280
   classDef open fill:#fef3c7,stroke:#d97706,color:#78350f
-  class B1,H1,T1,V1,O,C,M1,M2,M6,M9,M8,P1,Q1,W1,RV1,F2,MS,MT1,NM1,FD,LN1,BM1,CS1,SC1,SC3 chosen
-  class B2,H2,T2,T3,V2,M3,M5,M10,P2,R2,W2,RV2,MT2,NM2,BM2,SC2 dropped
+  class B1,H1,T1,V1,O,C,M1,M2,M6,M9,M8,P1,Q1,W1,RV1,F2,MS,MT1,NM1,FD,LN1,BM1,CS1,SC1,SC3,LF,AC2,BA2,BQ,BI,TD2,HL,BX chosen
+  class B2,H2,T2,T3,V2,M3,M5,M10,P2,R2,W2,RV2,MT2,NM2,BM2,SC2,AC1,BA1,TD1 dropped
   class Q2,UI1,UI2 open
   classDef deferred fill:#e0e7ff,stroke:#6366f1,color:#312e81
   class R1,TC,LN2 deferred
