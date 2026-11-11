@@ -1,6 +1,6 @@
 # Decision tree: the competition build
 
-Updated: 2026-11-12 00:05 IST. Green is chosen. Grey is dropped. Yellow is open.
+Updated: 2026-11-12 00:20 IST. Green is chosen. Grey is dropped. Yellow is open.
 
 ```mermaid
 flowchart TD
@@ -32,15 +32,17 @@ flowchart TD
   M1 --> M4{Digest source}
   M4 -->|chosen| M5[Question plus final answer, no model call]
   M4 -->|deferred| M6[Model-written summary]
-  M1 --> M7[Every mode starts with From side chat: title]
-  M7 --> M8[Tree draws the Merged node from that header]
+  M1 --> M7{Merge header}
+  M7 -->|chosen 00:13| M9[From side chat: side question]
+  M7 -->|dropped 00:13| M10[From side chat: title, cut to 50 chars and renamed by Hermes]
+  M9 --> M8[Tree links the Merged node to the side chat whose first message equals the question]
 
   G --> P{Packaging}
   P -->|chosen| P1[Three plugins plus one install script]
   P -->|dropped| P2[One combined plugin]
   P1 --> R{Repo is private}
-  R -->|open, Rohan| R1[Make this repo public]
-  R -->|open, Rohan| R2[New public repo for the entry]
+  R -->|deferred, Rohan 00:10| R1[Make this repo public, later]
+  R -->|dropped| R2[New public repo for the entry]
 
   G --> Q{Verification}
   Q -->|chosen| Q1[Static render harness plus screenshots]
@@ -52,7 +54,9 @@ flowchart TD
   classDef chosen fill:#d1fae5,stroke:#059669,color:#064e3b
   classDef dropped fill:#f3f4f6,stroke:#9ca3af,color:#6b7280
   classDef open fill:#fef3c7,stroke:#d97706,color:#78350f
-  class B1,H1,T1,V1,O,C,M1,M2,M3,M5,M7,M8,P1,Q1 chosen
-  class B2,H2,T2,T3,V2,M6,P2,F1 dropped
-  class R1,R2,Q2 open
+  class B1,H1,T1,V1,O,C,M1,M2,M3,M5,M9,M8,P1,Q1 chosen
+  class B2,H2,T2,T3,V2,M6,M10,P2,F1,R2 dropped
+  class Q2 open
+  classDef deferred fill:#e0e7ff,stroke:#6366f1,color:#312e81
+  class R1 deferred
 ```

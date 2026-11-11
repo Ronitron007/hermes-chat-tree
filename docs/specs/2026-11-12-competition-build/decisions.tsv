@@ -11,3 +11,5 @@ date	decision	why	evidence	result	by
 2026-11-12 00:05	Fork from any message (session.branch with count) after the core units	Hermes 0.23.1 supports count; not required by Rohan's rules	tui_gateway/methods_session_branch.py:108	deferred	Claude
 2026-11-12 00:05	Opus implements and a fresh Opus reviews each unit	Rohan's global rules; Outbox's mr rule does not apply here	Rohan, 2026-11-11	chosen	Rohan
 2026-11-12 00:05	The repo is private, so the catalog cannot load it	Catalog entries load the repo at the pinned SHA	plugin-catalog/README.md entry schema	open	Rohan
+2026-11-12 00:10	Make the repo public later, not now	Not important before the build is done	chat with Rohan	deferred	Rohan
+2026-11-12 00:13	The merge header is "From side chat: <side question>", not the title	branchName cuts titles to 50 chars and Hermes can rename chats; the question is the side chat's exact first message	side-chat/src/side-chat.js:22, :538	chosen; replaces the title rule in spec.md	Claude
