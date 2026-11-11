@@ -26,6 +26,13 @@ const useValue = sdk.useValue
 const Button = sdk.Button || 'button'
 const Input = sdk.Input || 'input'
 const ScrollArea = sdk.ScrollArea || 'div'
+// Hermes's model picker for the Branch form; undefined on an SDK without it (the form then says so).
+const ModelCatalogMenu = sdk.ModelCatalogMenu
+const ModelMenuCloseContext = sdk.ModelMenuCloseContext
+const DropdownMenu = sdk.DropdownMenu
+const DropdownMenuTrigger = sdk.DropdownMenuTrigger
+const DropdownMenuContent = sdk.DropdownMenuContent
+const reasoningEffortLabel = sdk.reasoningEffortLabel
 
 `
 
@@ -39,6 +46,12 @@ const _plugin = createChatTree({
   Button,
   Input,
   ScrollArea,
+  ModelCatalogMenu,
+  ModelMenuCloseContext,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  reasoningEffortLabel,
   setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
   clearTimeout: (id) => globalThis.clearTimeout(id),
 })
