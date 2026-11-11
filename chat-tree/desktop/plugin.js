@@ -1345,6 +1345,7 @@ const PILL = {
 
 // A small action button inside a one-line row, and a merge target chip.
 const ROW_ACTION = { ...SELECTABLE, flex: '0 0 auto', fontSize: 10, lineHeight: '14px', padding: '0 4px' };
+const PICK_HOVER_BG = 'color-mix(in srgb, var(--dt-foreground, #e5e5e5) 10%, transparent)';
 const CHIP = { ...SELECTABLE, maxWidth: 140, minWidth: 0, justifyContent: 'flex-start' };
 // The row icons: Hermes's own Branch in new chat button draws GitForkIcon at size-3.5, 14 px
 // (components/assistant-ui/thread/assistant-message.tsx:1418); the SDK exports it as icons.GitForkIcon.
@@ -1435,7 +1436,7 @@ function createChatTree(deps) {
   // The node rows under the pointer and under keyboard focus: { pointer, focus } node keys, in
   // memory only. The pointer's node gets the hover path; either one reveals its Branch button.
   // Only SVG colours and those buttons change: nothing is read again.
-  const freshHover = () => ({ pointer: null, focus: null, target: null });
+  const freshHover = () => ({ pointer: null, focus: null, target: null, item: null });
   const $hover = atom(freshHover());
   // Stand-in so the pane calls useValue the same number of times when host.state lacks an atom.
   const $none = atom(null);
@@ -2558,12 +2559,17 @@ function createChatTree(deps) {
   // One Quick Pick item: a label and a detail line. A disabled item stays focusable (its detail
   // says why) and cannot be picked.
   function pickItem({ key, label, detail, title, disabled = false, autoFocus = false, onPick, target = null, attrs = {} }) {
+    const hoveredItem = $hover.get().item;
     return jsxs(
       'button',
       {
         type: 'button',
-        className: disabled ? '' : 'hover:bg-muted',
-        style: { ...PICK_ITEM, ...(disabled ? { opacity: 0.45, cursor: 'default' } : {}) },
+        style: {
+          ...PICK_ITEM,
+          ...(disabled ? { opacity: 0.45, cursor: 'default' } : {}),
+          // Inline, because a class hover shows no change on the popover background.
+          ...(!disabled && hoveredItem === key ? { background: PICK_HOVER_BG } : {}),
+        },
         ...(title ? { title } : {}),
         ...(autoFocus ? { autoFocus: true } : {}),
         ...(disabled ? { 'aria-disabled': 'true' } : {}),
@@ -2574,7 +2580,12 @@ function createChatTree(deps) {
           if (!disabled) onPick();
         },
         // Hovering or focusing a target lights its lane in the graph ($hover.target).
-        ...(target ? { onMouseEnter: () => hoverSet('target', target), onFocus: () => hoverSet('target', target) } : {}),
+        onMouseEnter: () => {
+          hoverSet('item', key);
+          if (target) hoverSet('target', target);
+        },
+        onMouseLeave: () => hoverClear('item', key),
+        ...(target ? { onFocus: () => hoverSet('target', target) } : {}),
         ...attrs,
         children: [
           jsx('span', { style: { ...LABEL_STYLE, fontWeight: 500 }, 'data-selectable-text': 'true', children: label }, 'label'),
@@ -3267,12 +3278,13 @@ function createChatTree(deps) {
     const open = tree && !fellBack ? (lanes.find((lane) => lane.id === tree.focused.id) ?? null) : null;
     const targets = open ? mergeTargets(lanes, open.id) : [];
     // The pick of the open chat only. While it is open, its hovered target lights up: the target's
-    // last exchange takes the hover path.
+    // last exchange takes the hover path. The preview wins over the row pointer: the popover is a
+    // React child of its row, so the pointer in the popover never leaves the row.
     const pick = ui.pick && open && ui.pick.chatId === open.id ? ui.pick : null;
     const previewLane = pick && hover.target ? lanes.find((lane) => lane.id === hover.target) : null;
     const preview = previewLane && previewLane.exchanges.length ? `${previewLane.id}:${previewLane.exchanges.length - 1}` : null;
     const mode = ui.mode === BRANCHES_MODE ? BRANCHES_MODE : EXCHANGES_MODE;
-    let plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded, digests: data.digests, hovered: hover.pointer ?? preview, mode });
+    let plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded, digests: data.digests, hovered: preview ?? hover.pointer, mode });
     // The result line takes spacer rows under its row (else the open row, else the last row), so
     // the graph's lines run on through it: one row, two for a failure.
     const result = ui.result;
