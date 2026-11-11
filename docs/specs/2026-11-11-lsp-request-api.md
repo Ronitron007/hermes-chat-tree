@@ -1,6 +1,6 @@
 # Spec and plan: a public LSP request API in Hermes Agent
 
-Date: 2026-11-11. Target repo: NousResearch/hermes-agent, base `60f81635c2` (upstream `main`). Status: approved direction (Rohan, 2026-11-11: "Own request() PR"). We built nothing yet.
+Date: 2026-11-11. Target repo: NousResearch/hermes-agent, base `60f81635c2` (upstream `main`). Status: dropped (Rohan, 2026-11-11: "we have to work within the capabilities hermes gives us today with plugin framework"). The work is on the unmerged branch `feat/lsp-public-request` of `Ronitron007/hermes-agent`. Do not build from this spec.
 
 Research: [2026-11-10-lsp-bridge.md](../research/2026-11-10-lsp-bridge.md).
 

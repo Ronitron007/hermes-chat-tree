@@ -80,7 +80,7 @@ Hermes has no public way to send hover, definition, or references. There are thr
 
 | Path | Cost | Risk |
 |---|---|---|
-| Upstream PR: add a public `request()` to `agent.lsp` | Small change, review time | Can miss the catalog deadline |
+| Upstream PR: add a public `request()` to `agent.lsp` | Ruled out (Rohan, 2026-11-11): plugins use only the plugin framework of today | Not an option |
 | Call the private methods, as `omh` does | No new code | Catalog warning, breaks when Hermes changes |
 | Start our own servers with multilspy | Second copy of each server, about 0.8 GB for TypeScript | We must disclose it as a long-running process |
 
