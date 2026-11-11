@@ -96,15 +96,25 @@ Check: `npm test` exits 0, `node dev/render.mjs` writes the HTML files, and `her
 
 ## Unit `unit.tree_actions`
 
-After `unit.tree_view` merges, put the actions in the tree pane. This unit replaces `unit.tree_merge`.
+After `unit.tree_view` merges, put the actions in the tree pane. This unit replaces `unit.tree_merge`. Rohan set these rules on 2026-11-12 between 00:40 and 00:58.
 
-- Branch here: an action on each exchange of the open chat. It shows a small form in the pane: a question and a model, with a cheap model as the default. It forks the chat at that exchange with `session.branch` and `count`, sends the question with `prompt.submit` and `model_override`, and opens the branch in place.
+- The pane has one merge section, for the open chat. It has two buttons: Merge as-is and Digest. Merge record is dropped.
 
-- Merge back: an action on each branch lane. It shows the mode picker (Full text, Merge record, Digest), the fit check, and the notice that stays until dismissed. It stages the text in the parent's composer with `host.composer.setDraft`, opens the parent, and never sends.
+- The merge target is any ancestor of the open chat. Chips show the ancestors, and the parent is the default. The lane of the chosen target lights up in the graph.
 
-- Copy the merge helpers from `side-chat/src/side-chat.js` (`formatMergeText`, `stripConceptMarkup`, `formatNoFitNotice`, and the modes), because each plugin is one bundle with no imports.
+- The merge text starts with `From side chat: <question>`. Merge as-is adds every exchange after the fork. Digest adds a digest that a model writes. Remove concept-link markup, check the fit against the target, keep the notice until dismissed, stage with `host.composer.setDraft`, open the target, and never send.
 
-Check: `npm test` and `npm run assemble:chat-tree` exit 0, and new tests cover branch here (the `count` value and the payloads), each merge mode, and the notice.
+- Branch here is an action on each exchange of the open chat. It forks with `session.branch` and `count`, sends the question with `prompt.submit` and `model_override`, and opens the branch. It never passes `name`, because Hermes names chats in its own way.
+
+- After a fork, the plugin asks for a digest of the part above the fork. It stores the digest and shows it on the fork node.
+
+Check: `npm test` and `npm run assemble:chat-tree` exit 0, with tests for the count, the payloads, the targets, both buttons, and the notice.
+
+## Unit `unit.digest_backend`
+
+Give `chat-tree` a Python half with one route, `POST /api/plugins/chat-tree/digest`. The route calls `ctx.llm.complete_structured` (Rohan, 2026-11-12 00:58). It registers an auxiliary task, so that the user can send digests to a cheap model. The install script stops installing `side-chat`.
+
+Check: Python tests pass with a stub model, `hermes plugins validate chat-tree` passes, and the install script puts both halves in place.
 
 ## Unit `unit.verify`
 

@@ -17,3 +17,11 @@ date	decision	why	evidence	result	by
 2026-11-12 00:24	The entry lives in one window, the tree pane; a side chat is a branch lane, not a separate pane	Rohan's product rule	chat with Rohan	chosen; side-chat pane leaves the entry, its code moves into chat-tree	Rohan
 2026-11-12 00:24	Tree colours come from the Hermes theme, after the core units	Rohan's request	chat with Rohan	queued	Rohan
 2026-11-12 00:30	Branch at any exchange of the open chat with session.branch and count	The one window needs a branch action on a node; Hermes 0.23.1 supports count	tui_gateway/methods_session_branch.py:108	chosen; replaces the deferred row	Claude
+2026-11-12 00:45	Merge PR 27 into outbox/competition-entry	Checks pass: 276 tests, bundles current	npm test in .worktrees/integ	chosen	Rohan
+2026-11-12 00:50	Drop Merge record	It adds nothing, like archiving a chat	chat with Rohan	dropped	Rohan
+2026-11-12 00:52	Keep the lanes of PR 27; do not port VS Code lane code	The port changes VS Code's core loop and collapse feeds it new input, so its tests stop vouching for it	graph-libs spike notes	chosen; port deferred	Claude, on Rohan's condition
+2026-11-12 00:58	One merge section for the open chat with Merge as-is and Digest	Rohan's rule	chat with Rohan	chosen	Rohan
+2026-11-12 00:58	Merge into any ancestor; the target lane lights up	Rohan's rule	chat with Rohan	chosen	Rohan
+2026-11-12 00:58	Never pass a name when branching; Hermes names chats	A passed name counts as user-typed, so Hermes never renames it	agent/title_generator.py:1-6	chosen	Rohan
+2026-11-12 00:58	Digest is model-written through ctx.llm.complete_structured; a fork digests the part above the fork	Rohan's rule	agent/plugin_llm.py:486-500	chosen; replaces the question plus final answer digest	Rohan
+2026-11-12 01:00	chat-tree gets a Python half with a /digest route	ctx.llm lives on the Python PluginContext	hermes_cli/plugins_context.py:184	chosen	Claude
