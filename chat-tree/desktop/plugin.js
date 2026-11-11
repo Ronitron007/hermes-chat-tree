@@ -34,6 +34,14 @@ const ScrollArea = sdk.ScrollArea || 'div'
 const PLUGIN_ID = 'chat-tree';
 const PANE_ID = 'pane';
 const REFRESH_MS = 15_000;
+// Gateway events that change the tree. The pane reloads soon after one (debounced) instead of at
+// the next REFRESH_MS tick. Names from hermes-agent apps/desktop/src/app/session/hooks/use-message-stream/
+// gateway-event/: sessions.changed (lifecycle.ts:80, the change watcher's session-store broadcast),
+// message.start and message.complete (message-stream.ts:260, :401), session.title (session-info.ts:559).
+const RELOAD_EVENTS = ['sessions.changed', 'message.start', 'message.complete', 'session.title'];
+const RELOAD_DEBOUNCE_MS = 300;
+// The label of a fork with no exchange of its own yet, until Hermes names it.
+const NEW_BRANCH_TEXT = 'New branch';
 const LIST_LIMIT = 500;
 const MAX_CHATS = 30;
 const SIDE_PREFIX = 'Side: ';
@@ -56,9 +64,21 @@ const GRAPH_PAD = 8;
 const LANE_GAP = 14;
 const NODE_R = 4;
 const CURVE_R = 5;
-// The only two graph colours: the path to the open node, and everything else.
-const BLUE = '#3B82F6';
-const GREY = '#6B7280';
+// Graph colours are Hermes theme variables, each with the old fixed colour as its fallback, so the
+// pane still draws where the variables are missing. A role takes the token Hermes uses for that job
+// (paths in hermes-agent/apps/desktop/src):
+// - active (the open node's path, its fill, the open row band and left accent, the merge target
+//   lane): --ui-accent, the brand-accent stroke (styles.css:240, from midground, themes/types.ts:34-39).
+//   Hermes marks the active pane and tab with it (components/pane-shell/tree/renderer/tree-group.tsx:1214,
+//   components/ui/pane-tab.tsx:49).
+// - inactive: --dt-muted-foreground, the muted text token (styles.css:426, text-muted-foreground at styles.css:133).
+// - hover: --dt-foreground, the text token (styles.css:422, text-foreground at styles.css:129). Hermes
+//   lifts muted text to it on hover (hover:text-foreground). The row hover fill (bg-muted,
+//   styles.css:425) is too faint for a line.
+const ACCENT = 'var(--ui-accent, #3B82F6)';
+const MUTED = 'var(--dt-muted-foreground, #6B7280)';
+const HOVER = 'var(--dt-foreground, currentColor)';
+const ROLE_COLOURS = { active: ACCENT, hover: HOVER, inactive: MUTED };
 // Same wording as side-chat (side-chat/src/side-chat.js): the two panes show one merge flow.
 const MERGE_STAGED_TEXT =
   'The draft is in the main chat composer. Edit it and send. After sending, session.undo on an idle parent can drop that turn.';
@@ -748,15 +768,16 @@ function drawer(byId) {
   };
 }
 
-// rows: [{ kind: 'node', key, lane, index, label, merge, mergeFrom, blue, open, first, target,
-//          branchable, digest } |
-//        { kind: 'more', key, runKey, lane, index, count, blue, target }], oldest first, each with col.
+// rows: [{ kind: 'node', key, lane, index, label, merge, mergeFrom, blue, hover, open, first, target,
+//          branchable, digest, stub } |
+//        { kind: 'more', key, runKey, lane, index, count, blue, hover, target }], oldest first, each with col.
 // lanes: [{ id, col, rows, firstRow, lastRow, anchorRow, anchorCol, target }] for lanes with rows.
 // merges: [{ from, fromRow, to, toRow }]: a curve from a side lane's last row to a merge node.
 // A node `lane:index` is drawn once, on the lane that owns it: the shared exchanges of a child
 // are its parent's. options: { focusedId, open: { chatId, index } | null, expanded: { [runKey]: true },
 // target: the merge target lane id (its rows and lane get target: true), digests: { 'chatId:index':
-// fork digest } (each goes to the node that draws that exchange) }. branchable: an answered
+// fork digest } (each goes to the node that draws that exchange), hovered: the node key under the
+// pointer (its path gets hover: true) }. branchable: an answered
 // exchange of the focused chat, where Branch here applies.
 function planGraph(lanes, options = {}) {
   const list = Array.isArray(lanes) ? lanes : [];
@@ -765,6 +786,18 @@ function planGraph(lanes, options = {}) {
   const nodeKey = (id, index) => `${id}:${index}`;
   const resolve = drawer(byId);
   const mergeLane = typeof options.target === 'string' && byId.has(options.target) ? options.target : null;
+  // A child with no exchange of its own yet (a fork just made) draws one stub node at index
+  // start(lane), where its first exchange will go: right after its fork elbow. The stub has the
+  // key that node will have, so it turns into that node once the exchange exists.
+  // A child that shares nothing has no exact fork point, so no stub (its history may be unread).
+  const stubbed = (lane) => Boolean(lane?.parentId) && lane.fork > 0 && start(lane) >= lane.exchanges.length;
+  // The node that draws exchange `index` of chat `id`, or the stub of a chat with none of its own.
+  const nodeAt = (id, index) => {
+    const lane = byId.get(id);
+    if (!lane || !Number.isInteger(index) || index < 0) return null;
+    if (index < lane.exchanges.length) return resolve(id, index);
+    return stubbed(lane) && index === start(lane) ? { lane: id, index } : null;
+  };
 
   // Each child leaves its parent at the node of the last shared exchange. A child that shares
   // nothing has no fork node: it starts its own lane after its parent's rows.
@@ -789,18 +822,31 @@ function planGraph(lanes, options = {}) {
   let target = null;
   if (focused && open && open.chatId === focused.id && Number.isInteger(open.index) && open.index >= 0 && open.index < focused.exchanges.length) {
     target = resolve(focused.id, open.index);
+  } else if (focused && stubbed(focused)) {
+    target = { lane: focused.id, index: start(focused) };
   } else if (focused && focused.exchanges.length) {
     target = resolve(focused.id, focused.exchanges.length - 1);
   }
   const openKey = target ? nodeKey(target.lane, target.index) : null;
 
-  // Blue: on each lane from the open node up through the fork nodes to the root's first exchange.
-  const blue = new Set();
-  for (let at = target, guard = new Set(); at && !guard.has(at.lane); at = anchorOf.get(at.lane) ?? null) {
-    guard.add(at.lane);
-    const lane = byId.get(at.lane);
-    for (let i = start(lane); i <= at.index; i++) blue.add(nodeKey(lane.id, i));
+  // The node keys on each lane from a node up through the fork nodes to the root's first exchange.
+  const pathFrom = (from) => {
+    const keys = new Set();
+    for (let at = from, guard = new Set(); at && !guard.has(at.lane); at = anchorOf.get(at.lane) ?? null) {
+      guard.add(at.lane);
+      const lane = byId.get(at.lane);
+      for (let i = start(lane); i <= at.index; i++) keys.add(nodeKey(lane.id, i));
+    }
+    return keys;
+  };
+  // Blue: the path of the open node. Hover: the path of options.hovered, the node key under the pointer.
+  const blue = pathFrom(target);
+  let hoverAt = null;
+  if (typeof options.hovered === 'string') {
+    const cut = options.hovered.lastIndexOf(':');
+    if (cut > 0) hoverAt = nodeAt(options.hovered.slice(0, cut), Number(options.hovered.slice(cut + 1)));
   }
+  const hover = pathFrom(hoverAt);
 
   // Branch here: every answered exchange of the focused chat, on the node that draws it.
   const branchable = new Set();
@@ -838,11 +884,33 @@ function planGraph(lanes, options = {}) {
       merge: ex.merge,
       mergeFrom: null,
       blue: blue.has(key),
+      hover: hover.has(key),
       open: key === openKey,
       first: false,
       target: lane.id === mergeLane,
       branchable: branchable.has(key),
       digest: digestOf.get(key) ?? null,
+      stub: false,
+    });
+  };
+  const pushStub = (lane) => {
+    const key = nodeKey(lane.id, start(lane));
+    rows.push({
+      kind: 'node',
+      key,
+      lane: lane.id,
+      index: start(lane),
+      label: str(lane.row?.title) || NEW_BRANCH_TEXT,
+      merge: null,
+      mergeFrom: null,
+      blue: blue.has(key),
+      hover: hover.has(key),
+      open: key === openKey,
+      first: false,
+      target: lane.id === mergeLane,
+      branchable: false,
+      digest: null,
+      stub: true,
     });
   };
   const emit = (lane) => {
@@ -850,6 +918,7 @@ function planGraph(lanes, options = {}) {
     visited.add(lane.id);
     const n = lane.exchanges.length;
     const s = start(lane);
+    if (stubbed(lane)) pushStub(lane);
     const keep = new Set([s, n - 1]);
     for (let i = s; i < n; i++) {
       const key = nodeKey(lane.id, i);
@@ -866,7 +935,7 @@ function planGraph(lanes, options = {}) {
       while (j < n && !keep.has(j)) j += 1;
       const runKey = nodeKey(lane.id, i);
       if (j - i >= 3 && !expanded[runKey]) {
-        rows.push({ kind: 'more', key: `more:${runKey}`, runKey, lane: lane.id, index: i, count: j - i, blue: blue.has(runKey), target: lane.id === mergeLane });
+        rows.push({ kind: 'more', key: `more:${runKey}`, runKey, lane: lane.id, index: i, count: j - i, blue: blue.has(runKey), hover: hover.has(runKey), target: lane.id === mergeLane });
       } else {
         for (let k = i; k < j; k++) pushNode(lane, k);
       }
@@ -943,18 +1012,20 @@ function planGraph(lanes, options = {}) {
 const laneX = (col) => GRAPH_PAD + col * LANE_GAP;
 const rowY = (row) => row * ROW_H + ROW_H / 2;
 
-// { width, height, circles: [{ key, cx, cy, r, color, filled, target }], paths: [{ key, d, color, target }] }.
-// target marks the merge target lane: its line, fork elbow and nodes. The pane draws them thicker and
-// the line dashed, in their usual colour: the graph keeps exactly two colours. Lane lines stop at circle edges. A fork leaves its node sideways, turns down with a rounded
+// { width, height, circles: [{ key, cx, cy, r, role, filled, target }], paths: [{ key, d, role, target }] }.
+// role is the colour role: 'hover' on the path of the hovered node (it wins where it overlaps the
+// open path), else 'active' on the open path and on the merge target lane, else 'inactive'. The
+// pane maps roles to theme colours (ROLE_COLOURS). target marks the merge target lane: its line,
+// fork elbow and nodes, drawn thicker with a dashed line. Lane lines stop at circle edges. A fork leaves its node sideways, turns down with a rounded
 // corner, and runs to the child's first node. A merge runs down from the side lane's last node
-// and turns into the merge node. Merge curves are always grey: a merged chat is not on the path.
+// and turns into the merge node. Merge curves are always inactive: a merged chat is not on a path.
 function graphGeometry(plan) {
   const rows = Array.isArray(plan?.rows) ? plan.rows : [];
   const lanes = Array.isArray(plan?.lanes) ? plan.lanes : [];
   const maxCol = rows.reduce((m, row) => Math.max(m, num(row.col)), 0);
   const width = Math.max(GRAPH_W, GRAPH_PAD * 2 + maxCol * LANE_GAP);
   const height = rows.length * ROW_H;
-  const colour = (on) => (on ? BLUE : GREY);
+  const roleOf = (row, target) => (row.hover ? 'hover' : row.blue || target ? 'active' : 'inactive');
   const edge = (index) => (rows[index].kind === 'node' ? NODE_R : 0);
   const paths = [];
   for (const lane of lanes) {
@@ -962,13 +1033,13 @@ function graphGeometry(plan) {
     for (let k = 1; k < lane.rows.length; k++) {
       const a = lane.rows[k - 1];
       const b = lane.rows[k];
-      paths.push({ key: `lane:${lane.id}:${a}`, d: `M ${x} ${rowY(a) + edge(a)} V ${rowY(b) - edge(b)}`, color: colour(rows[b].blue), target: lane.target === true });
+      paths.push({ key: `lane:${lane.id}:${a}`, d: `M ${x} ${rowY(a) + edge(a)} V ${rowY(b) - edge(b)}`, role: roleOf(rows[b], lane.target === true), target: lane.target === true });
     }
     if (lane.anchorRow >= 0) {
       const xa = laneX(lane.anchorCol);
       const ya = rowY(lane.anchorRow);
       const d = `M ${xa + NODE_R} ${ya} H ${x - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 1 ${x} ${ya + CURVE_R} V ${rowY(lane.firstRow) - NODE_R}`;
-      paths.push({ key: `fork:${lane.id}`, d, color: colour(rows[lane.firstRow].blue), target: lane.target === true });
+      paths.push({ key: `fork:${lane.id}`, d, role: roleOf(rows[lane.firstRow], lane.target === true), target: lane.target === true });
     }
   }
   for (const merge of Array.isArray(plan?.merges) ? plan.merges : []) {
@@ -979,12 +1050,12 @@ function graphGeometry(plan) {
     let d = `M ${xs} ${y0} V ${y1 - NODE_R}`;
     if (xs > xt) d = `M ${xs} ${y0} V ${y1 - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 1 ${xs - CURVE_R} ${y1} H ${xt + NODE_R}`;
     else if (xs < xt) d = `M ${xs} ${y0} V ${y1 - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 0 ${xs + CURVE_R} ${y1} H ${xt - NODE_R}`;
-    paths.push({ key: `merge:${merge.from}:${merge.toRow}`, d, color: GREY, target: false });
+    paths.push({ key: `merge:${merge.from}:${merge.toRow}`, d, role: 'inactive', target: false });
   }
   const circles = [];
   rows.forEach((row, index) => {
     if (row.kind !== 'node') return;
-    circles.push({ key: row.key, cx: laneX(row.col), cy: rowY(index), r: NODE_R, color: colour(row.blue), filled: row.open === true, target: row.target === true });
+    circles.push({ key: row.key, cx: laneX(row.col), cy: rowY(index), r: NODE_R, role: roleOf(row, row.target === true), filled: row.open === true, target: row.target === true });
   });
   return { width, height, circles, paths };
 }
@@ -1052,7 +1123,8 @@ const ROW_STYLE = {
   whiteSpace: 'nowrap',
   cursor: 'pointer',
 };
-const OPEN_ROW = { background: 'rgba(59,130,246,0.14)', boxShadow: `inset 2px 0 0 ${BLUE}` };
+// The open row: the accent at 14 %, as Hermes tints its active tab (components/ui/pane-tab.tsx:49).
+const OPEN_ROW = { background: `color-mix(in srgb, ${ACCENT} 14%, transparent)`, boxShadow: `inset 2px 0 0 ${ACCENT}` };
 const LABEL_STYLE = { ...SELECTABLE, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
 const PILL = {
   ...SELECTABLE,
@@ -1061,7 +1133,7 @@ const PILL = {
   overflow: 'hidden',
   textOverflow: 'ellipsis',
   whiteSpace: 'nowrap',
-  border: `1px solid ${GREY}`,
+  border: `1px solid ${MUTED}`,
   borderRadius: 4,
   padding: '0 4px',
   fontSize: 10,
@@ -1090,6 +1162,11 @@ function createChatTree(deps) {
   // question, model, busy, error }. forkNotice: a failed fork digest, until Dismiss.
   const freshUi = () => ({ open: null, expanded: {}, merge: {}, held: null, target: null, branch: null, forkNotice: null });
   const $ui = atom(freshUi());
+  // The node rows under the pointer and under keyboard focus: { pointer, focus } node keys, in
+  // memory only. The pointer's node gets the hover path; either one reveals its Branch button.
+  // Only SVG colours and those buttons change: nothing is read again.
+  const freshHover = () => ({ pointer: null, focus: null });
+  const $hover = atom(freshHover());
   // Stand-in so the pane calls useValue the same number of times when host.state lacks an atom.
   const $none = atom(null);
 
@@ -1111,6 +1188,10 @@ function createChatTree(deps) {
   let listening = false;
   // chat id -> { key, exchanges }: a history is read again only when historyKey(row) moves.
   let historyCache = new Map();
+  // Chat ids a gateway event named since the last landed load: read again, cache or not.
+  let named = new Set();
+  // Cancels the debounced reload that RELOAD_EVENTS schedule.
+  let cancelSoon = null;
   const unsubscribers = [];
 
   const atomOf = (name) => host?.state?.[name] ?? $none;
@@ -1187,7 +1268,9 @@ function createChatTree(deps) {
   // message count and last activity hold; a failed read keeps the last good one. The stale chats
   // go in one history.read (stored ids). A chat it does not answer, or every stale chat when it
   // fails, is read the old way, one session.history each. backendMissing: history.read is unknown.
-  async function loadExchanges(rows, focusedId) {
+  // fresh: ids read again even when their history key holds (the open chat, chats an event named):
+  // the session list's message count and last activity lag live turns.
+  async function loadExchanges(rows, focusedId, fresh = new Set()) {
     const chats = lineageChats(buildTree(rows, focusedId));
     const exchanges = {};
     const errors = [];
@@ -1195,7 +1278,7 @@ function createChatTree(deps) {
     for (const { row } of chats) {
       const key = historyKey(row);
       const hit = historyCache.get(row.id);
-      if (hit && key !== null && hit.key === key) exchanges[row.id] = hit.exchanges;
+      if (hit && key !== null && hit.key === key && !fresh.has(row.id)) exchanges[row.id] = hit.exchanges;
       else stale.push(row);
     }
     const keep = (row, list) => {
@@ -1265,9 +1348,12 @@ function createChatTree(deps) {
     } else errors.push(`Subagents: ${errorText(live.reason)}`);
     // Histories only from the active backend: host.request cannot reach another owner.
     let backendMissing = false;
+    const asked = [...named];
     if (agentsOk) {
-      const histories = await loadExchanges(next.rows, stored ?? runtime);
+      const fresh = new Set([stored, runtime, ...asked].filter(Boolean));
+      const histories = await loadExchanges(next.rows, stored ?? runtime, fresh);
       if (disposed || mine !== generation) return;
+      for (const id of asked) named.delete(id);
       next.exchanges = histories.exchanges;
       errors.push(...histories.errors);
       backendMissing = histories.backendMissing;
@@ -1293,6 +1379,26 @@ function createChatTree(deps) {
       if (!disposed) $status.set({ loading: false, error: errorText(error) });
     });
   };
+
+  // One reload RELOAD_DEBOUNCE_MS after the last of a burst of calls.
+  function reloadSoon() {
+    if (disposed) return;
+    if (typeof cancelSoon === 'function') cancelSoon();
+    cancelSoon = schedule(() => {
+      cancelSoon = null;
+      reload();
+    }, RELOAD_DEBOUNCE_MS);
+  }
+
+  // A RELOAD_EVENTS event: remember the chats it names, then reload soon.
+  function onTreeEvent(event) {
+    if (disposed) return;
+    const payload = event?.payload && typeof event.payload === 'object' ? event.payload : {};
+    for (const id of [event?.session_id, event?.stored_session_id, payload.session_id, payload.stored_session_id]) {
+      if (typeof id === 'string' && id) named.add(id);
+    }
+    reloadSoon();
+  }
 
   // A tick never cuts off a load still in flight: a source slower than the period would else
   // never land (use-subagent-snapshot.ts:30 skips the same way). Focus changes still load.
@@ -1762,6 +1868,8 @@ function createChatTree(deps) {
     if (!sessionId) return fail('Branch failed: the gateway returned no session.');
     const storedId = str(branch?.stored_session_id) || sessionId;
     recordBranch([sessionId, storedId]);
+    // The new fork shows at once: its stub node until its first exchange lands.
+    reload();
 
     const model = str(form.model);
     const submit = { session_id: sessionId, text: question };
@@ -1794,8 +1902,19 @@ function createChatTree(deps) {
     return digest ? `${text}\n\nFork digest:\n${digest}` : text;
   }
 
-  // actions: { openId, busy, model }: the open chat's id, its busy flag, and its model. A
-  // branchable node carries a Branch button for the open chat.
+  // Pointer and keyboard focus on node rows ($hover). A set or clear that changes nothing writes nothing.
+  const hoverSet = (field, key) => {
+    const now = $hover.get();
+    if (now[field] !== key) $hover.set({ ...now, [field]: key });
+  };
+  const hoverClear = (field, key) => {
+    if ($hover.get()[field] === key) hoverSet(field, null);
+  };
+
+  // actions: { openId, busy, model, hover }: the open chat's id, its busy flag, its model, and the
+  // $hover value. A branchable node carries a Branch button for the open chat. The button shows on
+  // the open row and on the row under the pointer or keyboard focus. On every other branchable row
+  // it stays in place, hidden and inert, so a row never changes width when its button shows.
   function nodeLine(row, lane, lanesById, indent, actions) {
     const children = [
       jsx(
@@ -1808,7 +1927,26 @@ function createChatTree(deps) {
     const model = row.open ? actions.model || lane.model : '';
     if (model) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'model', children: modelName(model) }, 'model'));
     if (row.first && lane.side) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'side', children: 'side' }, 'side'));
-    if (row.branchable && actions.openId) {
+    const shown = row.open || row.key === actions.hover?.pointer || row.key === actions.hover?.focus;
+    if (row.branchable && actions.openId && !shown) {
+      children.push(
+        jsx(
+          Button,
+          {
+            type: 'button',
+            size: 'xs',
+            variant: 'ghost',
+            style: { ...ROW_ACTION, visibility: 'hidden' },
+            tabIndex: -1,
+            'aria-hidden': 'true',
+            disabled: true,
+            'data-branch-slot': row.key,
+            children: 'Branch',
+          },
+          'branch',
+        ),
+      );
+    } else if (row.branchable && actions.openId) {
       children.push(
         jsx(
           Button,
@@ -1849,10 +1987,20 @@ function createChatTree(deps) {
         ...(row.target ? { 'data-target-lane': 'true' } : {}),
         ...(row.merge !== null ? { 'data-merge-node': row.mergeFrom ?? '' } : {}),
         ...(row.digest ? { 'data-fork-digest': 'true' } : {}),
+        ...(row.stub ? { 'data-stub': 'true' } : {}),
         onClick: () => {
           if (!selecting()) select();
         },
         onKeyDown: onKey(select),
+        onMouseEnter: () => hoverSet('pointer', row.key),
+        onMouseLeave: () => hoverClear('pointer', row.key),
+        onFocus: () => hoverSet('focus', row.key),
+        // Focus that moves into the row (its Branch button) keeps the row focused.
+        onBlur: (event) => {
+          const next = event?.relatedTarget;
+          if (next && typeof event.currentTarget?.contains === 'function' && event.currentTarget.contains(next)) return;
+          hoverClear('focus', row.key);
+        },
         children,
       },
       row.key,
@@ -1883,7 +2031,7 @@ function createChatTree(deps) {
 
   // The rows, with one decorative SVG over them. The SVG takes no clicks; the graph column is
   // the rows' left padding, so no line runs over text. The merge target lane is drawn thicker
-  // with a dashed line, in its usual colour.
+  // with a dashed line, in the accent colour. Each shape's role maps to a theme colour here only.
   function graphView(plan, lanes, actions) {
     const geo = graphGeometry(plan);
     const lanesById = new Map(lanes.map((lane) => [lane.id, lane]));
@@ -1895,9 +2043,10 @@ function createChatTree(deps) {
           {
             d: p.d,
             fill: 'none',
-            stroke: p.color,
-            strokeWidth: (p.color === BLUE ? 2 : 1.5) + (p.target ? 1 : 0),
+            stroke: ROLE_COLOURS[p.role],
+            strokeWidth: (p.role === 'inactive' ? 1.5 : 2) + (p.target ? 1 : 0),
             strokeLinecap: 'round',
+            'data-role': p.role,
             ...(p.target ? { strokeDasharray: '4 3', 'data-target': 'true' } : {}),
           },
           p.key,
@@ -1910,9 +2059,10 @@ function createChatTree(deps) {
             cx: c.cx,
             cy: c.cy,
             r: c.r,
-            fill: c.filled ? c.color : 'none',
-            stroke: c.color,
+            fill: c.filled ? ROLE_COLOURS[c.role] : 'none',
+            stroke: ROLE_COLOURS[c.role],
             strokeWidth: c.target ? 2.5 : 1.5,
+            'data-role': c.role,
             ...(c.target ? { 'data-target': 'true' } : {}),
           },
           `c:${c.key}`,
@@ -2195,8 +2345,8 @@ function createChatTree(deps) {
     );
   }
 
-  // Hook order is fixed: seven useValue calls, every render, before any branch (React error 300).
-  // The last is the in-memory UI atom. Render only reads state; loading happens on focus change
+  // Hook order is fixed: eight useValue calls, every render, before any branch (React error 300).
+  // The last two are the in-memory UI and hover atoms. Render only reads state; loading happens on focus change
   // and on the timer, in register(); branching and merging happen in click handlers. Row builders
   // have no hooks.
   function renderPane() {
@@ -2207,6 +2357,7 @@ function createChatTree(deps) {
     const data = useValue($data);
     const status = useValue($status);
     const ui = useValue($ui);
+    const hover = useValue($hover);
 
     const runtime = focused ?? active ?? null;
     const tree = buildTree(data.rows, stored ?? runtime);
@@ -2215,7 +2366,7 @@ function createChatTree(deps) {
     const open = tree ? (lanes.find((lane) => lane.id === tree.focused.id) ?? null) : null;
     const targets = open ? mergeTargets(lanes, open.id) : [];
     const target = open ? selectedTarget(targets, ui.target, open.id) : null;
-    const plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded, target: target?.id, digests: data.digests });
+    const plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded, target: target?.id, digests: data.digests, hovered: hover.pointer });
     const agents = runtime && data.agentsFor === runtime ? data.agents : [];
     const busy = open ? chatBusy(busyMap, [runtime, open.id]) : false;
     const form = ui.branch && open && ui.branch.chatId === open.id ? ui.branch : null;
@@ -2260,7 +2411,7 @@ function createChatTree(deps) {
           notice ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: notice }) : null,
           capped ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: capped }) : null,
           status.note ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: status.note }) : null,
-          plan.rows.length ? graphView(plan, lanes, { openId: open?.id ?? null, busy, model: open?.model ?? '' }) : null,
+          plan.rows.length ? graphView(plan, lanes, { openId: open?.id ?? null, busy, model: open?.model ?? '', hover }) : null,
           form ? branchForm(form, busy) : null,
           !form && busy && plan.rows.some((row) => row.branchable) ? note(BRANCH_BUSY_TEXT, { 'data-branch-busy': 'true' }, 'busy') : null,
           ui.forkNotice ? heldNotice(ui.forkNotice, 'fork', dismissForkNotice) : null,
@@ -2279,6 +2430,8 @@ function createChatTree(deps) {
     disposed = true;
     revealing?.abort();
     revealing = null;
+    if (typeof cancelSoon === 'function') cancelSoon();
+    cancelSoon = null;
     generation += 1;
     if (typeof cancelTimer === 'function') cancelTimer();
     cancelTimer = null;
@@ -2305,6 +2458,8 @@ function createChatTree(deps) {
     lastKey = null;
     scopedTimeout = null;
     historyCache = new Map();
+    named = new Set();
+    cancelSoon = null;
     storage = ctx?.storage ?? null;
     // ctx.onEvent is tracked and removed with the plugin (contrib/plugin.ts); host.onEvent is the fallback.
     const listen = typeof ctx?.onEvent === 'function' ? ctx.onEvent : typeof host?.onEvent === 'function' ? host.onEvent : null;
@@ -2316,9 +2471,18 @@ function createChatTree(deps) {
       } catch {
         listening = false;
       }
+      for (const type of RELOAD_EVENTS) {
+        try {
+          const off = listen(type, onTreeEvent);
+          if (typeof off === 'function') unsubscribers.push(off);
+        } catch {
+          // A host that refuses the subscription: the REFRESH_MS tick still reloads.
+        }
+      }
     }
     $status.set({ loading: false, error: null, note: null });
     $ui.set(freshUi());
+    $hover.set(freshHover());
     $data.set({ ...$data.get(), branchIds: storedBranchIds() });
     // ctx.setTimeout: the host clears it on unload (apps/desktop/src/contrib/plugin.ts).
     if (typeof ctx?.setTimeout === 'function') scopedTimeout = (fn, ms) => ctx.setTimeout(fn, ms);
@@ -2350,7 +2514,7 @@ function createChatTree(deps) {
     });
   }
 
-  return { register, renderPane, load, openChat, dispose, $data, $status, $ui };
+  return { register, renderPane, load, openChat, dispose, $data, $status, $ui, $hover };
 }
 
 const _plugin = createChatTree({
