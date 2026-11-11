@@ -38,7 +38,7 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
 
 - Point to a node to see the chat title and its model. Click a node to open its chat at that exchange.
 
-- **Chat status.** Each chat in the tree shows its status on its last row. A pulsing dot in the primary colour shows a chat that runs now. An amber dot shows a chat that needs you, and a hollow dot shows a chat that starts. A chat with no dot is idle. The Branches view also shows the status as a word after the number of exchanges. The pane reads the status from the gateway method `session.active_list`, and shows no status and no error when the method fails.
+- **Chat status.** Each chat in the tree shows its status on its last row. A pulsing dot in the primary colour shows a chat that runs now. An amber dot shows a chat that needs you, and a hollow dot shows a chat that starts. A chat with no dot is idle. The Branches view also shows the status as a word after the number of exchanges. The pane reads the status from the gateway method `session.active_list`. If one read fails, the pane keeps the last status. After two failed reads in a row, the pane shows no status and no error.
 
 ## Parts
 
