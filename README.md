@@ -8,9 +8,11 @@ The entry uses only the public plugin framework of Hermes. It changes no Hermes 
 
 - **Branch here.** Start a branch from a node of the tree. The branch is a new chat that continues after that exchange. Hermes names the branch. The new branch shows at its fork point at once. **Branch here** shows on each answered node. The question is optional. Without a question, the pane makes the branch and opens it.
 
-- **Ask on a cheaper model.** A branch can use a cheaper model. A side question then costs less, and the main chat stays on topic.
+- **Ask on a cheaper model.** You can type a question when you branch, and pick the model and reasoning level for its answer in the model picker of Hermes. A side question on a cheaper model costs less, and the main chat stays on topic.
 
-- **Merge back.** Merge a branch back into any ancestor chat on its path. You choose the merge mode:
+- **Row actions.** When you point to a row, up to three icons show at its right edge: **Branch here** (the fork icon of Hermes), **Merge into**, and **Open in a tab**.
+
+- **Merge back.** Merge the open chat back into any ancestor chat on its path. **Merge into** opens a pick in two steps: first the ancestor (the parent comes first), then the mode. Each mode shows its size and whether it fits the context of the ancestor. You choose the mode:
 
   - **Merge as-is** copies the questions and answers of the branch.
 
