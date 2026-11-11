@@ -1,0 +1,13 @@
+date	decision	why	evidence	result	by
+2026-11-11 23:55	Build on outbox/competition-entry at 46a3bef	It holds all chat-branching work; 253 tests pass	npm test in .worktrees/competition-base	chosen	Rohan
+2026-11-11	Use only the plugin framework of today	No changes to Hermes code	chat with Rohan	chosen	Rohan
+2026-11-11 22:31	A tree node is one exchange	Forks and merges anchor to an exact exchange	Outbox record of Rohan's choice	chosen	Rohan
+2026-11-11 22:35	The merge mode is the user's choice: Full text (default), Merge record, Digest	Rohan's rule	Outbox record of Rohan's choice	chosen	Rohan
+2026-11-12 00:05	One git-graph view; drop the outline, gutter, and strip modes of PR 20	The rules describe one graph view; less code to fix before the deadline	build.rules	chosen	Claude
+2026-11-12 00:05	Oldest exchange at the top	Reads in the same order as the chat	build.rules	chosen	Claude
+2026-11-12 00:05	Digest is the side question plus its final answer, with no model call	No cost per click, deterministic, and formatSideDigest exists	side-chat/src/side-chat.js:94	chosen; model summary deferred	Claude
+2026-11-12 00:05	Every merge mode starts with "From side chat: <title>"	The tree finds merges from that header in the parent's messages	chat-tree/src/chat-tree.js:335	chosen	Claude
+2026-11-12 00:05	Keep three plugins with one install script	A combined plugin is a risky restructure before the deadline	repo layout	chosen	Claude
+2026-11-12 00:05	Fork from any message (session.branch with count) after the core units	Hermes 0.23.1 supports count; not required by Rohan's rules	tui_gateway/methods_session_branch.py:108	deferred	Claude
+2026-11-12 00:05	Opus implements and a fresh Opus reviews each unit	Rohan's global rules; Outbox's mr rule does not apply here	Rohan, 2026-11-11	chosen	Rohan
+2026-11-12 00:05	The repo is private, so the catalog cannot load it	Catalog entries load the repo at the pinned SHA	plugin-catalog/README.md entry schema	open	Rohan
