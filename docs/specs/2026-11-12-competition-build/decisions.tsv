@@ -13,3 +13,7 @@ date	decision	why	evidence	result	by
 2026-11-12 00:05	The repo is private, so the catalog cannot load it	Catalog entries load the repo at the pinned SHA	plugin-catalog/README.md entry schema	open	Rohan
 2026-11-12 00:10	Make the repo public later, not now	Not important before the build is done	chat with Rohan	deferred	Rohan
 2026-11-12 00:13	The merge header is "From side chat: <side question>", not the title	branchName cuts titles to 50 chars and Hermes can rename chats; the question is the side chat's exact first message	side-chat/src/side-chat.js:22, :538	chosen; replaces the title rule in spec.md	Claude
+2026-11-12 00:22	No review for each unit; one review of the whole build at the end	Time before the deadline	chat with Rohan	chosen	Rohan
+2026-11-12 00:24	The entry lives in one window, the tree pane; a side chat is a branch lane, not a separate pane	Rohan's product rule	chat with Rohan	chosen; side-chat pane leaves the entry, its code moves into chat-tree	Rohan
+2026-11-12 00:24	Tree colours come from the Hermes theme, after the core units	Rohan's request	chat with Rohan	queued	Rohan
+2026-11-12 00:30	Branch at any exchange of the open chat with session.branch and count	The one window needs a branch action on a node; Hermes 0.23.1 supports count	tui_gateway/methods_session_branch.py:108	chosen; replaces the deferred row	Claude

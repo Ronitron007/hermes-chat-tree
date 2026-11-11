@@ -1,6 +1,6 @@
 # Decision tree: the competition build
 
-Updated: 2026-11-12 00:20 IST. Green is chosen. Grey is dropped. Yellow is open.
+Updated: 2026-11-12 00:30 IST. Green is chosen. Grey is dropped. Yellow is open.
 
 ```mermaid
 flowchart TD
@@ -37,9 +37,16 @@ flowchart TD
   M7 -->|dropped 00:13| M10[From side chat: title, cut to 50 chars and renamed by Hermes]
   M9 --> M8[Tree links the Merged node to the side chat whose first message equals the question]
 
+  G --> W{Windows}
+  W -->|chosen, Rohan 00:24| W1[One window: the tree pane holds branch, ask, open, merge]
+  W -->|dropped| W2[Separate side-chat pane]
   G --> P{Packaging}
-  P -->|chosen| P1[Three plugins plus one install script]
+  P -->|chosen| P1[chat-tree plus concept-links, one install script]
   P -->|dropped| P2[One combined plugin]
+  G --> RV{Reviews}
+  RV -->|chosen, Rohan 00:22| RV1[One review of the whole build at the end]
+  RV -->|dropped| RV2[A review for each unit]
+  G --> TC[Queued: tree colours from the Hermes theme]
   P1 --> R{Repo is private}
   R -->|deferred, Rohan 00:10| R1[Make this repo public, later]
   R -->|dropped| R2[New public repo for the entry]
@@ -48,15 +55,15 @@ flowchart TD
   Q -->|chosen| Q1[Static render harness plus screenshots]
   Q -->|open, Rohan| Q2[Live Desktop click-through]
 
-  G --> F{Fork from any message}
-  F -->|deferred| F1[session.branch with count, after the core units]
+  W1 --> F{Branch point}
+  F -->|chosen| F2[Any exchange of the open chat: session.branch with count]
 
   classDef chosen fill:#d1fae5,stroke:#059669,color:#064e3b
   classDef dropped fill:#f3f4f6,stroke:#9ca3af,color:#6b7280
   classDef open fill:#fef3c7,stroke:#d97706,color:#78350f
-  class B1,H1,T1,V1,O,C,M1,M2,M3,M5,M9,M8,P1,Q1 chosen
-  class B2,H2,T2,T3,V2,M6,M10,P2,F1,R2 dropped
+  class B1,H1,T1,V1,O,C,M1,M2,M3,M5,M9,M8,P1,Q1,W1,RV1,F2 chosen
+  class B2,H2,T2,T3,V2,M6,M10,P2,R2,W2,RV2 dropped
   class Q2 open
   classDef deferred fill:#e0e7ff,stroke:#6366f1,color:#312e81
-  class R1 deferred
+  class R1,TC deferred
 ```
