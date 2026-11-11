@@ -52,14 +52,14 @@ export const CURVE_R = 5;
 // pane still draws where the variables are missing. A role takes the token Hermes uses for that job
 // (paths in hermes-agent/apps/desktop/src):
 // - active (the open node's path, its fill, the open row band and left accent, the merge target
-//   lane): --ui-accent, the brand-accent stroke (styles.css:240, from midground, themes/types.ts:34-39).
-//   Hermes marks the active pane and tab with it (components/pane-shell/tree/renderer/tree-group.tsx:1214,
-//   components/ui/pane-tab.tsx:49).
+//   lane): --dt-primary, the theme's primary colour (styles.css:429, from --theme-primary). It carries
+//   the user's chosen accent (themes/context.tsx:168, :342). --ui-accent is not used: it is
+//   --theme-midground, a neutral (styles.css:240), so the active path looked like the hover path.
 // - inactive: --dt-muted-foreground, the muted text token (styles.css:426, text-muted-foreground at styles.css:133).
 // - hover: --dt-foreground, the text token (styles.css:422, text-foreground at styles.css:129). Hermes
 //   lifts muted text to it on hover (hover:text-foreground). The row hover fill (bg-muted,
 //   styles.css:425) is too faint for a line.
-export const ACCENT = 'var(--ui-accent, #3B82F6)';
+export const ACCENT = 'var(--dt-primary, #3B82F6)';
 export const MUTED = 'var(--dt-muted-foreground, #6B7280)';
 export const HOVER = 'var(--dt-foreground, currentColor)';
 export const ROLE_COLOURS = { active: ACCENT, hover: HOVER, inactive: MUTED };
@@ -532,7 +532,9 @@ function fitReadout(state) {
 
 // One line, at most `max` characters, with an ellipsis when cut.
 export function shortLabel(text, max = LABEL_MAX) {
-  const line = typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '';
+  // Markup the reader never sees in the chat: HTML comments and leading quote marks.
+  const raw = typeof text === 'string' ? text.replace(/<!--[\s\S]*?-->/g, ' ').replace(/^(\s*>)+\s*/, '') : '';
+  const line = raw.replace(/\s+/g, ' ').trim();
   if (!line) return '(no text)';
   return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
 }
@@ -1156,7 +1158,9 @@ const PILL = {
 
 // A small action button inside a one-line row, and a merge target chip.
 const ROW_ACTION = { ...SELECTABLE, flex: '0 0 auto', fontSize: 10, lineHeight: '14px', padding: '0 4px' };
-const CHIP = { ...SELECTABLE, maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+const CHIP = { ...SELECTABLE, maxWidth: 140, minWidth: 0, justifyContent: 'flex-start' };
+// The SDK Button centres its children, so the ellipsis lives on an inner span that starts at the left.
+const CHIP_TEXT = { ...SELECTABLE, display: 'block', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
 const INPUT_STYLE = { ...SELECTABLE, width: '100%', boxSizing: 'border-box' };
 
 export function createChatTree(deps) {
@@ -2408,7 +2412,7 @@ export function createChatTree(deps) {
                             stop(event);
                             pickTarget(open.id, t.id);
                           },
-                          children: t.title,
+                          children: jsx('span', { style: CHIP_TEXT, children: t.title }),
                         },
                         t.id,
                       ),

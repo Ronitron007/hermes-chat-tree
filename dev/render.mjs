@@ -187,6 +187,7 @@ const THEME_VARS = `
     --theme-mix-chrome: 74%;
     --ui-base: var(--theme-foreground);
     --ui-accent: var(--theme-midground);
+    --dt-primary: var(--theme-primary);
     --ui-bg-chrome: color-mix(in srgb, var(--theme-background-seed) var(--theme-mix-chrome), var(--theme-neutral-chrome));
     --ui-bg-tertiary: color-mix(in srgb, var(--ui-accent) 8%, color-mix(in srgb, var(--ui-base) 5%, transparent));
     --ui-text-primary: color-mix(in srgb, var(--ui-base) 94%, transparent);
