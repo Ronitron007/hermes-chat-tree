@@ -6,7 +6,7 @@ Decision tree: [decision-tree.md](decision-tree.md). Trail: [decisions.tsv](deci
 
 ## What ships `build.outcome`
 
-The entry lives in one window: the `chat-tree` pane, a git graph of a chat and its branches (Rohan, 2026-11-12 00:24). A side chat is not a separate pane. It is a branch lane in the graph. From the pane, the user can branch at an exchange, ask the branch a question on a cheaper model, open any chat, and merge a branch back into its parent.
+The entry lives in one window: the `chat-tree` pane, a git graph of a chat and its branches (Rohan, 2026-11-12 00:24). A side chat is not a separate pane. It is a branch lane in the graph. From the pane, the user can branch at an exchange, ask the branch a question on a model the user picks, open any chat, and merge a branch back into its parent.
 
 `concept-links` ships beside it: chips on terms in replies, with definitions in its own pane.
 
@@ -106,6 +106,8 @@ After `unit.tree_view` merges, put the actions in the tree pane. This unit repla
 
 - Branch here is an action on each exchange of the open chat. It forks with `session.branch` and `count`, sends the question with `prompt.submit` and `model_override`, and opens the branch. It never passes `name`, because Hermes names chats in its own way.
 
+- The user picks the branch model and reasoning level in the model picker of Hermes, `ModelCatalogMenu` (Rohan, 2026-11-12 01:05). The entry assumes no cheap model. `model_override` carries only `model`, `provider`, and `reasoning`. With no choice, send no override, so the branch uses the session model. Details: [`findings.model_picker`](../../research/2026-11-12-plugin-css-and-model-picker.md).
+
 - After a fork, the plugin asks for a digest of the part above the fork. It stores the digest and shows it on the fork node.
 
 Check: `npm test` and `npm run assemble:chat-tree` exit 0, with tests for the count, the payloads, the targets, both buttons, and the notice.
@@ -119,6 +121,10 @@ Check: Python tests pass with a stub model, `hermes plugins validate chat-tree` 
 ## Unit `unit.verify`
 
 Integrate on `outbox/competition-entry`. Run all tests, assemble all bundles, render the harness, and compare the screenshots with the two-colour mockup. Install into Hermes. A live Desktop click-through needs Rohan's access or his hands.
+
+## Styling rule `build.css`
+
+A Tailwind class works in a plugin only if the shipped CSS of Hermes has it. Use inline styles or SVG attributes for exact sizes and colours. The render harness loads the real `main-*.css` of Hermes, not the Tailwind CDN. Details: [`findings.css`](../../research/2026-11-12-plugin-css-and-model-picker.md).
 
 ## Process `build.process`
 
