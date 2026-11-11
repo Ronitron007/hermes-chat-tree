@@ -8,6 +8,11 @@ session event ``plugin.chat-tree.digest.written`` with ``{"job", "digest"}`` or 
 This is the frontend path that Hermes documents for ctx.llm: website/docs/developer-guide/
 plugin-llm-access.md:332-414 and website/docs/developer-guide/plugins/index.md:1961-2031 (Hermes 0.23.1).
 An RPC call holds the client's request lane until it returns, so the model call runs in a thread.
+
+The pane also calls ``plugin.chat-tree.history.read`` with ``{session_ids}`` (stored ids, at most
+MAX_HISTORY_IDS) and gets ``{"histories": {id: [{role, text, row_id?}]}, "missing": [id]}``. It reads
+the local session store read-only (hermes_state.SessionDB, a public plugin import), because
+session.history answers only for chats loaded in gateway memory. No model call. Nothing leaves the machine.
 """
 
 import contextvars
@@ -35,6 +40,11 @@ CUT_MARK = " [cut]"
 
 TIMEOUT_SECONDS = 60
 MAX_TOKENS = {"fork": 300, "merge": 450}
+
+HISTORY_METHOD = "history.read"  # served as plugin.chat-tree.history.read
+MAX_HISTORY_IDS = 30  # the pane's MAX_CHATS; ids after the first 30 unique ones are not read
+MAX_ID_CHARS = 200
+SYSTEM_MARKER = "[System:"  # gateway notices stored as user rows; the transcript never shows them
 
 SCHEMA = {
     "type": "object",
@@ -170,6 +180,86 @@ def _emit(ctx, session_id, payload):
         LOGGER.info("chat-tree: no viewer took %s for session %s (job %s)", EVENT, session_id, payload["job"])
 
 
+def parse_history(params):
+    """The stored ids to read: strings only, stripped, deduplicated in order, the first MAX_HISTORY_IDS.
+
+    ``ValueError`` for bad input (the RPC answers plugin_rpc_failed)."""
+    if not isinstance(params, Mapping):
+        raise ValueError("params must be an object")
+    raw = params.get("session_ids")
+    if not isinstance(raw, list):
+        raise ValueError("session_ids must be a list")
+    ids = []
+    for item in raw:
+        sid = item.strip() if isinstance(item, str) else ""
+        if sid and len(sid) <= MAX_ID_CHARS and sid not in ids:
+            ids.append(sid)
+        if len(ids) == MAX_HISTORY_IDS:
+            break
+    return ids
+
+
+def _content_text(content):
+    """The text of a stored ``content``: a string, the text parts of a parts list, or a text dict."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(part if isinstance(part, str) else part["text"] for part in content
+                       if isinstance(part, str) or (isinstance(part, Mapping) and isinstance(part.get("text"), str)))
+    if isinstance(content, Mapping) and isinstance(content.get("text"), str):
+        return content["text"]
+    return ""
+
+
+def project_history(messages):
+    """User and assistant rows with text, oldest first, as ``{role, text, row_id?}``.
+
+    Public surfaces only, so this is a subset of the gateway's transcript projection
+    (tui_gateway/session_history.py _history_to_messages): it drops the rows that projection never
+    shows as a bubble by the same tests, ``display_kind == "hidden"`` and ``[System:`` user notices."""
+    out = []
+    for message in messages if isinstance(messages, list) else []:
+        if not isinstance(message, Mapping):
+            continue
+        role = message.get("role")
+        if role not in ("user", "assistant") or message.get("display_kind") == "hidden":
+            continue
+        text = _content_text(message.get("content"))
+        if role == "user" and text.lstrip().startswith(SYSTEM_MARKER):
+            continue
+        if not text.strip():
+            continue
+        row = {"role": role, "text": text}
+        row_id = message.get("_row_id")
+        if isinstance(row_id, int) and not isinstance(row_id, bool):
+            row["row_id"] = row_id
+        out.append(row)
+    return out
+
+
+def read_histories(ids):
+    """``{"histories": {id: rows}, "missing": [ids not in the store]}`` from one read-only open.
+
+    SessionDB() with no path opens get_hermes_home()/state.db at call time, so the handler reads the
+    profile whose scope the RPC runs in. The read is the one session.history makes for a live chat:
+    active rows only, the compression lineage root to tip, with row ids."""
+    histories, missing = {}, []
+    if not ids:
+        return {"histories": histories, "missing": missing}
+    from hermes_state import SessionDB  # public plugin API (plugins/public-api.md)
+    db = SessionDB(read_only=True)  # no schema init, no write lock (hermes_state.py _open_read_only)
+    try:
+        for sid in ids:
+            if db.get_session_list_row(sid) is None:
+                missing.append(sid)
+                continue
+            histories[sid] = project_history(
+                db.get_messages_as_conversation(sid, include_ancestors=True, include_row_ids=True))
+    finally:
+        db.close()
+    return {"histories": histories, "missing": missing}
+
+
 def register(ctx):
     # Digests follow the title-generation model (a cheap slot) until the user sets
     # auxiliary.chat_tree_digest (plugin-llm-access.md:294-330).
@@ -210,4 +300,10 @@ def register(ctx):
             raise
         return {"job": job}
 
+    def history(params, *, session_id=None, **kwargs):
+        # session_id: the open chat, or None for a sessionless call. Either way the read is read-only
+        # and stays in the calling profile's state.db.
+        return read_histories(parse_history(params))
+
     ctx.register_rpc(METHOD, write)
+    ctx.register_rpc(HISTORY_METHOD, history)

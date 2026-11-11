@@ -100,7 +100,7 @@ class RegisterTest(unittest.TestCase):
             "description": "Fork and merge digests in the Chat Tree pane",
             "inherit_from": "title_generation",
         })])
-        self.assertEqual(list(ctx.rpcs), ["digest.write"])
+        self.assertEqual(list(ctx.rpcs), ["digest.write", "history.read"])
 
 
 class HandlerTest(unittest.TestCase):

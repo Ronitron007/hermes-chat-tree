@@ -29,7 +29,7 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
 | Part | Files | Job |
 |---|---|---|
 | Desktop half | `desktop/plugin.js` (built from `src/`) | The tree pane |
-| Python half | `plugin.yaml`, `__init__.py` | The digest RPC method |
+| Python half | `plugin.yaml`, `__init__.py` | The digest and history RPC methods |
 
 ## The digest method
 
@@ -57,9 +57,33 @@ A `fork` digest has 3 to 5 bullet lines and fewer than 80 words. It covers the c
 
 The method sends at most 24,000 characters of exchanges to the model. It cuts each question and each answer to 6,000 characters. Then it leaves out the oldest exchanges first, and it tells the model how many it left out. It masks secrets in the text before the model call.
 
+## The history method
+
+The pane draws the tree from the messages of each chat in the lineage of the open chat. The `session.history` method of Hermes answers only for a chat that the gateway holds in memory. Thus the Python half reads the other chats from the local session store of Hermes.
+
+Privacy: the plugin reads the messages of the chats in the lineage of the open chat. It reads them from the local session store of Hermes, to draw the tree. It reads only. Nothing leaves the machine, and no model gets this text.
+
+On each refresh, the pane sends one call for all chats with new messages:
+
+```js
+host.request('plugin.chat-tree.history.read', { session_ids, session_id })
+```
+
+- `session_ids` is a list of stored chat ids. The method reads the first 30 different ids. It ignores an item that is not a string.
+
+- `session_id` is the runtime id of the open chat. The call can also come without it.
+
+- The call answers `{ histories, missing }`. `histories` maps each stored id to its rows, oldest first. Each row is `{ role, text, row_id }`, and `role` is `user` or `assistant`. `missing` lists the ids that are not in the store.
+
+- The method opens the store of the profile of the call one time, read-only (`hermes_state.SessionDB(read_only=True)`). It reads the active rows with `get_messages_as_conversation`, as `session.history` does.
+
+- A bad request fails the call with the reason `plugin_rpc_failed`.
+
+If the Python half is not enabled, the call fails with the error `-32601`. Then the pane reads each chat with `session.history` and shows this note: `Enable the chat-tree plugin backend to see other chats (hermes plugins enable chat-tree).`
+
 ## How the method calls the model
 
-- `register(ctx)` in `__init__.py` registers the auxiliary task `chat_tree_digest` and the RPC method `digest.write`.
+- `register(ctx)` in `__init__.py` registers the auxiliary task `chat_tree_digest` and the RPC methods `digest.write` and `history.read`.
 
 - The worker thread calls `ctx.llm.complete_structured` with the JSON schema `{ digest: string }`, temperature 0, and `task="chat_tree_digest"`.
 
@@ -97,14 +121,17 @@ Then quit and relaunch Hermes Desktop. The root [README](../README.md) gives all
 ```bash
 npm run test:chat-tree
 <hermes venv>/bin/python chat-tree/tests_py/test_digest.py
+<hermes venv>/bin/python chat-tree/tests_py/test_history.py
 ```
 
-The Python tests import `agent.redact` and `agent.plugin_llm` from the Hermes source. No test calls a model.
+The digest tests import `agent.redact` and `agent.plugin_llm` from the Hermes source. The history tests make a temporary session store with `hermes_state.SessionDB`. No test calls a model, and no test opens a real Hermes home.
 
 ## Limits
 
 - Hermes has no API to scroll a chat to one message. A click on a node opens the chat of that node, at its usual scroll position.
 
 - The tree reads the newest 500 chats and at most 30 chats of one lineage.
+
+- Without the Python half, the tree shows only the chats that the gateway holds in memory.
 
 - A digest needs a model call. If the call fails, the pane gets an error and no digest.

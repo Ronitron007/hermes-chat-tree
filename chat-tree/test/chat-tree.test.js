@@ -123,6 +123,7 @@ function fakeHost({
   agents = [],
   active = { connectionId: 'local', profile: 'default' },
   history = HIST,
+  backend = false,
 } = {}) {
   const calls = [];
   const opened = [];
@@ -158,6 +159,11 @@ function fakeHost({
     // transcript: { [id]: rows } turns session.transcript on. history: { [id]: messages }.
     transcript: null,
     history: { ...history },
+    // plugin.chat-tree.history.read: backend false answers -32601 (the Python half is not enabled).
+    // store: { [stored id]: rows } the session store; null reads host.history. historyReadError throws.
+    backend,
+    store: null,
+    historyReadError: null,
     usage: undefined,
     stats: undefined,
     breakdown: undefined,
@@ -212,6 +218,18 @@ function fakeHost({
           return { rows: host.transcript[params.session_id] ?? [], next_cursor: null };
         case 'session.history':
           return { messages: host.history[params.session_id] ?? [] };
+        case 'plugin.chat-tree.history.read': {
+          if (!host.backend) throw Object.assign(new Error('Method not found'), { code: -32601 });
+          if (host.historyReadError) throw host.historyReadError;
+          const store = host.store ?? host.history;
+          const histories = {};
+          const missing = [];
+          for (const id of params.session_ids) {
+            if (Object.hasOwn(store, id)) histories[id] = store[id];
+            else missing.push(id);
+          }
+          return { histories, missing };
+        }
         case 'session.usage':
           return answer(method, host.usage, params);
         case 'session.stats':
@@ -2007,4 +2025,108 @@ test('the pane code never touches host transcript DOM, never sends a draft, and 
   assert.doesNotMatch(src, /^import /m);
   // Hermes names branches: the branch call carries no name.
   assert.doesNotMatch(src, /session\.branch_whole|name: branchName/);
+});
+
+// ── Stored histories: plugin.chat-tree.history.read ──────────────────────────────────────────
+
+const storeCalls = (host) => host.calls.filter(([m]) => m === mod.HISTORY_METHOD);
+
+test('one history.read per refresh reads every tree chat by stored id, with no session.history', async () => {
+  const ctx = setup({ host: fakeHost({ backend: true }) });
+  await flush();
+  const calls = storeCalls(ctx.host);
+  assert.equal(calls.length, 1);
+  const [, params] = calls[0];
+  assert.deepEqual([...params.session_ids].sort(), ['b1', 'b2', 'b3', 'root']);
+  assert.equal(params.session_id, 'rt-b2');
+  assert.equal(historyCalls(ctx.host), 0);
+  assert.equal(ctx.host.calls.filter(([m]) => m === 'session.transcript').length, 0);
+  const tree = ctx.pane.render();
+  assert.deepEqual(nodeKeys(tree), MAIN_KEYS);
+  assert.doesNotMatch(textOf(tree), /Enable the chat-tree plugin backend/);
+  ctx.unload();
+});
+
+test('history.read asks again only for the chats whose history key moved', async () => {
+  const ctx = setup({ host: fakeHost({ backend: true }) });
+  await flush();
+  await ctx.clock.tick(REFRESH_MS * 2);
+  assert.equal(storeCalls(ctx.host).length, 1); // nothing moved: no request at all
+  ctx.host.rows = ROWS.map((r) => (r.id === 'b1' ? { ...r, message_count: 4 } : r));
+  ctx.host.history.b1 = [...HIST.b1, { role: 'user', text: 'b1 more' }];
+  await ctx.clock.tick(REFRESH_MS);
+  const calls = storeCalls(ctx.host);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1][1].session_ids, ['b1']);
+  assert.equal(historyCalls(ctx.host), 0);
+  assert.ok(nodeKeys(ctx.pane.render()).includes('b1:3'));
+  ctx.unload();
+});
+
+test('without the Python half (-32601) the pane reads each chat with session.history and shows the backend note', async () => {
+  const ctx = setup(); // fakeHost answers history.read with -32601 by default
+  await flush();
+  assert.equal(storeCalls(ctx.host).length, 1);
+  for (const id of ['root', 'b1', 'b2', 'b3']) assert.equal(historyCalls(ctx.host, id), 1, id);
+  const tree = ctx.pane.render();
+  assert.deepEqual(nodeKeys(tree), MAIN_KEYS);
+  assert.ok(textOf(tree).includes(mod.BACKEND_NOTE_TEXT));
+  assert.equal(mod.BACKEND_NOTE_TEXT, 'Enable the chat-tree plugin backend to see other chats (hermes plugins enable chat-tree).');
+  assert.doesNotMatch(textOf(tree), /Stored histories/);
+  assert.equal(ctx.tree.$status.get().note, mod.BACKEND_NOTE_TEXT);
+  ctx.unload();
+});
+
+test('ids: history.read gets stored ids only; the fallback reads the open chat by its runtime id when its stored id fails', async () => {
+  const host = fakeHost();
+  const history = { ...HIST, 'rt-b2': HIST.b2 };
+  delete history.b2;
+  host.history = history;
+  const base = host.request;
+  host.request = async (method, params) => {
+    // A legacy gateway knows live chats by runtime id only.
+    if (method === 'session.history' && params.session_id === 'b2') {
+      host.calls.push([method, params]);
+      throw Object.assign(new Error('session not found'), { code: 4001 });
+    }
+    return base(method, params);
+  };
+  const ctx = setup({ host });
+  await flush();
+  const [, params] = storeCalls(host)[0];
+  assert.ok(!params.session_ids.includes('rt-b2'));
+  assert.ok(params.session_ids.includes('b2'));
+  assert.equal(historyCalls(host, 'rt-b2'), 1);
+  assert.deepEqual(nodeKeys(ctx.pane.render()), MAIN_KEYS);
+  assert.doesNotMatch(textOf(ctx.pane.render()), /History of b2/);
+  ctx.unload();
+});
+
+test('a chat missing from the store is read with session.history; another history.read error shows its text', async () => {
+  const host = fakeHost({ backend: true });
+  host.store = { ...HIST };
+  delete host.store.b3;
+  const ctx = setup({ host });
+  await flush();
+  assert.equal(historyCalls(host), 1);
+  assert.equal(historyCalls(host, 'b3'), 1);
+  assert.deepEqual(nodeKeys(ctx.pane.render()), MAIN_KEYS);
+
+  host.historyReadError = Object.assign(new Error('plugin_rpc_failed: OperationalError: locked'), { code: 4001 });
+  host.rows = ROWS.map((r) => (r.id === 'root' ? { ...r, message_count: 7 } : r));
+  await ctx.clock.tick(REFRESH_MS);
+  const text = textOf(ctx.pane.render());
+  assert.match(text, /Stored histories: plugin_rpc_failed: OperationalError: locked/);
+  assert.doesNotMatch(text, /Enable the chat-tree plugin backend/);
+  assert.equal(historyCalls(host, 'root'), 1); // the fallback read root the old way
+  ctx.unload();
+});
+
+test('parseHistoryReply keeps list histories and string missing ids; no histories object is null', () => {
+  const reply = mod.parseHistoryReply({ histories: { a: [{ role: 'user', text: 'q' }], b: 'bad' }, missing: ['c', 4] });
+  assert.deepEqual([...reply.histories.keys()], ['a']);
+  assert.deepEqual([...reply.missing], ['c']);
+  assert.equal(mod.parseHistoryReply({}), null);
+  assert.equal(mod.parseHistoryReply({ histories: [] }), null);
+  assert.equal(mod.parseHistoryReply(null), null);
 });
