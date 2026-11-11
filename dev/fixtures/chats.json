@@ -1,0 +1,423 @@
+{
+  "about": "Fixture chats for dev/render.mjs. sessions: rows as host.listPersistedSessions returns them. history: session.history messages per chat id. storage: ctx.storage values of the side-chat pane. The side chat \"Side: Explain virtualenv\" forked after exchange 3 and was merged back as exchange 4 of the main chat. \"Token scopes\" forked after exchange 5 on another model. \"Side: Pre-release tags\" forked after exchange 7.",
+  "owner": {
+    "connectionId": "local",
+    "profile": "default"
+  },
+  "focus": {
+    "chat-tree": "20261112_005322_c9171f",
+    "side-chat": "20261112_003012_a41c7e"
+  },
+  "sideBranchIds": [
+    "20261112_004105_3be0d2",
+    "20261112_010640_5d8e44"
+  ],
+  "mergedIds": [
+    "20261112_004105_3be0d2"
+  ],
+  "sessions": [
+    {
+      "id": "20261112_010640_5d8e44",
+      "title": "Side: Pre-release tags",
+      "model": "anthropic/claude-haiku-4.5",
+      "profile": "default",
+      "started_at": 1794425760,
+      "last_active": 1794425920,
+      "message_count": 18,
+      "parent_session_id": "20261112_003012_a41c7e",
+      "_lineage_root_id": "20261112_010640_5d8e44",
+      "_branched_from": "20261112_003012_a41c7e"
+    },
+    {
+      "id": "20261112_005322_c9171f",
+      "title": "Token scopes",
+      "model": "openai/gpt-5",
+      "profile": "default",
+      "started_at": 1794424980,
+      "last_active": 1794425500,
+      "message_count": 16,
+      "parent_session_id": "20261112_003012_a41c7e",
+      "_lineage_root_id": "20261112_005322_c9171f",
+      "_branched_from": "20261112_003012_a41c7e"
+    },
+    {
+      "id": "20261112_004105_3be0d2",
+      "title": "Side: Explain virtualenv",
+      "model": "anthropic/claude-haiku-4.5",
+      "profile": "default",
+      "started_at": 1794424260,
+      "last_active": 1794424330,
+      "message_count": 8,
+      "parent_session_id": "20261112_003012_a41c7e",
+      "_lineage_root_id": "20261112_004105_3be0d2",
+      "_branched_from": "20261112_003012_a41c7e"
+    },
+    {
+      "id": "20261112_003012_a41c7e",
+      "title": "Publish a Python package to PyPI",
+      "model": "anthropic/claude-sonnet-4.5",
+      "profile": "default",
+      "started_at": 1794423612,
+      "last_active": 1794426040,
+      "message_count": 16,
+      "parent_session_id": null,
+      "_lineage_root_id": "20261112_003012_a41c7e"
+    }
+  ],
+  "history": {
+    "20261112_003012_a41c7e": [
+      {
+        "role": "user",
+        "content": "I want to publish my Python package to PyPI. Where do I start?",
+        "timestamp": 1794423660
+      },
+      {
+        "role": "assistant",
+        "content": "Start with three things: a `pyproject.toml` that describes the package, a build of an sdist and a wheel, and a PyPI account with an API token. Then upload the files with `twine`.",
+        "timestamp": 1794423700
+      },
+      {
+        "role": "user",
+        "content": "What goes in pyproject.toml?",
+        "timestamp": 1794423840
+      },
+      {
+        "role": "assistant",
+        "content": "A `[build-system]` table that names the backend (for example `hatchling`), and a `[project]` table with `name`, `version`, `description`, `readme`, `requires-python`, `license` and `dependencies`. Add `[project.urls]` for the repository link.",
+        "timestamp": 1794423880
+      },
+      {
+        "role": "user",
+        "content": "Do I still need setup.py?",
+        "timestamp": 1794424080
+      },
+      {
+        "role": "assistant",
+        "content": "No. A pure-Python package builds from `pyproject.toml` alone. Keep `setup.py` only when the build runs custom code, such as a C extension.",
+        "timestamp": 1794424120
+      },
+      {
+        "role": "user",
+        "content": "From side chat: Side: Explain virtualenv\n\nYou:\nExplain virtualenv\n\nAssistant:\nA virtualenv is a folder with its own Python interpreter and its own site-packages. Packages you install while it is active go into that folder, not into the system Python.\n\nCreate one with `python -m venv .venv`, activate it with `source .venv/bin/activate`, and leave it with `deactivate`. Build and upload tools such as `build` and `twine` then stay out of your global install.",
+        "timestamp": 1794424440
+      },
+      {
+        "role": "assistant",
+        "content": "Good, that fits the plan. Create the venv first, install `build` and `twine` into it, and run every command below from inside it.",
+        "timestamp": 1794424480
+      },
+      {
+        "role": "user",
+        "content": "How do I create an API token for uploads?",
+        "timestamp": 1794424680
+      },
+      {
+        "role": "assistant",
+        "content": "Sign in to pypi.org, open Account settings, and add an API token under API tokens. Copy it at once, because PyPI shows it only one time. Use `__token__` as the user name and the token as the password.",
+        "timestamp": 1794424720
+      },
+      {
+        "role": "user",
+        "content": "How do I build the sdist and the wheel?",
+        "timestamp": 1794425160
+      },
+      {
+        "role": "assistant",
+        "content": "Run `python -m build` in the project folder. It writes a `.tar.gz` sdist and a `.whl` wheel into `dist/`. Check them with `twine check dist/*` before you upload.",
+        "timestamp": 1794425200
+      },
+      {
+        "role": "user",
+        "content": "Should I test on TestPyPI first?",
+        "timestamp": 1794425580
+      },
+      {
+        "role": "assistant",
+        "content": "Yes. TestPyPI is a separate index with its own accounts and tokens. Upload with `twine upload --repository testpypi dist/*`, then install from it in a clean venv to check the metadata and the entry points.",
+        "timestamp": 1794425620
+      },
+      {
+        "role": "user",
+        "content": "How do I upload the release with twine?",
+        "timestamp": 1794426000
+      },
+      {
+        "role": "assistant",
+        "content": "Run `twine upload dist/*`. Twine reads the token from `~/.pypirc` or from the `TWINE_PASSWORD` variable. A version number can be uploaded only once, so bump the version for each new release.",
+        "timestamp": 1794426040
+      }
+    ],
+    "20261112_004105_3be0d2": [
+      {
+        "role": "user",
+        "content": "I want to publish my Python package to PyPI. Where do I start?",
+        "timestamp": 1794423660
+      },
+      {
+        "role": "assistant",
+        "content": "Start with three things: a `pyproject.toml` that describes the package, a build of an sdist and a wheel, and a PyPI account with an API token. Then upload the files with `twine`.",
+        "timestamp": 1794423700
+      },
+      {
+        "role": "user",
+        "content": "What goes in pyproject.toml?",
+        "timestamp": 1794423840
+      },
+      {
+        "role": "assistant",
+        "content": "A `[build-system]` table that names the backend (for example `hatchling`), and a `[project]` table with `name`, `version`, `description`, `readme`, `requires-python`, `license` and `dependencies`. Add `[project.urls]` for the repository link.",
+        "timestamp": 1794423880
+      },
+      {
+        "role": "user",
+        "content": "Do I still need setup.py?",
+        "timestamp": 1794424080
+      },
+      {
+        "role": "assistant",
+        "content": "No. A pure-Python package builds from `pyproject.toml` alone. Keep `setup.py` only when the build runs custom code, such as a C extension.",
+        "timestamp": 1794424120
+      },
+      {
+        "role": "user",
+        "content": "Explain virtualenv",
+        "timestamp": 1794424290
+      },
+      {
+        "role": "assistant",
+        "content": "A virtualenv is a folder with its own Python interpreter and its own site-packages. Packages you install while it is active go into that folder, not into the system Python.\n\nCreate one with `python -m venv .venv`, activate it with `source .venv/bin/activate`, and leave it with `deactivate`. Build and upload tools such as `build` and `twine` then stay out of your global install.",
+        "timestamp": 1794424330
+      }
+    ],
+    "20261112_005322_c9171f": [
+      {
+        "role": "user",
+        "content": "I want to publish my Python package to PyPI. Where do I start?",
+        "timestamp": 1794423660
+      },
+      {
+        "role": "assistant",
+        "content": "Start with three things: a `pyproject.toml` that describes the package, a build of an sdist and a wheel, and a PyPI account with an API token. Then upload the files with `twine`.",
+        "timestamp": 1794423700
+      },
+      {
+        "role": "user",
+        "content": "What goes in pyproject.toml?",
+        "timestamp": 1794423840
+      },
+      {
+        "role": "assistant",
+        "content": "A `[build-system]` table that names the backend (for example `hatchling`), and a `[project]` table with `name`, `version`, `description`, `readme`, `requires-python`, `license` and `dependencies`. Add `[project.urls]` for the repository link.",
+        "timestamp": 1794423880
+      },
+      {
+        "role": "user",
+        "content": "Do I still need setup.py?",
+        "timestamp": 1794424080
+      },
+      {
+        "role": "assistant",
+        "content": "No. A pure-Python package builds from `pyproject.toml` alone. Keep `setup.py` only when the build runs custom code, such as a C extension.",
+        "timestamp": 1794424120
+      },
+      {
+        "role": "user",
+        "content": "From side chat: Side: Explain virtualenv\n\nYou:\nExplain virtualenv\n\nAssistant:\nA virtualenv is a folder with its own Python interpreter and its own site-packages. Packages you install while it is active go into that folder, not into the system Python.\n\nCreate one with `python -m venv .venv`, activate it with `source .venv/bin/activate`, and leave it with `deactivate`. Build and upload tools such as `build` and `twine` then stay out of your global install.",
+        "timestamp": 1794424440
+      },
+      {
+        "role": "assistant",
+        "content": "Good, that fits the plan. Create the venv first, install `build` and `twine` into it, and run every command below from inside it.",
+        "timestamp": 1794424480
+      },
+      {
+        "role": "user",
+        "content": "How do I create an API token for uploads?",
+        "timestamp": 1794424680
+      },
+      {
+        "role": "assistant",
+        "content": "Sign in to pypi.org, open Account settings, and add an API token under API tokens. Copy it at once, because PyPI shows it only one time. Use `__token__` as the user name and the token as the password.",
+        "timestamp": 1794424720
+      },
+      {
+        "role": "user",
+        "content": "Which token scope should CI use?",
+        "timestamp": 1794425040
+      },
+      {
+        "role": "assistant",
+        "content": "Use a token scoped to this one project, not an account-wide token. If the CI secret leaks, the token can upload only to this project, and you can revoke it without touching your other projects.",
+        "timestamp": 1794425080
+      },
+      {
+        "role": "user",
+        "content": "Can one token cover two projects?",
+        "timestamp": 1794425220
+      },
+      {
+        "role": "assistant",
+        "content": "No. A project-scoped token covers exactly one project. For two projects, make two tokens, or use an account-wide token and accept the larger risk. Trusted publishing from GitHub Actions avoids long-lived tokens altogether.",
+        "timestamp": 1794425260
+      },
+      {
+        "role": "user",
+        "content": "How do I rotate the token safely?",
+        "timestamp": 1794425460
+      },
+      {
+        "role": "assistant",
+        "content": "Create the new token first, put it in the CI secret, and run one upload to TestPyPI or a dry-run job. Then revoke the old token on PyPI. The order keeps CI working at every step.",
+        "timestamp": 1794425500
+      }
+    ],
+    "20261112_010640_5d8e44": [
+      {
+        "role": "user",
+        "content": "I want to publish my Python package to PyPI. Where do I start?",
+        "timestamp": 1794423660
+      },
+      {
+        "role": "assistant",
+        "content": "Start with three things: a `pyproject.toml` that describes the package, a build of an sdist and a wheel, and a PyPI account with an API token. Then upload the files with `twine`.",
+        "timestamp": 1794423700
+      },
+      {
+        "role": "user",
+        "content": "What goes in pyproject.toml?",
+        "timestamp": 1794423840
+      },
+      {
+        "role": "assistant",
+        "content": "A `[build-system]` table that names the backend (for example `hatchling`), and a `[project]` table with `name`, `version`, `description`, `readme`, `requires-python`, `license` and `dependencies`. Add `[project.urls]` for the repository link.",
+        "timestamp": 1794423880
+      },
+      {
+        "role": "user",
+        "content": "Do I still need setup.py?",
+        "timestamp": 1794424080
+      },
+      {
+        "role": "assistant",
+        "content": "No. A pure-Python package builds from `pyproject.toml` alone. Keep `setup.py` only when the build runs custom code, such as a C extension.",
+        "timestamp": 1794424120
+      },
+      {
+        "role": "user",
+        "content": "From side chat: Side: Explain virtualenv\n\nYou:\nExplain virtualenv\n\nAssistant:\nA virtualenv is a folder with its own Python interpreter and its own site-packages. Packages you install while it is active go into that folder, not into the system Python.\n\nCreate one with `python -m venv .venv`, activate it with `source .venv/bin/activate`, and leave it with `deactivate`. Build and upload tools such as `build` and `twine` then stay out of your global install.",
+        "timestamp": 1794424440
+      },
+      {
+        "role": "assistant",
+        "content": "Good, that fits the plan. Create the venv first, install `build` and `twine` into it, and run every command below from inside it.",
+        "timestamp": 1794424480
+      },
+      {
+        "role": "user",
+        "content": "How do I create an API token for uploads?",
+        "timestamp": 1794424680
+      },
+      {
+        "role": "assistant",
+        "content": "Sign in to pypi.org, open Account settings, and add an API token under API tokens. Copy it at once, because PyPI shows it only one time. Use `__token__` as the user name and the token as the password.",
+        "timestamp": 1794424720
+      },
+      {
+        "role": "user",
+        "content": "How do I build the sdist and the wheel?",
+        "timestamp": 1794425160
+      },
+      {
+        "role": "assistant",
+        "content": "Run `python -m build` in the project folder. It writes a `.tar.gz` sdist and a `.whl` wheel into `dist/`. Check them with `twine check dist/*` before you upload.",
+        "timestamp": 1794425200
+      },
+      {
+        "role": "user",
+        "content": "Should I test on TestPyPI first?",
+        "timestamp": 1794425580
+      },
+      {
+        "role": "assistant",
+        "content": "Yes. TestPyPI is a separate index with its own accounts and tokens. Upload with `twine upload --repository testpypi dist/*`, then install from it in a clean venv to check the metadata and the entry points.",
+        "timestamp": 1794425620
+      },
+      {
+        "role": "user",
+        "content": "Pre-release tags",
+        "timestamp": 1794425790
+      },
+      {
+        "role": "assistant",
+        "content": "Use the PEP 440 forms: `1.2.0a1` for an alpha, `1.2.0b1` for a beta and `1.2.0rc1` for a release candidate. Put the tag in `version` in `pyproject.toml`, build, and upload as usual.",
+        "timestamp": 1794425830
+      },
+      {
+        "role": "user",
+        "content": "Does pip install pick a pre-release by default?",
+        "timestamp": 1794425880
+      },
+      {
+        "role": "assistant",
+        "content": "No. `pip install yourpkg` skips pre-releases unless no final release exists. Users opt in with `pip install --pre yourpkg` or by naming the exact version, such as `yourpkg==1.2.0b1`.",
+        "timestamp": 1794425920
+      }
+    ]
+  },
+  "storage": {
+    "sideChat:model": {
+      "model": "anthropic/claude-haiku-4.5",
+      "provider": ""
+    },
+    "sideChat:20261112_003012_a41c7e": [
+      {
+        "id": "20261112_010640_5d8e44",
+        "question": "Pre-release tags",
+        "session_id": "20261112_010640_5d8e44",
+        "stored_session_id": "20261112_010640_5d8e44",
+        "model": "anthropic/claude-haiku-4.5",
+        "provider": null,
+        "answer": "Use the PEP 440 forms: `1.2.0a1` for an alpha, `1.2.0b1` for a beta and `1.2.0rc1` for a release candidate. Put the tag in `version` in `pyproject.toml`, build, and upload as usual.",
+        "error": null,
+        "status": "answered",
+        "maxRowId": 14,
+        "at": 1794425820000,
+        "diag": {
+          "busySeen": true,
+          "reads": 4,
+          "doneBy": "busy-signal"
+        }
+      },
+      {
+        "id": "20261112_004105_3be0d2",
+        "question": "Explain virtualenv",
+        "session_id": "20261112_004105_3be0d2",
+        "stored_session_id": "20261112_004105_3be0d2",
+        "model": "anthropic/claude-haiku-4.5",
+        "provider": null,
+        "answer": "A virtualenv is a folder with its own Python interpreter and its own site-packages. Packages you install while it is active go into that folder, not into the system Python.\n\nCreate one with `python -m venv .venv`, activate it with `source .venv/bin/activate`, and leave it with `deactivate`. Build and upload tools such as `build` and `twine` then stay out of your global install.",
+        "error": null,
+        "status": "answered",
+        "maxRowId": 6,
+        "at": 1794424320000,
+        "diag": {
+          "busySeen": true,
+          "reads": 4,
+          "doneBy": "busy-signal"
+        }
+      }
+    ]
+  },
+  "expect": {
+    "chat-tree": [
+      "Publish a Python package to PyPI",
+      "Side: Explain virtualenv",
+      "Token scopes",
+      "Side: Pre-release tags"
+    ],
+    "side-chat": [
+      "Explain virtualenv",
+      "Pre-release tags"
+    ]
+  }
+}

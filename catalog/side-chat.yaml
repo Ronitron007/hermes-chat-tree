@@ -1,0 +1,31 @@
+name: side-chat
+title: Side Chat
+repo: https://github.com/Ronitron007/hermes-concept-links
+sha: "0000000000000000000000000000000000000000"
+subdir: side-chat
+description: >-
+  Ask a side question in a fork of the open chat, on a cheaper model, and read
+  the answer in a side pane. The main chat gets no new message. A merge stages
+  the side exchange in the main chat composer as Full text, a Merge record or a
+  Digest, and never sends it. Disclosure: forks the focused chat with
+  session.branch_whole, submits the side question to that fork through the
+  public Desktop SDK, reads the fork's history, and keeps the side question
+  list in plugin storage. No external services, credentials, filesystem access,
+  shell, backend, telemetry or self-updater.
+maintainer: Ronitron007
+tier: community
+category: desktop
+requires_hermes: ">=0.23"
+version: "0.1.0"
+docs_url: https://github.com/Ronitron007/hermes-concept-links#readme
+readme: true
+platforms: []
+known_issues:
+  - Requires Hermes Desktop.
+  - A merge is staged in the composer and never sent. Edit and send it yourself.
+  - Digest is the side question and its final answer. No model writes a summary.
+capabilities:
+  provides_tools: []
+  provides_hooks: []
+  provides_middleware: []
+  requires_env: []

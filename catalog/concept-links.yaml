@@ -1,0 +1,28 @@
+name: concept-links
+title: Concept Links
+repo: https://github.com/Ronitron007/hermes-concept-links
+sha: "0000000000000000000000000000000000000000"
+subdir: ""
+description: >-
+  Dotted-underline chips on technical terms in replies. Hover a chip for a
+  short definition, and click it for a Concepts side pane with the definition,
+  its source and its first use in the session. Disclosure: a
+  transform_llm_output hook rewrites reply paragraphs into ::termline markup,
+  and term lookups call MDN, Wiktionary and Wikipedia (1.5 s budget, at most 8
+  terms per turn). No credentials, telemetry or self-updater.
+maintainer: Ronitron007
+tier: community
+category: desktop
+requires_hermes: ">=0.23"
+version: "0.1.0"
+docs_url: https://github.com/Ronitron007/hermes-concept-links#readme
+readme: true
+platforms: []
+known_issues:
+  - The hook does not hold the stream, so a reply can show as plain text before the chips appear.
+capabilities:
+  provides_tools: []
+  provides_hooks:
+    - transform_llm_output
+  provides_middleware: []
+  requires_env: []

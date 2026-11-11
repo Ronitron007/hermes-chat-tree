@@ -8,6 +8,11 @@
     "test:chat-tree": "node --test chat-tree/test/*.test.js",
     "assemble": "node scripts/assemble.mjs",
     "assemble:side-chat": "node side-chat/scripts/assemble.mjs",
-    "assemble:chat-tree": "node chat-tree/scripts/assemble.mjs"
+    "assemble:chat-tree": "node chat-tree/scripts/assemble.mjs",
+    "render": "node dev/render.mjs"
+  },
+  "devDependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
   }
 }
