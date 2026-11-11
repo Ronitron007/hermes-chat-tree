@@ -34,7 +34,9 @@ flowchart TD
   Q2 -.->|third| F3[Judge + concept links]
   F1 --> Q3{Which cheap model path?}
   Q3 -->|model_override per turn<br/>D-route| F1a[Branch + override]
-  F2 --> Q4{Tree UI?}
+  F2 --> Q7{Which nodes go in the tree?}
+  Q7 -->|branches + delegate subagent sessions<br/>D-unify-tree| Q4
+  Q4{Tree UI?}
   Q4 -->|outline first<br/>D-tree-ui| F2a[Indented list in a pane]
   Q4 -.->|later| F2b[React Flow + d3-hierarchy graph]
   F3 --> Q5{Where does the judge run?}
@@ -99,13 +101,30 @@ All rows are verified (esbuild bundle, grep for `eval`, `new Function`, `Worker`
 | @xyflow/react | 62 KB plus CSS | None | Graph view, later |
 | elkjs | 452 KB | GPL or EPL license, size | Do not use |
 
+## Reconcile with the second research `chat_tree.reconcile`
+
+A second agent did the same research on 2026-11-11 and sent it by email. Its raw notes are on another computer, so we could not check its sources. Its numbers have the label "not checked" below.
+
+| Topic | This note | Second research | Result |
+|---|---|---|---|
+| Agent share of OpenRouter tokens | 8% to 76% | 8% to 76% | Agree |
+| ChatGPT weekly users | 900M (2026-02, secondary) | About 1.2B (not checked) | Both say chat has the most users. The date of the 1.2B figure is not known |
+| Spend | Coding is $4.0B of $7.3B departmental spend (Menlo, secondary) | Coding tools $34.0B, enterprise chatbots $25.0B (Menlo, not checked) | Different Menlo splits. Both put coding first |
+| Developer use | Not measured | Agents 66%, chatbots 63% (Stack Overflow). Agent use 90% weekly (JetBrains). Not checked | New data. It supports a tree for developers that holds both chats and agent runs |
+| First audience | Agent runners in Hermes Desktop | Developers who use both chat and agents | Compatible |
+| Tree contents | Chat branches only | Chat threads and agent transcripts as one tree | Adopt. See `D-unify-tree` |
+| Concept links | Open the branch. No SDK verb scrolls to a message | Point at the node where the term was defined | Agree on the target. The node is a session in the tree pane until Hermes gets a reveal verb |
+| Rejected paths | Chat-first app | Consumer chat only, agents only, wait a year | Agree |
+
+The merge changes one decision. The tree pane shows branch sessions and delegate subagent sessions in one tree. Hermes stores both as sessions with a parent. Branches use `_branched_from`, and subagents use `_delegate_from` (`hermes_state_delegate_children.py:13-28`). Verified (read). The order of features does not change.
+
 ## Next steps `chat_tree.next`
 
 1. Spike `host.request('session.branch')` and `prompt.submit` with `model_override` from a plugin pane.
 
 2. Build the side chat pane. It forks from the last message and uses a cheap model.
 
-3. Add the outline tree pane from `host.listPersistedSessions`.
+3. Add the outline tree pane from `host.listPersistedSessions`. Show branch sessions and delegate subagent sessions.
 
 4. Add the judge on `post_llm_call`. Store marks in `ctx.state`, keyed by session id and row id.
 
