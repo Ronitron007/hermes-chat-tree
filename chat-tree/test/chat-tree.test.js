@@ -174,6 +174,8 @@ function fakeHost({
     // session.branch and prompt.submit results: a value, a function of the params, or an Error.
     branchResult: { session_id: 'nb-rt', stored_session_id: 'nb', title: 'b2 (branch)' },
     submitResult: { status: 'queued' },
+    // session.resume result: a value, a function of the params, or an Error. The default attaches.
+    resumeResult: (params) => ({ session_id: params.session_id, revision: 1, execution_generation: 0 }),
     // true: an open moves focus to the opened chat, as the desktop does.
     moveFocusOnOpen: false,
     // plugin.chat-tree.digest.write: digestError throws; else it answers { job } and, when
@@ -237,7 +239,11 @@ function fakeHost({
         case 'session.active_list':
           return answer(method, host.activeList, params);
         case 'config.set':
+          order.push(['config', params]);
           return answer(method, host.configSet, params);
+        case 'session.resume':
+          order.push(['resume', params]);
+          return answer(method, host.resumeResult, params);
         case 'session.title':
           return answer(method, host.title ?? { ok: true }, params);
         case 'session.usage':
@@ -3365,6 +3371,179 @@ test('without config.set and without a question, a picked model shows a notice a
   assert.ok(ctx.host.opened.length >= 1);
   assert.match(textOf(ctx.pane.render()), /did not take its model/);
   ctx.unload();
+});
+
+// A Branch here submit with a picked model (and the level high), with or without a question.
+// wait: false does not wait for the submit to end (a confirm dialog holds it open).
+async function branchWithModel({ host = fakeHost(), deps = {}, question = 'q?', wait = true } = {}) {
+  const ctx = setup({ host, deps });
+  await flush();
+  branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+  if (question) typeInto(ctx, 'question', question);
+  pickRow(ctx, 'claude-x', 'anthropic');
+  controllerOf(ctx).setOptions({ effort: 'high' }, { isActive: true, model: 'claude-x', provider: 'anthropic' });
+  const submitted = submitForm(ctx);
+  if (wait) await submitted;
+  await flush();
+  return ctx;
+}
+const heldModelNotice = (ctx) => byAttr(ctx.pane.render(), 'data-held-notice', 'fork')[0];
+
+test('a picked model: session.resume on the stored branch id comes before config.set, and a set model sends no model_override', async () => {
+  for (const question of ['', 'q?']) {
+    const host = fakeHost();
+    host.configSet = () => ({ ok: true });
+    const ctx = await branchWithModel({ host, question });
+    const kinds = host.order.map(([k]) => k).filter((k) => ['branch', 'resume', 'config', 'prompt'].includes(k));
+    assert.deepEqual(kinds, ['branch', 'resume', 'config', 'config', ...(question ? ['prompt'] : [])]);
+    assert.deepEqual(host.order.find(([k]) => k === 'resume')[1], { session_id: 'nb', source: 'desktop', omit_messages: true });
+    assert.deepEqual(
+      host.order.filter(([k]) => k === 'config').map(([, p]) => p),
+      [
+        { key: 'model', session_id: 'nb-rt', value: 'claude-x --provider anthropic --session' },
+        { key: 'reasoning', session_id: 'nb-rt', value: 'high' },
+      ],
+    );
+    if (question) assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+    assert.equal(heldModelNotice(ctx), undefined);
+    assert.deepEqual(host.opened, [['nb', OPEN_HERE]]);
+    ctx.unload();
+  }
+  // Nothing picked: no resume and no config.set.
+  const plain = setup();
+  await flush();
+  branchButton(plain, 'b2:3').props.onClick(fakeEvent());
+  typeInto(plain, 'question', 'q?');
+  await submitForm(plain);
+  await flush();
+  assert.equal(plain.host.order.some(([k]) => k === 'resume' || k === 'config'), false);
+  plain.unload();
+});
+
+test('a failed config.set sends the model_override on the first question and shows the error in the branch notice', async () => {
+  const host = fakeHost();
+  host.configSet = new Error('Session revision unavailable; reopen the session before editing metadata');
+  const ctx = await branchWithModel({ host });
+  assert.deepEqual(promptOf(host), {
+    session_id: 'nb-rt',
+    text: 'q?',
+    model_override: { model: 'claude-x', provider: 'anthropic', reasoning: 'high' },
+  });
+  assert.equal(
+    textOf(heldModelNotice(ctx)),
+    `${mod.BRANCH_MODEL_FIRST_TURN_TEXT} Error: Session revision unavailable; reopen the session before editing metadata\nDismiss`,
+  );
+  assert.deepEqual(host.opened, [['nb', OPEN_HERE]]);
+  ctx.unload();
+
+  // No question: the branch opens with the notice and the error, and nothing is asked.
+  const quiet = fakeHost();
+  quiet.configSet = new Error('no revision');
+  const none = await branchWithModel({ host: quiet, question: '' });
+  assert.equal(quiet.order.some(([k]) => k === 'prompt'), false);
+  assert.ok(textOf(heldModelNotice(none)).startsWith(`${mod.BRANCH_MODEL_NOT_SET_TEXT} Error: no revision`));
+  assert.deepEqual(quiet.opened, [['nb', OPEN_HERE]]);
+  none.unload();
+
+  // A failed level: the model went in, the level did not. The first question still carries both.
+  const level = fakeHost();
+  level.configSet = (p) => (p.key === 'reasoning' ? Promise.reject(new Error('bad level')) : { ok: true });
+  const lv = await branchWithModel({ host: level });
+  assert.deepEqual(promptOf(level).model_override, { model: 'claude-x', provider: 'anthropic', reasoning: 'high' });
+  assert.match(textOf(heldModelNotice(lv)), /Error: The level was not set: bad level/);
+  lv.unload();
+});
+
+test('a failed session.resume still tries config.set; the notice names the resume error only when the model did not stick', async () => {
+  const host = fakeHost();
+  host.resumeResult = new Error('session not found');
+  host.configSet = new Error('Session revision unavailable');
+  const ctx = await branchWithModel({ host });
+  assert.deepEqual(host.order.filter(([k]) => ['resume', 'config', 'prompt'].includes(k)).map(([k]) => k), ['resume', 'config', 'prompt']);
+  assert.ok(promptOf(host).model_override);
+  assert.match(textOf(heldModelNotice(ctx)), /Error: session\.resume failed \(session not found\)\. Session revision unavailable/);
+  ctx.unload();
+
+  // An older wire takes config.set without the resume: the model sticks, and no notice shows.
+  const older = fakeHost();
+  older.resumeResult = new Error('session not found');
+  older.configSet = () => ({ ok: true });
+  const ok = await branchWithModel({ host: older });
+  assert.equal(promptOf(older).model_override, undefined);
+  assert.equal(heldModelNotice(ok), undefined);
+  ok.unload();
+});
+
+test('a confirm_required answer opens the SDK confirm; the model counts as set only once the user confirms', { timeout: 5000 }, async () => {
+  for (const accept of [true, false]) {
+    const host = fakeHost();
+    host.configSet = (p) => (p.key === 'model' && !p.confirm_expensive_model ? { confirm_required: true, confirm_message: 'Costly model' } : { ok: true });
+    const asked = [];
+    let answer;
+    const surfaceModelSwitchConfirm = (options) => {
+      asked.push(options);
+      return new Promise((resolve) => (answer = resolve));
+    };
+    const ctx = await branchWithModel({ host, deps: { surfaceModelSwitchConfirm }, wait: false });
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].model, 'claude-x');
+    assert.equal(asked[0].confirmMessage, 'Costly model');
+    assert.equal(asked[0].failureMessage, mod.BRANCH_MODEL_FAILED_TEXT);
+    assert.equal(asked[0].isStale(), false);
+    // While the dialog is open: no question, no level, no open, and the form stays busy.
+    assert.equal(host.order.some(([k]) => k === 'prompt'), false);
+    assert.equal(host.order.filter(([k]) => k === 'config').length, 1);
+    assert.deepEqual(host.opened, []);
+    assert.equal(ctx.tree.$ui.get().branch.busy, true);
+    if (accept) {
+      // Hermes's confirm resends with confirm_expensive_model, then resolves true.
+      await asked[0].requestConfirmed();
+      answer(true);
+    } else answer(false);
+    await flush();
+    const sets = host.order.filter(([k]) => k === 'config').map(([, p]) => p);
+    if (accept) {
+      assert.deepEqual(sets.slice(1), [
+        { key: 'model', session_id: 'nb-rt', value: 'claude-x --provider anthropic --session', confirm_expensive_model: true },
+        { key: 'reasoning', session_id: 'nb-rt', value: 'high' },
+      ]);
+      assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+      assert.equal(heldModelNotice(ctx), undefined);
+    } else {
+      // Declined: nothing was applied, and no override side-steps the refused switch.
+      assert.equal(sets.length, 1);
+      assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+      assert.equal(textOf(heldModelNotice(ctx)), `${mod.BRANCH_MODEL_DECLINED_TEXT}\nDismiss`);
+    }
+    assert.deepEqual(host.opened, [['nb', OPEN_HERE]]);
+    ctx.unload();
+  }
+
+  // An SDK without the confirm: the guarded pick stays unset, with no override, and the notice says why.
+  const host = fakeHost();
+  host.configSet = (p) => (p.key === 'model' ? { confirm_required: true, confirm_message: 'Costly model' } : { ok: true });
+  const ctx = await branchWithModel({ host });
+  assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+  assert.equal(textOf(heldModelNotice(ctx)), `${mod.BRANCH_MODEL_DECLINED_TEXT} ${mod.BRANCH_MODEL_CONFIRM_MISSING_TEXT} Costly model\nDismiss`);
+  ctx.unload();
+});
+
+test('a failed fork digest adds to the model notice and does not replace it', async () => {
+  const host = fakeHost();
+  host.configSet = new Error('no revision');
+  host.digestEvent = () => ({ error: 'no model' });
+  const ctx = await branchWithModel({ host });
+  await flush();
+  assert.match(textOf(heldModelNotice(ctx)), /did not take its model.*Error: no revision Fork digest failed: no model/);
+  ctx.unload();
+});
+
+test('branchModelNotice: null when the model is set, the declined text, else the text for the question with the error', () => {
+  assert.equal(mod.branchModelNotice(null, true), null);
+  assert.equal(mod.branchModelNotice({ ok: true }, false), null);
+  assert.equal(mod.branchModelNotice({ declined: true }, true), mod.BRANCH_MODEL_DECLINED_TEXT);
+  assert.equal(mod.branchModelNotice({ error: 'x' }, true), `${mod.BRANCH_MODEL_FIRST_TURN_TEXT} Error: x`);
+  assert.equal(mod.branchModelNotice({ error: 'x' }, false), `${mod.BRANCH_MODEL_NOT_SET_TEXT} Error: x`);
 });
 
 const nameRowOf = (tree, chatId) => findAll(tree, (n) => n.props?.['data-name-row'] === chatId)[0];

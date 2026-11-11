@@ -95,6 +95,11 @@ export const UNLISTED_FOCUS_TEXT =
   "This chat is not in Hermes's session list (a subagent's chat is hidden there). The tree shows the chat you had open before, read-only.";
 export const BRANCH_MODEL_NOT_SET_TEXT =
   "The branch was made, but Hermes did not take its model. It uses this chat's model. Pick a model in the branch's own model menu.";
+export const BRANCH_MODEL_FIRST_TURN_TEXT =
+  "The branch was made, but Hermes did not take its model. The first question runs on the picked model, later turns on this chat's model. Pick a model in the branch's own model menu.";
+export const BRANCH_MODEL_DECLINED_TEXT = "The branch uses this chat's model: the switch to the picked model was not confirmed.";
+export const BRANCH_MODEL_CONFIRM_MISSING_TEXT = 'This Hermes has no model confirm for plugins.';
+export const BRANCH_MODEL_FAILED_TEXT = "Hermes did not switch the branch's model.";
 export const FOCUS_WAIT_MS = 6000;
 export const MERGE_SEND_FOCUS_TEXT = 'The target chat did not open in time. Nothing was sent.';
 export const MERGE_SEND_BUSY_TEXT = 'The target chat is running. Nothing was sent.';
@@ -714,6 +719,17 @@ export function modelOverride(choice) {
   const provider = str(choice?.provider);
   const reasoning = str(choice?.effort);
   return { model, ...(provider ? { provider } : {}), ...(reasoning ? { reasoning } : {}) };
+}
+
+// The branch notice when the picked model did not become the branch's model, or null when it did.
+// outcome is setBranchSessionModel's answer. question: the first question went out (with the
+// one-turn model_override when config.set failed). The error text is Hermes's own.
+export function branchModelNotice(outcome, question) {
+  if (!outcome || outcome.ok) return null;
+  if (outcome.declined) return [BRANCH_MODEL_DECLINED_TEXT, str(outcome.note)].filter(Boolean).join(' ');
+  const text = question ? BRANCH_MODEL_FIRST_TURN_TEXT : BRANCH_MODEL_NOT_SET_TEXT;
+  const error = str(outcome.error);
+  return error ? `${text} Error: ${error}` : text;
 }
 
 // The picker button text: `provider: model · level`, or MODEL_INHERIT_TEXT when nothing is picked.
@@ -1497,6 +1513,9 @@ export function createChatTree(deps) {
           effortLabel: typeof deps.reasoningEffortLabel === 'function' ? deps.reasoningEffortLabel : null,
         }
       : null;
+  // Hermes's one confirm flow for a guarded model switch (sdk surfaceModelSwitchConfirm,
+  // lib/guarded-model-switch.ts). null on an SDK without it: a guarded pick then stays unset.
+  const confirmModelSwitch = typeof deps.surfaceModelSwitchConfirm === 'function' ? deps.surfaceModelSwitchConfirm : null;
 
   // rows: last good session rows. agents: last good subagents, for agentsFor (a runtime id).
   // exchanges: { [chat id]: exchanges } for the chats of the focused tree. branchIds: the ids of
@@ -2502,7 +2521,10 @@ export function createChatTree(deps) {
     const reply = await requestDigest(branchSessionId, 'fork', title, exchanges);
     if (disposed || act !== activation) return;
     if (!reply.ok) {
-      setUi({ forkNotice: reply.missing ? `No fork digest. ${DIGEST_MISSING_TEXT.replace(' Nothing was staged.', '')}` : `Fork digest failed: ${reply.error}` });
+      // Added to a notice already held (the branch's model notice), never in its place.
+      const text = reply.missing ? `No fork digest. ${DIGEST_MISSING_TEXT.replace(' Nothing was staged.', '')}` : `Fork digest failed: ${reply.error}`;
+      const held = $ui.get().forkNotice;
+      setUi({ forkNotice: held ? `${held} ${text}` : text });
       return;
     }
     write(digestKey(chatId, index), reply.digest);
@@ -2510,21 +2532,57 @@ export function createChatTree(deps) {
     $data.set({ ...data, digests: { ...data.digests, [`${chatId}:${index}`]: reply.digest } });
   }
 
-  // Submit of the Branch here form. Forks the open chat after the form's exchange, asks the branch
-  // the question on the form's model, and opens the branch in place. Never throws. Errors stay in the form.
-  // Sets the branch session's model (and level) the way Hermes Desktop's picker does. true when both
-  // calls answered without an error.
-  async function setBranchSessionModel(sessionId, override) {
+  // Attaches this window to a new branch, so Desktop knows its revision and generation. A new
+  // branch has neither yet, and config.set (a session.mutate op) throws before it is sent without
+  // them (api/canonical-protocol.ts retainedMutation; the resume reply primes both in snapshotResult).
+  // Desktop resumes a chat it opens the same way (use-session-actions/resume-owner.ts
+  // primaryResumeParams). session_id is the STORED id (tui_gateway/contracts/sessions.py
+  // SessionResumeParams). null, or the error text.
+  async function primeBranchSession(storedId) {
     try {
-      const value = `${override.model}${override.provider ? ` --provider ${override.provider}` : ''} --session`;
-      await host.request('config.set', { key: 'model', session_id: sessionId, value });
-      if (override.reasoning) await host.request('config.set', { key: 'reasoning', session_id: sessionId, value: override.reasoning });
-      return true;
-    } catch {
-      return false;
+      await host.request('session.resume', { session_id: storedId, source: 'desktop', omit_messages: true });
+      return null;
+    } catch (error) {
+      return errorText(error);
     }
   }
 
+  // Sets the branch session's model (and level) the way Hermes Desktop's picker does
+  // (app/session/hooks/use-model-controls.ts requestSwitch). Answers { ok: true } when Hermes took
+  // the model, { declined: true, note? } when a guarded model was not confirmed (nothing was
+  // applied), or { error } with the failure text. A guarded model answers confirm_required: the
+  // SDK's confirm asks the user, and only a confirmed resend (confirm_expensive_model) applies it.
+  async function setBranchSessionModel(sessionId, override, alive) {
+    const value = `${override.model}${override.provider ? ` --provider ${override.provider}` : ''} --session`;
+    const switchModel = (confirmed) =>
+      host.request('config.set', { key: 'model', session_id: sessionId, value, ...(confirmed ? { confirm_expensive_model: true } : {}) });
+    try {
+      const result = await switchModel(false);
+      if (result?.confirm_required) {
+        if (!confirmModelSwitch) return { declined: true, note: [BRANCH_MODEL_CONFIRM_MISSING_TEXT, str(result.confirm_message)].filter(Boolean).join(' ') };
+        const confirmed = await confirmModelSwitch({
+          confirmMessage: str(result.confirm_message) || undefined,
+          failureMessage: BRANCH_MODEL_FAILED_TEXT,
+          isStale: () => !alive(),
+          model: override.model,
+          requestConfirmed: () => switchModel(true),
+        });
+        if (!confirmed) return { declined: true };
+      }
+    } catch (error) {
+      return { error: errorText(error) };
+    }
+    if (!override.reasoning) return { ok: true };
+    try {
+      await host.request('config.set', { key: 'reasoning', session_id: sessionId, value: override.reasoning });
+      return { ok: true };
+    } catch (error) {
+      return { error: `The level was not set: ${errorText(error)}` };
+    }
+  }
+
+  // Submit of the Branch here form. Forks the open chat after the form's exchange, asks the branch
+  // the question on the form's model, and opens the branch in place. Never throws. Errors stay in the form.
   async function submitBranch() {
     const form = $ui.get().branch;
     if (!form || form.busy) return;
@@ -2569,20 +2627,31 @@ export function createChatTree(deps) {
     reload();
 
     // The picked model becomes the branch's own model, so every turn uses it, with or without a
-    // question: config.set with session scope, the call Hermes Desktop's model picker makes
-    // (app/session/hooks/use-model-controls.ts:280-284, lib/reasoning-step.ts:69-71). If it fails,
-    // the question still goes out with a one-turn model_override.
+    // question: session.resume first (primeBranchSession), then config.set with session scope, the
+    // call Hermes Desktop's model picker makes (app/session/hooks/use-model-controls.ts,
+    // lib/reasoning-step.ts:69-71). Only when config.set fails does the question go out with a
+    // one-turn model_override. A guarded model the user did not confirm gets none: the chat's model
+    // answers. The branch notice keeps Hermes's error text.
     const override = modelOverride(form.model);
-    let modelSet = false;
-    if (override) modelSet = await setBranchSessionModel(sessionId, override);
+    let outcome = null;
+    if (override) {
+      const primeError = await primeBranchSession(storedId);
+      if (!alive()) return;
+      outcome = await setBranchSessionModel(sessionId, override, alive);
+      // A failed resume is shown only when the model did not stick: an older wire takes config.set without it.
+      if (primeError && outcome.error) outcome = { error: `session.resume failed (${primeError}). ${outcome.error}` };
+    }
     if (!alive()) return;
-    if (override && !modelSet && !question) {
-      setUi({ branch: null, forkNotice: BRANCH_MODEL_NOT_SET_TEXT });
+    const notice = branchModelNotice(outcome, Boolean(question));
+    if (notice) setUi({ forkNotice: notice });
+    if (notice && !question) {
+      setUi({ branch: null });
       openChat(storedId, 'in-place');
       return;
     }
     if (question) {
-      const submit = { session_id: sessionId, text: question, ...(override && !modelSet ? { model_override: override } : {}) };
+      const oneTurn = Boolean(override && outcome?.error);
+      const submit = { session_id: sessionId, text: question, ...(oneTurn ? { model_override: override } : {}) };
       try {
         await host.request('prompt.submit', submit);
       } catch (error) {
