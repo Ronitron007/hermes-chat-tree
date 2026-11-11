@@ -13,6 +13,9 @@ import {
   branchName,
   rowsAfterFence,
   digestFromRows,
+  rowText,
+  rememberSideBranch,
+  isKnownSideBranch,
   MERGE_STAGED_TEXT,
   MERGE_HIDDEN_TEXT,
   MERGE_NO_COMPOSER_TEXT,
@@ -917,5 +920,223 @@ test('a missing composer draft API shows a notice and writes nothing', async () 
   await assert.doesNotReject(() => stageButton(ctx).props.onClick());
   assert.equal(ctx.host.opened.length, opened);
   assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_NO_COMPOSER_TEXT);
+  ctx.unload();
+});
+
+test('rowText uses trimmed text, then string content, then joined part text', () => {
+  assert.equal(rowText({ text: '  hello  ' }), 'hello');
+  assert.equal(rowText({ text: '   ', content: ' from content ' }), 'from content');
+  assert.equal(rowText({ content: 'plain' }), 'plain');
+  assert.equal(rowText({ content: [{ text: 'What is ' }, { type: 'image' }, { text: 'a virtualenv?' }] }), 'What is a virtualenv?');
+  assert.equal(rowText({ role: 'assistant' }), '');
+  assert.equal(rowText(null), '');
+});
+
+// v0.23.0 has session.history and no session.transcript. History is one complete snapshot.
+function withHistoryFallback(host, { contentOnly = false } = {}) {
+  const base = host.request.bind(host);
+  host.request = async (method, params) => {
+    if (method === 'session.transcript') {
+      host.calls.push([method, params]);
+      throw new Error('unknown method: session.transcript');
+    }
+    if (method === 'session.history') {
+      host.calls.push([method, params]);
+      const b = host.branches.get(params.session_id);
+      const project = (row) => (
+        contentOnly
+          ? { role: row.role, content: row.text, row_id: row.row_id }
+          : { role: row.role, text: row.text, row_id: row.row_id }
+      );
+      const messages = b.rows.map(project);
+      if (b.submitted) {
+        b.reads += 1;
+        const user = contentOnly
+          ? { role: 'user', content: b.question, row_id: 900 }
+          : { role: 'user', text: b.question, row_id: 900 };
+        const assistant = contentOnly
+          ? { role: 'assistant', content: 'history answer', row_id: 901 }
+          : { role: 'assistant', text: 'history answer', row_id: 901 };
+        if (b.reads >= 1) messages.push(user);
+        if (b.reads >= 2) messages.push(assistant);
+      }
+      return { count: messages.length, messages };
+    }
+    return base(method, params);
+  };
+  return host;
+}
+
+const historyCalls = (host) => host.calls.filter(([method]) => method === 'session.history').length;
+
+test('session.history answers when session.transcript is unknown', async () => {
+  const host = withHistoryFallback(fakeHost());
+  const ctx = setup({ host });
+  await ask(ctx, 'What is a virtualenv?');
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+  assert.equal(entryOf(ctx).answer, 'history answer');
+  assert.ok(historyCalls(host) < 30, `history called ${historyCalls(host)} times`);
+  ctx.unload();
+});
+
+test('session.history answers from content-only rows', async () => {
+  const host = withHistoryFallback(fakeHost(), { contentOnly: true });
+  const ctx = setup({ host });
+  await ask(ctx, 'What is a virtualenv?');
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+  assert.equal(entryOf(ctx).answer, 'history answer');
+  assert.ok(historyCalls(host) < 30, `history called ${historyCalls(host)} times`);
+  ctx.unload();
+});
+
+test('after a numeric fence, a new user row starts the turn even when its text differs', async () => {
+  const script = (n, b, { add }) => {
+    if (n === 1) add({ role: 'user', text: 'Explain virtualenv' });
+    if (n === 2) add({ role: 'assistant', text: 'renamed-user answer' });
+  };
+  const ctx = setup({ host: fakeHost({ script }) });
+  await ask(ctx, 'What is a virtualenv?');
+  assert.equal(Number.isFinite(entryOf(ctx).maxRowId), true);
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+  assert.equal(entryOf(ctx).answer, 'renamed-user answer');
+  ctx.unload();
+});
+
+test('digest keeps the first side pair when a follow-up turn is already stored', () => {
+  const rows = [
+    { role: 'user', text: 'Publish Python package to PyPI', row_id: 43 },
+    { role: 'assistant', text: 'parent answer', row_id: 44 },
+    { role: 'user', text: 'What is a virtualenv?', row_id: 45 },
+    { role: 'assistant', text: 'a virtualenv is an isolated environment', row_id: 46 },
+    { role: 'user', text: 'How do I make one?', row_id: 47 },
+    { role: 'assistant', text: 'follow-up answer', row_id: 48 },
+  ];
+  assert.equal(
+    digestFromRows(rows, 44, { question: 'What is a virtualenv?', answer: 'stored' }),
+    DIGEST('What is a virtualenv?', 'a virtualenv is an isolated environment'),
+  );
+});
+
+test('with no fence, the digest is the side pair that matches the stored question', () => {
+  const rows = [
+    { role: 'user', text: 'Publish Python package to PyPI', row_id: 43 },
+    { role: 'assistant', text: 'parent answer', row_id: 44 },
+    { role: 'user', text: 'What is a virtualenv?', row_id: 45 },
+    { role: 'assistant', text: 'a virtualenv is an isolated environment', row_id: 46 },
+  ];
+  assert.equal(rowsAfterFence(rows, null).length, 0);
+  assert.equal(
+    digestFromRows(rows, null, { question: 'What is a virtualenv?' }),
+    DIGEST('What is a virtualenv?', 'a virtualenv is an isolated environment'),
+  );
+  assert.equal(digestFromRows([], null, { question: 'stored q', answer: '  stored a  ' }), DIGEST('stored q', 'stored a'));
+});
+
+function paneInputs(ctx) {
+  return findAll(expand(ctx.pane.render()), (n) => n.type === 'Input');
+}
+
+test('typing in the side form does not propagate to the parent composer', () => {
+  const ctx = setup();
+  const tree = expand(ctx.pane.render());
+  const inputs = findAll(tree, (n) => n.type === 'Input');
+  assert.equal(inputs.length, 3);
+  for (const input of inputs) {
+    assert.equal(typeof input.props.onKeyDown, 'function');
+    assert.equal(typeof input.props.onKeyUp, 'function');
+    assert.equal(typeof input.props.onPointerDown, 'function');
+    let stopped = 0;
+    const event = { key: 'a', stopPropagation: () => { stopped += 1; }, stopImmediatePropagation: () => { stopped += 1; } };
+    input.props.onKeyDown(event);
+    assert.equal(stopped, 2);
+    input.props.onKeyUp(event);
+    input.props.onPointerDown(event);
+    assert.equal(stopped, 6);
+  }
+  const wrappers = findAll(tree, (n) => (
+    n.type !== 'Input'
+    && typeof n.props?.onKeyDown === 'function'
+    && typeof n.props?.onKeyUp === 'function'
+    && typeof n.props?.onPointerDown === 'function'
+  ));
+  assert.ok(wrappers.length >= 1);
+  let wrapped = 0;
+  wrappers[0].props.onKeyDown({ key: 'a', stopPropagation: () => { wrapped += 1; } });
+  assert.equal(wrapped, 1);
+  assert.equal(methods(ctx.host).includes('session.branch_whole'), false);
+});
+
+test('Enter in the question field asks and stops the key', async () => {
+  const ctx = setup();
+  ctx.chat.$form.set({ question: 'What is a virtualenv?', model: '', provider: '' });
+  const [question] = paneInputs(ctx);
+  assert.equal(question.props.placeholder, 'Side question');
+  let prevented = 0;
+  let stopped = 0;
+  question.props.onKeyDown({
+    key: 'Enter',
+    shiftKey: false,
+    preventDefault: () => { prevented += 1; },
+    stopPropagation: () => { stopped += 1; },
+    stopImmediatePropagation: () => { stopped += 1; },
+  });
+  await flush();
+  assert.equal(prevented, 1);
+  assert.equal(stopped, 2);
+  assert.equal(entryOf(ctx).question, 'What is a virtualenv?');
+  ctx.unload();
+});
+
+test('asking a side question registers the branch session ids', async () => {
+  const host = fakeHost();
+  const base = host.request.bind(host);
+  host.request = async (method, params) => {
+    const result = await base(method, params);
+    if (method === 'session.branch_whole') return { ...result, stored_session_id: 'stored-branch-1' };
+    return result;
+  };
+  const ctx = setup({ host });
+  await ask(ctx, 'What is a virtualenv?');
+  const entry = entryOf(ctx);
+  assert.equal(isKnownSideBranch(entry.session_id), true);
+  assert.equal(isKnownSideBranch(entry.stored_session_id), true);
+  assert.equal(entry.stored_session_id, 'stored-branch-1');
+  ctx.unload();
+});
+
+test('restoring a stored list registers the branch session ids', () => {
+  const storage = syncStorage({
+    [listKey('st-main')]: [{
+      id: 'b9',
+      question: 'q',
+      session_id: 'sess-b9',
+      stored_session_id: 'stored-b9',
+      status: 'answered',
+      answer: 'a',
+      at: 5,
+    }],
+  });
+  setup({ storage });
+  assert.equal(isKnownSideBranch('sess-b9'), true);
+  assert.equal(isKnownSideBranch('stored-b9'), true);
+  assert.equal(rememberSideBranch('sess-b9'), undefined);
+});
+
+test('side cards follow the focused chat and come back with it', async () => {
+  const ctx = setup();
+  await ask(ctx, 'only on main');
+  const shown = () => textOf(expand(ctx.pane.render()));
+  assert.match(shown(), /only on main/);
+  ctx.host.state.focusedStoredSessionId.set('st-other');
+  ctx.host.state.focusedSessionId.set('rt-other');
+  await flush();
+  assert.doesNotMatch(shown(), /only on main/);
+  ctx.host.state.focusedStoredSessionId.set('st-main');
+  ctx.host.state.focusedSessionId.set('rt-main');
+  await flush();
+  assert.match(shown(), /only on main/);
   ctx.unload();
 });

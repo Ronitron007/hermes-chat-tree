@@ -38,6 +38,43 @@ const MERGE_NO_COMPOSER_TEXT = 'The composer draft API is missing. Nothing was w
 const listKey = (chatId) => `sideChat:${chatId}`;
 const branchName = (question) => `Side: ${question.slice(0, 50)}`;
 
+// Shared with chat-tree through globalThis: assembled plugins cannot import each other.
+// Hermes retitles a side branch, so the side mark is keyed by these ids, with the title prefix as fallback.
+const SIDE_BRANCH_IDS = '__hermesSideChatBranchIds';
+
+function sideBranchIds() {
+  if (!(globalThis[SIDE_BRANCH_IDS] instanceof Set)) {
+    const ids = new Set();
+    try {
+      const raw = globalThis.localStorage?.getItem?.(SIDE_BRANCH_IDS);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(parsed)) {
+        for (const id of parsed) if (typeof id === 'string' && id) ids.add(id);
+      }
+    } catch {
+      // node tests have no localStorage; a bad stored value must not break the pane.
+    }
+    globalThis[SIDE_BRANCH_IDS] = ids;
+  }
+  return globalThis[SIDE_BRANCH_IDS];
+}
+
+function rememberSideBranch(id) {
+  if (typeof id !== 'string' || !id) return;
+  const ids = sideBranchIds();
+  if (ids.has(id)) return;
+  ids.add(id);
+  try {
+    globalThis.localStorage?.setItem?.(SIDE_BRANCH_IDS, JSON.stringify([...ids]));
+  } catch {
+    // Persistence is best effort.
+  }
+}
+
+function isKnownSideBranch(id) {
+  return typeof id === 'string' && id !== '' && sideBranchIds().has(id);
+}
+
 // Pane text must be copyable; the spike log was not.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text' };
 const PRE_STYLE = { ...SELECTABLE, whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0, font: 'inherit' };
@@ -49,6 +86,16 @@ const errorText = (error) => str(error?.message) || str(error) || 'Unknown error
 // The canonical gateway refuses a mutation it cannot run now as reason `session_busy`
 // (hermes_state_mutation_guards.py busy_refusal); the desktop sends branch_whole as that mutation.
 const isBusy = (error) => /busy/i.test(`${error?.data?.reason ?? ''} ${errorText(error)}`);
+
+// Transcript rows on this Hermes may carry text, a string content, or content parts.
+function rowText(row) {
+  const direct = typeof row?.text === 'string' ? row.text.trim() : '';
+  if (direct) return direct;
+  const content = row?.content;
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  return content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('').trim();
+}
 
 // Cherry-pick merge-back: a short plain-text digest of the side turn. Copied parent rows
 // (row_id at or under the fence) stay out. The user edits the digest and sends it.
@@ -69,17 +116,45 @@ function turnFromNewRows(rows) {
   let question = '';
   let answer = '';
   for (const row of rows) {
-    const text = str(row?.text);
-    if (!text) continue;
     if (row?.role === 'user') {
-      if (!question) question = text;
-    } else if (row?.role === 'assistant') answer = text;
+      // First complete turn only: a later user stops once this pair is in hand.
+      if (question && answer) break;
+      const text = rowText(row);
+      if (!question && text) question = text;
+    } else if (row?.role === 'assistant' && question) {
+      const text = rowText(row);
+      if (text) answer = text;
+    }
   }
   if (!question || !answer) return null;
   return { question, answer };
 }
 
+// Legacy entries stored no fence. Match the side question instead of the copied parent turn.
+function digestWithoutFence(rows, fallback) {
+  const question = str(fallback?.question);
+  const stored = str(fallback?.answer);
+  const list = Array.isArray(rows) ? rows : [];
+  let start = -1;
+  if (question) {
+    for (let i = 0; i < list.length; i++) {
+      if (list[i]?.role === 'user' && rowText(list[i]) === question) start = i;
+    }
+  }
+  if (start < 0) return formatSideDigest(question, stored);
+  let answer = '';
+  for (let i = start + 1; i < list.length; i++) {
+    if (list[i]?.role === 'user') break;
+    if (list[i]?.role === 'assistant') {
+      const text = rowText(list[i]);
+      if (text) answer = text;
+    }
+  }
+  return formatSideDigest(question, answer || stored);
+}
+
 function digestFromRows(rows, maxRowId, fallback) {
+  if (!Number.isFinite(maxRowId)) return digestWithoutFence(rows, fallback);
   const turn = turnFromNewRows(rowsAfterFence(rows, maxRowId));
   const question = turn?.question ?? str(fallback?.question);
   const answer = turn?.answer ?? str(fallback?.answer);
@@ -192,7 +267,11 @@ function createSideChat(deps) {
     write(listKey(chatId), next);
   }
 
-  const addEntry = (chatId, entry) => setList(chatId, [entry, ...($lists.get()[chatId] ?? [])]);
+  const addEntry = (chatId, entry) => {
+    rememberSideBranch(entry?.session_id);
+    rememberSideBranch(entry?.stored_session_id);
+    setList(chatId, [entry, ...($lists.get()[chatId] ?? [])]);
+  };
 
   function updateEntry(chatId, id, patch) {
     const list = $lists.get()[chatId] ?? [];
@@ -213,15 +292,33 @@ function createSideChat(deps) {
         .map(cleanEntry)
         .filter((e) => e && !ids.has(e.id))
         .map((e) => (e.status === 'asking' && !polls.has(e.id) ? { ...e, status: 'timeout' } : e));
+      for (const entry of restored) {
+        rememberSideBranch(entry.session_id);
+        rememberSideBranch(entry.stored_session_id);
+      }
       const merged = [...current, ...restored].sort((a, b) => b.at - a.at).slice(0, MAX_ENTRIES);
       $lists.set({ ...$lists.get(), [chatId]: merged });
       if (current.length) write(listKey(chatId), merged);
     });
   }
 
+  // This Hermes (v0.23) has no session.transcript. Cache that and read session.history,
+  // which is one complete snapshot. An empty transcript page is not a missing method.
+  let transcriptMissing = false;
   const request = (params) => host.request('session.transcript', params);
-  const page = (sessionId, cursor) =>
-    request({ session_id: sessionId, order: 'oldest', limit: PAGE_LIMIT, ...(cursor ? { cursor } : {}) });
+  async function page(sessionId, cursor) {
+    const params = { session_id: sessionId, order: 'oldest', limit: PAGE_LIMIT, ...(cursor ? { cursor } : {}) };
+    if (!transcriptMissing) {
+      try {
+        return await request(params);
+      } catch {
+        transcriptMissing = true;
+      }
+    }
+    const history = await host.request('session.history', { session_id: sessionId });
+    const messages = Array.isArray(history?.messages) ? history.messages : [];
+    return { rows: messages, next_cursor: null, reset: true, complete: true };
+  }
 
   // Reads the copied history to its end before the question goes in. Only an EMPTY page means
   // caught up: the gateway also cuts pages at 2 MiB and between tool groups (session_stored_reads.py). The poll then starts from
@@ -235,7 +332,8 @@ function createSideChat(deps) {
       const rows = Array.isArray(result?.rows) ? result.rows : [];
       for (const row of rows) if (Number.isFinite(row?.row_id)) maxRowId = Math.max(maxRowId ?? row.row_id, row.row_id);
       cursor = result?.next_cursor ?? cursor;
-      if (rows.length === 0) break;
+      // History is a complete snapshot. Without this, the fence rereads it until the cap.
+      if (result?.complete === true || rows.length === 0) break;
     }
     return { cursor, maxRowId };
   }
@@ -281,7 +379,11 @@ function createSideChat(deps) {
         }
         for (const row of rows) {
           if (!isNew(row)) continue;
-          if (row?.role === 'user' && str(row.text) === entry.question) {
+          const text = rowText(row);
+          // A numeric fence already dropped copied rows, so any new user row is this turn.
+          // With no fence, only the exact question starts it.
+          const startsTurn = row?.role === 'user' && (text === entry.question || Number.isFinite(start.maxRowId));
+          if (startsTurn) {
             questionSeen = true;
             tail = [];
           } else if (questionSeen && (row?.role === 'assistant' || row?.role === 'tool')) {
@@ -289,13 +391,13 @@ function createSideChat(deps) {
           }
         }
         cursor = result.next_cursor ?? (result.reset ? null : cursor);
-        // A full page means more rows wait; read on without the delay.
-        if (rows.length >= PAGE_LIMIT) return step();
+        // A full page means more rows wait; a complete history snapshot does not.
+        if (rows.length >= PAGE_LIMIT && result.complete !== true) return step();
       }
       const busy = Boolean(atomOf('busyBySession').get()?.[entry.session_id]);
       if (busy) seenBusy = true;
       const last = tail[tail.length - 1];
-      const candidate = last?.role === 'assistant' ? str(last.text) || null : null;
+      const candidate = last?.role === 'assistant' ? rowText(last) || null : null;
       if (candidate && !busy && (seenBusy || candidate === previous)) {
         return finish({ status: 'answered', answer: candidate, diag: diag(seenBusy ? 'busy-signal' : 'two-reads') });
       }
@@ -459,6 +561,12 @@ function createSideChat(deps) {
     }
   }
 
+  // Hermes listens for keys on window capture; the composer takes whatever still bubbles.
+  function stopHostEvent(event) {
+    event.stopPropagation?.();
+    event.stopImmediatePropagation?.();
+  }
+
   function setField(key, value) {
     const next = { ...$form.get(), [key]: value };
     $form.set(next);
@@ -533,6 +641,9 @@ function createSideChat(deps) {
       children: jsxs('div', {
         className: 'flex flex-col gap-2 p-4 text-sm',
         style: SELECTABLE,
+        onKeyDown: stopHostEvent,
+        onKeyUp: stopHostEvent,
+        onPointerDown: stopHostEvent,
         children: [
           jsx('p', {
             className: 'text-xs opacity-70',
@@ -545,21 +656,30 @@ function createSideChat(deps) {
             placeholder: 'Side question',
             onChange: (event) => setField('question', event.target.value),
             onKeyDown: (event) => {
+              stopHostEvent(event);
               if (event.key === 'Enter' && !event.shiftKey) {
                 event.preventDefault?.();
                 onAsk();
               }
             },
+            onKeyUp: stopHostEvent,
+            onPointerDown: stopHostEvent,
           }),
           jsx(Input, {
             value: form.model,
             placeholder: 'Side model (blank = session model)',
             onChange: (event) => setField('model', event.target.value),
+            onKeyDown: stopHostEvent,
+            onKeyUp: stopHostEvent,
+            onPointerDown: stopHostEvent,
           }),
           jsx(Input, {
             value: form.provider,
             placeholder: 'Side provider (optional)',
             onChange: (event) => setField('provider', event.target.value),
+            onKeyDown: stopHostEvent,
+            onKeyUp: stopHostEvent,
+            onPointerDown: stopHostEvent,
           }),
           jsx(Button, { type: 'button', disabled: !chatId || Boolean(status.pending), onClick: onAsk, children: 'Ask' }),
           status.notice

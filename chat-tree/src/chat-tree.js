@@ -146,6 +146,46 @@ export function flattenTree(tree, subagents = []) {
 
 export const isSideTitle = (title) => typeof title === 'string' && title.startsWith(SIDE_PREFIX);
 
+// Shared with side-chat through globalThis: assembled plugins cannot import each other.
+const SIDE_BRANCH_IDS = '__hermesSideChatBranchIds';
+
+function sideBranchIds() {
+  if (!(globalThis[SIDE_BRANCH_IDS] instanceof Set)) {
+    const ids = new Set();
+    try {
+      const raw = globalThis.localStorage?.getItem?.(SIDE_BRANCH_IDS);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(parsed)) {
+        for (const id of parsed) if (typeof id === 'string' && id) ids.add(id);
+      }
+    } catch {
+      // node tests have no localStorage; a bad stored value must not break the pane.
+    }
+    globalThis[SIDE_BRANCH_IDS] = ids;
+  }
+  return globalThis[SIDE_BRANCH_IDS];
+}
+
+export function rememberSideBranch(id) {
+  if (typeof id !== 'string' || !id) return;
+  const ids = sideBranchIds();
+  if (ids.has(id)) return;
+  ids.add(id);
+  try {
+    globalThis.localStorage?.setItem?.(SIDE_BRANCH_IDS, JSON.stringify([...ids]));
+  } catch {
+    // Persistence is best effort.
+  }
+}
+
+export function isKnownSideBranch(id) {
+  return typeof id === 'string' && id !== '' && sideBranchIds().has(id);
+}
+
+export function isSideChat(row) {
+  return isSideTitle(row?.title) || isKnownSideBranch(row?.id);
+}
+
 // Session times are Unix seconds (SessionInfo.last_active).
 export function timeText(seconds) {
   const s = num(seconds);
@@ -347,7 +387,7 @@ export function createChatTree(deps) {
           children: [
             item.focused ? '● ' : '',
             str(row.title) || 'Untitled',
-            isSideTitle(row.title) ? jsx('span', { className: 'ml-1 text-xs opacity-60', style: SELECTABLE, children: '[side]' }) : null,
+            isSideChat(row) ? jsx('span', { className: 'ml-1 text-xs opacity-60', style: SELECTABLE, children: '[side]' }) : null,
           ].filter(Boolean),
         }),
         jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: parts.join(' · ') }),

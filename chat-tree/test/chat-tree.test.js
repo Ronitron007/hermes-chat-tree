@@ -10,6 +10,8 @@ import {
   routeFor,
   REFRESH_MS,
   LIST_LIMIT,
+  isSideChat,
+  rememberSideBranch,
 } from '../src/chat-tree.js';
 
 const el = (type, props, key) => ({ type, props, key });
@@ -541,6 +543,28 @@ test('open passes the owner: a profile for a local owner, a route for a remote o
     ['root', { intent: 'tab', route: { connectionId: 'src-a', mode: 'remote', profile: 'p', targetProfile: 'p' } }],
   ]);
   remote.unload();
+});
+
+test('a retitled side branch shows [side] only after its id is recorded', async () => {
+  const titled = setup();
+  await flush();
+  const b3 = chatNodes(titled.pane.render()).find((n) => n.props['data-session-id'] === 'b3');
+  assert.match(textOf(b3), /\[side\]/);
+  assert.equal(isSideChat({ id: 'b3', title: 'Side: what is x?' }), true);
+  titled.unload();
+
+  const id = 'local-90c423bb';
+  const ctx = setup({ host: fakeHost({ rows: [row(id, { title: 'Explain virtualenv' })], stored: id, runtime: 'rt-venv' }) });
+  await flush();
+  const before = chatNodes(ctx.pane.render()).find((n) => n.props['data-session-id'] === id);
+  assert.equal(before.props['data-session-id'], id);
+  assert.doesNotMatch(textOf(before), /\[side\]/);
+  assert.equal(isSideChat({ id, title: 'Explain virtualenv' }), false);
+  rememberSideBranch(id);
+  const after = chatNodes(ctx.pane.render()).find((n) => n.props['data-session-id'] === id);
+  assert.match(textOf(after), /\[side\]/);
+  assert.equal(isSideChat({ id, title: 'Explain virtualenv' }), true);
+  ctx.unload();
 });
 
 test('subagents of a chat on another profile or connection are not requested', async () => {
