@@ -46,3 +46,7 @@ date	decision	why	evidence	result	by
 2026-11-12 02:16	Merge and branch live as row icon actions with a two-step merge pick and a result line	Rohan chose the proposal of docs/research/2026-11-12-merge-ui-proposal.md	PR 45	chosen	Rohan
 2026-11-12 02:22	Make the repo public	The catalog loads the repo at the pinned SHA; gitleaks found no leaks	gitleaks over 86 commits	done	Rohan
 2026-11-12 02:41	Show branch names with a name row at each fork, and add a Branches mode	Options in docs/research/2026-11-12-branch-names.md	Brief D	chosen	Rohan
+2026-11-12 04:25	Show a status mark for every chat in the tree, from session.active_list	Rohan picked every chat in the tree over a separate live-chats list	session_registry.py:657-680	chosen	Rohan
+2026-11-12 04:35	Prime the branch with session.resume before config.set for the model	A new branch has no revision in Desktop, so config.set throws and the pick lasts one turn	canonical-protocol.ts:347; chat-tree.js:2279-2347	chosen	Claude
+2026-11-12 04:35	Reveal after data-session-switching clears, then correct the scroll each frame	A fixed 150 ms wait races the scroll restore, and placeholder heights move the target	list.tsx:468-485, 1140-1146; session-switching.ts:1-38	chosen	Claude
+2026-11-12 04:35	One fresh Opus review of all three units at the end	Rohan: we do the reviews in the end	chat with Rohan	chosen	Rohan
