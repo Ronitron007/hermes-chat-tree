@@ -28,3 +28,7 @@ date	decision	why	evidence	result	by
 2026-11-12 01:05	The user picks the branch model and reasoning level in ModelCatalogMenu; no assumed cheap model	Rohan: the user gets to choose	sdk/index.ts:1657, plugins/kanban/model-override.tsx, gateway/session_cli_turn.py:40-53	chosen	Rohan
 2026-11-12 01:05	model_override sends only model, provider, reasoning	Any other key fails with invalid_params	gateway/session_cli_turn.py:40-53	chosen	Claude
 2026-11-12 01:05	Inline styles for exact sizes and colours; Tailwind only for classes in the shipped CSS	Hermes builds Tailwind once over app source; plugin classes are never scanned	apps/desktop/dist/assets/main-D01CRUNp.css	chosen	Claude
+2026-11-12 01:10	Show the model pill only on the open node	Rohan's rule	chat with Rohan	chosen	Rohan
+2026-11-12 01:15	Digests go through a plugin RPC method and a session event	Hermes documents this path for a plugin frontend; the dashboard route trick is not documented	plugin-llm-access.md:332-414; sdk/index.ts:1331-1338	chosen; replaces the /digest route	Claude
+2026-11-12 01:22	The tree reads other chats through a plugin RPC method on hermes_state SessionDB	session.history answers only for chats in gateway memory, so the other lanes were empty in the live app	tui_gateway/session_registry.py:304-320; public-api.md:57	chosen	Claude
+2026-11-12 01:22	concept-links dashboard routes never mount (no dashboard/manifest.json)	Pre-existing; only the MDN click lookup fallback is lost	web_server_dashboard.py:628-630	low urgency; fix in its own session	Claude
