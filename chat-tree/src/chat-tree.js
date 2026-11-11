@@ -51,8 +51,11 @@ export function collapseLineages(rows) {
 // Children sort oldest first by started_at, else last_active (spec chat_tree_pane.behavior).
 export const sortTime = (row) => num(row?.started_at) || num(row?.last_active);
 
-// Every id a kept row answers to: its own id, its lineage root and chain ids, and the ids of
-// collapsed stale tips of its lineage (session-branch-tree.ts:93-116).
+// Every id a kept row answers to: its own id, its lineage root, and the ids of collapsed stale
+// tips of its lineage (session-branch-tree.ts:93-116). The `_lineage_ids` chain goes beyond the
+// sidebar rule on purpose: the server row of a compressed chat is its tip, with the chain
+// root..tip in `_lineage_ids` (hermes_state_session_list.py:20-44). A /branch made from a middle
+// segment names that segment; without the chain it would lose its parent and show as a root.
 function indexRows(input, rows) {
   const byId = new Map();
   for (const row of rows) {
@@ -93,7 +96,7 @@ export function findRoot(row, byId) {
   }
 }
 
-// Builds { root, focused } where each node is { row, children }. Each row is visited once.
+// Builds { root, focused, partial } where each node is { row, children }. Each row is visited once.
 // Returns null when the focused id is not in the list.
 export function buildTree(input, focusedId) {
   const all = (Array.isArray(input) ? input : []).filter((row) => row && typeof row.id === 'string' && row.id);
@@ -119,7 +122,11 @@ export function buildTree(input, focusedId) {
     for (const kid of children.get(row) ?? []) if (!seen.has(kid)) nodes.push(visit(kid));
     return { row, children: nodes };
   };
-  return { root: visit(findRoot(focusedRow, byId)), focused: focusedRow };
+  const rootRow = findRoot(focusedRow, byId);
+  // The top row names a parent that the page does not hold: older than the page, archived, or
+  // hidden. The real root is above it.
+  const missing = forkParentId(rootRow);
+  return { root: visit(rootRow), focused: focusedRow, partial: Boolean(missing && !byId.has(missing)) };
 }
 
 // Depth-first, flat: [{ depth, kind: 'chat', row, focused } | { depth, kind: 'subagent', agent }].
@@ -168,17 +175,33 @@ export function routeFor(owner) {
   return { connectionId, mode: connectionId === 'local' ? 'local' : 'remote', profile, targetProfile: profile };
 }
 
+// openSession options for the owner (sdk/index.ts:836-850, 922-934): an explicit route dials the
+// registry path, so a local owner passes only its profile, as the SDK's own local bot open does.
+export function openOptions(owner) {
+  const route = routeFor(owner);
+  if (route && route.mode === 'remote') return { intent: 'tab', route };
+  const profile = str(owner?.profile);
+  return profile ? { intent: 'tab', profile } : { intent: 'tab' };
+}
+
+const profileKey = (v) => str(v) || 'default'; // store/profile.ts normalizeProfileKey
+
 export function createChatTree(deps) {
   const { host, jsx, jsxs, atom, useValue, Button, ScrollArea } = deps;
 
   // rows: last good session rows. agents: last good subagents, for agentsFor (a runtime id).
   const $data = atom({ rows: [], agents: [], agentsFor: null });
-  const $status = atom({ loading: false, error: null });
+  // note: why live subagents are not shown (not an error).
+  const $status = atom({ loading: false, error: null, note: null });
   // Stand-in so the pane calls useValue the same number of times when host.state lacks an atom.
   const $none = atom(null);
 
+  // Per-activation state. register() resets it: a disable then enable calls register() again on
+  // the same module object (apps/desktop/src/contrib/runtime-loader.ts:499-512).
   let disposed = false;
   let generation = 0;
+  let inFlight = 0;
+  let activation = 0;
   let cancelTimer = null;
   let lastKey = null;
   let scopedTimeout = null;
@@ -186,6 +209,12 @@ export function createChatTree(deps) {
 
   const atomOf = (name) => host?.state?.[name] ?? $none;
   const runtimeId = () => atomOf('focusedSessionId').get() ?? atomOf('activeSessionId').get() ?? null;
+  // host.request goes to the active gateway only (sdk/index.ts:1507-1514). A chat owned by another
+  // profile or connection would ask the wrong backend.
+  const ownerIsActive = (owner) =>
+    Boolean(owner) &&
+    str(owner.connectionId) === str(atomOf('connectionId').get()) &&
+    profileKey(owner.profile) === profileKey(atomOf('profile').get());
 
   function schedule(fn, ms) {
     if (scopedTimeout) return scopedTimeout(fn, ms);
@@ -200,11 +229,23 @@ export function createChatTree(deps) {
   async function load() {
     if (disposed) return;
     const mine = ++generation;
+    const act = activation;
+    inFlight += 1;
+    try {
+      await loadOnce(mine);
+    } finally {
+      // A load from an earlier activation must not touch this activation's count.
+      if (act === activation) inFlight -= 1;
+    }
+  }
+
+  async function loadOnce(mine) {
     const stored = atomOf('focusedStoredSessionId').get();
     const runtime = runtimeId();
     const owner = atomOf('focusedSessionOwner').get();
-    if (!stored && !runtime) return $status.set({ loading: false, error: null });
+    if (!stored && !runtime) return $status.set({ loading: false, error: null, note: null });
     $status.set({ ...$status.get(), loading: true });
+    const agentsOk = ownerIsActive(owner);
 
     const errors = [];
     const sessions = (async () => {
@@ -215,7 +256,7 @@ export function createChatTree(deps) {
       return Array.isArray(result?.sessions) ? result.sessions : [];
     })();
     const agents = (async () => {
-      if (!runtime) return [];
+      if (!runtime || !agentsOk) return [];
       const result = await host.request('subagent.list', { session_id: runtime });
       return (Array.isArray(result?.subagents) ? result.subagents : []).map(cleanAgent).filter(Boolean);
     })();
@@ -230,7 +271,11 @@ export function createChatTree(deps) {
       next.agentsFor = runtime;
     } else errors.push(`Subagents: ${errorText(live.reason)}`);
     $data.set(next);
-    $status.set({ loading: false, error: errors.length ? errors.join('\n') : null });
+    $status.set({
+      loading: false,
+      error: errors.length ? errors.join('\n') : null,
+      note: agentsOk ? null : 'Subagents unavailable for this chat.',
+    });
   }
 
   const reload = () => {
@@ -239,9 +284,11 @@ export function createChatTree(deps) {
     });
   };
 
+  // A tick never cuts off a load still in flight: a source slower than the period would else
+  // never land (use-subagent-snapshot.ts:30 skips the same way). Focus changes still load.
   function tick() {
     if (disposed) return;
-    reload();
+    if (inFlight === 0) reload();
     cancelTimer = schedule(tick, REFRESH_MS);
   }
 
@@ -254,6 +301,8 @@ export function createChatTree(deps) {
       runtimeId(),
       str(owner?.connectionId),
       str(owner?.profile),
+      str(atomOf('connectionId').get()),
+      str(atomOf('profile').get()),
     ]);
     if (key === lastKey) return;
     lastKey = key;
@@ -262,8 +311,9 @@ export function createChatTree(deps) {
 
   function openChat(id) {
     if (!id || typeof host?.openSession !== 'function') return;
+    const options = openOptions(atomOf('focusedSessionOwner').get());
     Promise.resolve()
-      .then(() => host.openSession(id, { intent: 'tab' }))
+      .then(() => host.openSession(id, options))
       .then(null, () => {});
   }
 
@@ -339,7 +389,15 @@ export function createChatTree(deps) {
 
     let notice = null;
     if (!stored && !runtime) notice = 'Open a chat to see its tree.';
-    else if (!tree && !status.loading) notice = 'This chat is not in the session list yet.';
+    else if (!tree && !status.loading) {
+      // The page is the newest LIST_LIMIT rows by creation (sdk/index.ts:1446-1455, offset fixed at 0).
+      notice =
+        data.rows.length >= LIST_LIMIT
+          ? `This chat is older than the newest ${LIST_LIMIT} chats. Older chats are not loaded.`
+          : 'This chat is not in the session list yet.';
+    } else if (tree?.partial) {
+      notice = `Partial tree: the parent of the top chat is not loaded (older than the newest ${LIST_LIMIT} chats, archived, or hidden).`;
+    }
 
     return jsx(ScrollArea, {
       children: jsxs('div', {
@@ -362,6 +420,7 @@ export function createChatTree(deps) {
               })
             : null,
           notice ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: notice }) : null,
+          status.note ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: status.note }) : null,
           ...items.map((item) => (item.kind === 'chat' ? chatLine(item) : agentLine(item))),
         ].filter(Boolean),
       }),
@@ -384,14 +443,22 @@ export function createChatTree(deps) {
   }
 
   function register(ctx) {
+    // A second register() (disable, then enable) starts clean: drop the old activation first.
+    if (!disposed) dispose();
+    disposed = false;
+    generation += 1;
+    activation += 1;
+    inFlight = 0;
+    lastKey = null;
+    scopedTimeout = null;
+    $status.set({ loading: false, error: null, note: null });
     // ctx.setTimeout: the host clears it on unload (apps/desktop/src/contrib/plugin.ts).
     if (typeof ctx?.setTimeout === 'function') scopedTimeout = (fn, ms) => ctx.setTimeout(fn, ms);
     if (typeof ctx?.onDispose === 'function') ctx.onDispose(dispose);
-    for (const name of ['focusedStoredSessionId', 'focusedSessionId', 'activeSessionId', 'focusedSessionOwner']) {
+    for (const name of ['focusedStoredSessionId', 'focusedSessionId', 'activeSessionId', 'focusedSessionOwner', 'connectionId', 'profile']) {
       const store = host?.state?.[name];
       if (typeof store?.listen === 'function') unsubscribers.push(store.listen(onFocus));
     }
-    lastKey = null;
     onFocus();
     cancelTimer = schedule(tick, REFRESH_MS);
     ctx.register({

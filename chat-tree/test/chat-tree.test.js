@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import {
   createChatTree,
   buildTree,
@@ -82,7 +83,7 @@ const ROWS = [
   row('r2', { parent_session_id: 'root', _reset_from: 'root', started_at: 40 }),
 ];
 
-function fakeHost({ rows = ROWS, stored = 'b2', runtime = 'rt-b2', owner = { connectionId: 'local', profile: 'default' }, agents = [] } = {}) {
+function fakeHost({ rows = ROWS, stored = 'b2', runtime = 'rt-b2', owner = { connectionId: 'local', profile: 'default' }, agents = [], active = { connectionId: 'local', profile: 'default' } } = {}) {
   const calls = [];
   const opened = [];
   const state = {
@@ -90,6 +91,8 @@ function fakeHost({ rows = ROWS, stored = 'b2', runtime = 'rt-b2', owner = { con
     focusedSessionId: atom(runtime),
     activeSessionId: atom(null),
     focusedSessionOwner: atom(owner),
+    connectionId: atom(active.connectionId),
+    profile: atom(active.profile),
   };
   const host = {
     state,
@@ -160,6 +163,8 @@ const textOf = (node) =>
 
 const chatNodes = (tree) => findAll(tree, (n) => n.props?.['data-session-id']);
 const outline = (items) => items.map((i) => `${'  '.repeat(i.depth)}${i.kind === 'chat' ? i.row.id : `@${i.agent.subagent_id}`}`);
+// A test timeout cannot stop a synchronous endless loop; the vm watchdog can.
+const bounded = (fn) => vm.runInNewContext('fn()', { fn }, { timeout: 2000 });
 const listCalls = (host) => host.calls.filter(([m]) => m === 'listPersistedSessions').length;
 
 test('parent rule: _reset_from wins, then _branched_from, then parent_session_id', () => {
@@ -176,14 +181,29 @@ test('a _reset_from row is a top-level root, not a child of its predecessor', ()
   assert.ok(!outline(flattenTree(rootTree)).some((line) => line.trim() === 'r2'));
 });
 
-test('one row for each compression lineage, and branches of a stale tip nest under the survivor', () => {
+// Server shape (hermes_state_session_list.py:20-44): one row per compression lineage. Its id is
+// the tip, `_lineage_root_id` the root, `_lineage_ids` the chain root..tip.
+const COMPRESSED = row('tip', {
+  _lineage_root_id: 'seg0',
+  _lineage_ids: ['seg0', 'seg1', 'tip'],
+  continuation_kind: 'compression',
+  started_at: 10,
+});
+
+test('a branch made from a middle compression segment nests under the lineage row', () => {
+  const rows = [COMPRESSED, row('br', { _branched_from: 'seg1', started_at: 50 }), row('br0', { _branched_from: 'seg0', started_at: 40 })];
+  assert.deepEqual(outline(flattenTree(buildTree(rows, 'br'))), ['tip', '  br0', '  br']);
+  // A focused id that is an older segment maps to the lineage row.
+  assert.equal(buildTree(rows, 'seg1').focused.id, 'tip');
+});
+
+test('stale tips of one lineage in the desktop store collapse to one row', () => {
   const rows = [
-    row('seg1', { _lineage_root_id: 'seg1', last_active: 100 }),
-    row('seg2', { _lineage_root_id: 'seg1', parent_session_id: 'seg1', last_active: 300 }),
+    row('seg1', { _lineage_root_id: 'seg0', last_active: 100 }),
+    row('seg2', { _lineage_root_id: 'seg0', parent_session_id: 'seg1', last_active: 300 }),
     row('br', { _branched_from: 'seg1', started_at: 50 }),
   ];
   assert.deepEqual(collapseLineages(rows).map((r) => r.id), ['seg2', 'br']);
-  // The focused id can be an older segment: it maps to the survivor.
   assert.deepEqual(outline(flattenTree(buildTree(rows, 'seg1'))), ['seg2', '  br']);
 });
 
@@ -194,9 +214,12 @@ test('the root walk goes up from a deep branch to the oldest ancestor', () => {
   assert.deepEqual(outline(flattenTree(tree)), ['root', '  b3', '  b1', '    b2']);
 });
 
-test('the walk stops at a parent that is not in the list', () => {
+test('the walk stops at a parent that is not in the list, and marks the tree partial', () => {
   const rows = [row('orphan', { _branched_from: 'gone' }), row('kid', { _branched_from: 'orphan' })];
-  assert.deepEqual(outline(flattenTree(buildTree(rows, 'kid'))), ['orphan', '  kid']);
+  const tree = buildTree(rows, 'kid');
+  assert.deepEqual(outline(flattenTree(tree)), ['orphan', '  kid']);
+  assert.equal(tree.partial, true);
+  assert.equal(buildTree(ROWS, 'b2').partial, false);
 });
 
 test('children sort oldest first, with last_active when started_at is missing', () => {
@@ -209,13 +232,13 @@ test('children sort oldest first, with last_active when started_at is missing', 
   assert.deepEqual(outline(flattenTree(buildTree(rows, 'p'))), ['p', '  early', '  fallback', '  late']);
 });
 
-test('a parent cycle ends with no loop and shows each row once', () => {
+test('a parent cycle ends with no loop and shows each row once', { timeout: 2000 }, () => {
   const rows = [row('a', { _branched_from: 'c' }), row('b', { _branched_from: 'a' }), row('c', { _branched_from: 'b' })];
-  const items = flattenTree(buildTree(rows, 'b'));
+  const items = bounded(() => flattenTree(buildTree(rows, 'b')));
   assert.equal(items.length, 3);
   assert.deepEqual(new Set(items.map((i) => i.row.id)), new Set(['a', 'b', 'c']));
   const self = [row('s', { _branched_from: 's' })];
-  assert.deepEqual(outline(flattenTree(buildTree(self, 's'))), ['s']);
+  assert.deepEqual(outline(bounded(() => flattenTree(buildTree(self, 's')))), ['s']);
 });
 
 test('the focused chat not in the list gives no tree', () => {
@@ -234,7 +257,8 @@ test('routeFor builds a full route from the owner; a missing connection id gives
 });
 
 test('register loads sessions for the owner profile and subagents for the runtime id', async () => {
-  const ctx = setup({ host: fakeHost({ owner: { connectionId: 'src-a', profile: 'work' } }) });
+  const owner = { connectionId: 'src-a', profile: 'work' };
+  const ctx = setup({ host: fakeHost({ owner, active: owner }) });
   await flush();
   const [, route, options] = ctx.host.calls.find(([m]) => m === 'listPersistedSessions');
   assert.deepEqual(options, { profile: 'work', limit: LIST_LIMIT });
@@ -298,8 +322,8 @@ test('a click on a chat node opens it in a tab; a subagent opens its child sessi
   assert.equal(sa2.props.onClick, undefined);
   await flush();
   assert.deepEqual(ctx.host.opened, [
-    ['b1', { intent: 'tab' }],
-    ['child-1', { intent: 'tab' }],
+    ['b1', { intent: 'tab', profile: 'default' }],
+    ['child-1', { intent: 'tab', profile: 'default' }],
   ]);
   ctx.unload();
 });
@@ -447,5 +471,85 @@ test('each render calls the same hooks in the same order (React error 300)', asy
     assert.equal(s.length, 5);
     assert.deepEqual(s, states[0]);
   }
+  ctx.unload();
+});
+
+test('a source slower than the refresh period still shows its tree', async () => {
+  const host = fakeHost();
+  const base = host.listPersistedSessions;
+  const clock = fakeClock();
+  host.listPersistedSessions = (route, options) =>
+    new Promise((resolve) => clock.setTimeout(() => resolve(base(route, options)), 20_000));
+  const ctx = setup({ host, clock });
+  await clock.tick(55_000); // loads at 0-20 s and 30-50 s; the ticks at 15 s and 45 s are skipped
+  assert.equal(ctx.tree.$data.get().rows.length, ROWS.length);
+  assert.equal(ctx.tree.$status.get().loading, false);
+  ctx.unload();
+});
+
+test('register after dispose (disable, then enable) works again', async () => {
+  const host = fakeHost();
+  const clock = fakeClock();
+  const ctx = setup({ host, clock });
+  await flush();
+  ctx.unload();
+  const disposers = [];
+  ctx.tree.register({ register: () => {}, setTimeout: clock.setTimeout, onDispose: (fn) => disposers.push(fn) });
+  await flush();
+  const before = listCalls(host);
+  host.state.focusedStoredSessionId.set('b1');
+  await flush();
+  assert.equal(listCalls(host), before + 1);
+  await clock.tick(REFRESH_MS);
+  assert.equal(listCalls(host), before + 2);
+  // One listener per atom, not two.
+  assert.equal(host.state.focusedStoredSessionId.listeners(), 1);
+  disposers.forEach((fn) => fn());
+  assert.equal(clock.pending(), 0);
+});
+
+test('a focused chat missing from a full page says older chats are not loaded', async () => {
+  const rows = Array.from({ length: LIST_LIMIT }, (_, i) => row(`n${i}`));
+  const ctx = setup({ host: fakeHost({ rows, stored: 'old' }) });
+  await flush();
+  const text = textOf(ctx.pane.render());
+  assert.match(text, /older than the newest 500/);
+  assert.doesNotMatch(text, /not in the session list yet/);
+  ctx.unload();
+});
+
+test('a tree whose top parent is missing shows a partial note', async () => {
+  const rows = [row('orphan', { _branched_from: 'gone' }), row('kid', { _branched_from: 'orphan' })];
+  const ctx = setup({ host: fakeHost({ rows, stored: 'kid' }) });
+  await flush();
+  assert.match(textOf(ctx.pane.render()), /Partial tree/);
+  ctx.unload();
+});
+
+test('open passes the owner: a profile for a local owner, a route for a remote owner', async () => {
+  const local = setup({ host: fakeHost({ owner: { connectionId: 'local', profile: 'work' }, active: { connectionId: 'local', profile: 'work' } }) });
+  await flush();
+  chatNodes(local.pane.render())[0].props.onClick();
+  await flush();
+  assert.deepEqual(local.host.opened, [['root', { intent: 'tab', profile: 'work' }]]);
+  local.unload();
+  const remote = setup({ host: fakeHost({ owner: { connectionId: 'src-a', profile: 'p' }, active: { connectionId: 'src-a', profile: 'p' } }) });
+  await flush();
+  chatNodes(remote.pane.render())[0].props.onClick();
+  await flush();
+  assert.deepEqual(remote.host.opened, [
+    ['root', { intent: 'tab', route: { connectionId: 'src-a', mode: 'remote', profile: 'p', targetProfile: 'p' } }],
+  ]);
+  remote.unload();
+});
+
+test('subagents of a chat on another profile or connection are not requested', async () => {
+  const agents = [{ subagent_id: 'sa', goal: 'g', status: 'running' }];
+  const ctx = setup({ host: fakeHost({ agents, owner: { connectionId: 'local', profile: 'other' } }) });
+  await flush();
+  assert.equal(ctx.host.calls.filter(([m]) => m === 'subagent.list').length, 0);
+  const tree = ctx.pane.render();
+  assert.match(textOf(tree), /Subagents unavailable for this chat/);
+  assert.equal(findAll(tree, (n) => n.props?.['data-subagent-id']).length, 0);
   ctx.unload();
 });
