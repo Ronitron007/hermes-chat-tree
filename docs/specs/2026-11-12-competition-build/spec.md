@@ -6,13 +6,11 @@ Decision tree: [decision-tree.md](decision-tree.md). Trail: [decisions.tsv](deci
 
 ## What ships `build.outcome`
 
-A Hermes Desktop entry with three plugins in this repo:
+The entry lives in one window: the `chat-tree` pane, a git graph of a chat and its branches (Rohan, 2026-11-12 00:24). A side chat is not a separate pane. It is a branch lane in the graph. From the pane, the user can branch at an exchange, ask the branch a question on a cheaper model, open any chat, and merge a branch back into its parent.
 
-- `chat-tree`: a git-graph tree of a chat and its side chats, in a side pane.
+`concept-links` ships beside it: chips on terms in replies, with definitions in its own pane.
 
-- `side-chat`: ask a side question in a fork, on a cheaper model, and merge the answer back.
-
-- `concept-links`: chips on terms in replies, with definitions in a side pane.
+The `side-chat` pane is not part of the entry. Its fork, ask, and merge code moves into `chat-tree` in `unit.tree_actions`.
 
 The entry uses only the Hermes plugin framework of today (Rohan, 2026-11-11). It changes no Hermes code.
 
@@ -96,11 +94,17 @@ Make the repo installable and reviewable as an entry. Files: `side-chat/plugin.y
 
 Check: `npm test` exits 0, `node dev/render.mjs` writes the HTML files, and `hermes plugins validate` passes on each plugin directory.
 
-## Unit `unit.tree_merge`
+## Unit `unit.tree_actions`
 
-After `unit.tree_view` and `unit.merge_modes` merge, give the tree's merge action the same modes, markup removal, and notice. Copy the helpers, because each plugin is one bundle with no imports.
+After `unit.tree_view` merges, put the actions in the tree pane. This unit replaces `unit.tree_merge`.
 
-Check: `npm test` exits 0, and new tests cover the tree merge modes.
+- Branch here: an action on each exchange of the open chat. It shows a small form in the pane: a question and a model, with a cheap model as the default. It forks the chat at that exchange with `session.branch` and `count`, sends the question with `prompt.submit` and `model_override`, and opens the branch in place.
+
+- Merge back: an action on each branch lane. It shows the mode picker (Full text, Merge record, Digest), the fit check, and the notice that stays until dismissed. It stages the text in the parent's composer with `host.composer.setDraft`, opens the parent, and never sends.
+
+- Copy the merge helpers from `side-chat/src/side-chat.js` (`formatMergeText`, `stripConceptMarkup`, `formatNoFitNotice`, and the modes), because each plugin is one bundle with no imports.
+
+Check: `npm test` and `npm run assemble:chat-tree` exit 0, and new tests cover branch here (the `count` value and the payloads), each merge mode, and the notice.
 
 ## Unit `unit.verify`
 
@@ -111,6 +115,8 @@ Integrate on `outbox/competition-entry`. Run all tests, assemble all bundles, re
 - Opus implements each unit. A fresh Opus reviewer reviews each unit. A unit merges into `outbox/competition-entry` only when its checks pass and no finding is open.
 
 - `unit.tree_view`, `unit.merge_modes`, and `unit.entry_package` run in parallel. They touch different files.
+
+- There is no review for each unit. One review of the whole build runs at the end (Rohan, 2026-11-12 00:22).
 
 - No agent calls a model, starts Hermes Desktop, or writes to `~/.hermes`.
 
