@@ -1,11 +1,17 @@
 name: chat-tree
 label: Chat Tree
+kind: standalone
 version: 0.1.0
 author: Rohan Malik
 license: MIT
 description: >
-  A git-graph tree of the open chat, its forks and its side chats, in a side
-  pane. Each node is one exchange. Blue marks the path to the open node and
-  grey marks the rest. A click opens that node's chat. Desktop only
-  (desktop/plugin.js); no agent tools, hooks, middleware or env vars.
+  A git-graph tree of the open chat and its branches, in a side pane of Hermes
+  Desktop (desktop/plugin.js). This Python half serves one plugin RPC method,
+  plugin.chat-tree.digest.write. It answers with a job id at once, asks the
+  model through ctx.llm.complete_structured in a thread, and sends the digest
+  as the session event plugin.chat-tree.digest.written. The digests use the
+  chat_tree_digest auxiliary task, which follows the title generation model
+  until you set auxiliary.chat_tree_digest. No agent tools, hooks or env vars.
+provides_tools: []
+provides_hooks: []
 requires_hermes: ">=0.23"
