@@ -1435,9 +1435,12 @@ const CHIP = { ...SELECTABLE, maxWidth: 140, minWidth: 0, justifyContent: 'flex-
 // The row icons: Hermes's own Branch in new chat button draws GitForkIcon at size-3.5, 14 px
 // (components/assistant-ui/thread/assistant-message.tsx:1418); the SDK exports it as icons.GitForkIcon.
 const BRANCH_GLYPH = { flex: '0 0 auto', width: 14, height: 14 };
-// A name row: the fork icon at 12 px, the chat title in 12 px muted text, then its model, muted.
+// A name row: the fork icon at 12 px, the chat title in 14 px muted text, then its model, muted.
+// The name is bigger than the node text (Rohan, 2026-11-12 04:50).
 const NAME_GLYPH = { flex: '0 0 auto', width: 12, height: 12, color: MUTED };
-const NAME_TEXT = { fontSize: 12, color: MUTED };
+const NAME_TEXT = { fontSize: 14, color: MUTED };
+// A node row's label: 12 px, smaller than the name rows.
+const NODE_TEXT = { fontSize: 12 };
 const NAME_MODEL = { ...SELECTABLE, flex: '0 0 auto', maxWidth: 72, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: MUTED };
 // A status mark: a 6 px dot, filled in the status colour, hollow while starting. The exchanges view
 // keeps a fixed slot for it on each lane's last row (empty when done), the branches view a fixed box
@@ -2737,7 +2740,7 @@ export function createChatTree(deps) {
     const children = [
       jsx(
         'span',
-        { style: { ...LABEL_STYLE, ...(row.blue ? {} : { opacity: 0.72 }), ...(row.open ? { fontWeight: 600 } : {}) }, 'data-selectable-text': 'true', 'data-label': 'true', children: row.label },
+        { style: { ...LABEL_STYLE, ...NODE_TEXT, ...(row.blue ? {} : { opacity: 0.72 }), ...(row.open ? { fontWeight: 600 } : {}) }, 'data-selectable-text': 'true', 'data-label': 'true', children: row.label },
         'label',
       ),
     ];
