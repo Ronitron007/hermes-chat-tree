@@ -28,6 +28,8 @@ The user opens the "Side chat" pane beside a chat. The user types a side questio
 
 9. All text in the pane allows selection (`userSelect: 'text'`). The spike log did not allow it.
 
+10. The pane renders an answer as markdown with the SDK component `MessageTextContent` (`apps/desktop/src/sdk/index.ts:1685`), the same renderer as chat messages. If the SDK does not have the component, the pane shows the plain text. Added 2026-11-11 after the first run showed raw `**` and code fences.
+
 ## Code layout `side_chat.layout`
 
 - `side-chat/src/side-chat.js`: a factory `createSideChat(deps)` with no imports. `deps` holds `host`, `jsx`, `jsxs`, `atom`, `useValue`, the SDK components, `setTimeout`, `clearTimeout`, and `now`. This follows `src/plugin-factory.js`.
