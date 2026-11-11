@@ -344,7 +344,13 @@ export function createSideChat(deps) {
         jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: `${modelText} · ${when}` }),
         // Answers use the chat's own markdown renderer when the SDK has it.
         entry.status === 'answered' && MessageTextContent
-          ? jsx('div', { className: 'text-sm', style: SELECTABLE, children: jsx(MessageTextContent, { text: entry.answer ?? '' }) })
+          ? jsx('div', {
+              className: 'text-sm',
+              style: SELECTABLE,
+              'data-selectable-text': 'true',
+              // media off: outside a chat, MEDIA: paths resolve against the primary session, not the branch.
+              children: jsx(MessageTextContent, { text: entry.answer ?? '', media: false }),
+            })
           : jsx('pre', { className: 'text-sm', style: PRE_STYLE, children: statusText(entry) }),
         entry.diag && (entry.status === 'asking' || entry.status === 'answered' || entry.status === 'timeout')
           ? jsx('p', { className: 'text-xs opacity-60', style: SELECTABLE, children: diagText(entry.diag) })

@@ -726,6 +726,7 @@ test('an answer renders through MessageTextContent when the SDK has it, else as 
   const md = findAll(expand(rich.pane.render()), (n) => n.type === MessageTextContent);
   assert.equal(md.length, 1);
   assert.equal(md[0].props.text, '**bold**');
+  assert.equal(md[0].props.media, false);
 
   const plain = setup({ storage: asyncStorage({ [listKey('st-main')]: stored }) });
   await flush();
