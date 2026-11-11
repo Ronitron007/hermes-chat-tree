@@ -1,8 +1,0 @@
-{
-  "name": "chat-tree",
-  "label": "Chat Tree",
-  "description": "Backend routes for the Chat Tree Desktop pane. No dashboard tab.",
-  "version": "0.1.0",
-  "tab": { "hidden": true },
-  "api": "plugin_api.py"
-}
