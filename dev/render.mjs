@@ -168,11 +168,14 @@ function page(title, width, markup) {
   tailwind.config = { darkMode: 'class', theme: { extend: { colors: { muted: '#27272a', destructive: '#f87171' } } } };
 </script>
 <style>
-  body { margin: 0; background: #09090b; color: #e4e4e7; font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif; }
-  .pane { width: ${width}; min-height: 100vh; background: #18181b; border-left: 1px solid #27272a; margin-left: auto; }
+  /* The pane sits at the left edge and the body is exactly as wide as the pane, so a narrow
+     headless screenshot (npm run render:png, 380 px) holds the whole pane. */
+  html, body { margin: 0; padding: 0; background: #09090b; }
+  body { width: ${width}; color: #e4e4e7; font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  .pane { box-sizing: border-box; width: ${width}; min-height: 100vh; margin: 0; background: #18181b; overflow-wrap: anywhere; }
   .pane-title { padding: 8px 12px; font-weight: 600; border-bottom: 1px solid #27272a; }
-  button { border: 1px solid #3f3f46; border-radius: 4px; padding: 1px 6px; background: #27272a; color: inherit; font: inherit; }
-  input { width: 100%; box-sizing: border-box; border: 1px solid #3f3f46; border-radius: 4px; padding: 4px 6px; background: #09090b; color: inherit; font: inherit; }
+  .pane button { border: 1px solid #3f3f46; border-radius: 4px; padding: 1px 6px; background: #27272a; color: inherit; font: inherit; }
+  .pane input { width: 100%; box-sizing: border-box; border: 1px solid #3f3f46; border-radius: 4px; padding: 4px 6px; background: #09090b; color: inherit; font: inherit; }
 </style>
 </head>
 <body>

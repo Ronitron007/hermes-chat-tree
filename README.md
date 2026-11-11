@@ -24,11 +24,11 @@ The entry uses only the public plugin framework of Hermes. It changes no Hermes 
 
   - **Full text** (the default) copies each question and answer of the side chat.
 
-  - **Merge record** writes the side chat title and its id only.
+  - **Merge record** writes the header line and the side chat id only.
 
   - **Digest** writes the side question and the final answer of the side chat.
 
-- Each merge text starts with the line `From side chat: <title>`. The tree uses this line to draw the merge.
+- Each merge text starts with the header line `From side chat: <side question>`. The side question is the first question that the pane sent to the side chat. The tree uses this line to draw the merge.
 
 - The merge removes concept-link markup from the text and keeps the plain sentences.
 
@@ -105,16 +105,17 @@ The render harness renders the real pane code with fixture chats to static HTML 
 
 ```bash
 npm install
-npm run render     # writes dev/out/chat-tree.html and dev/out/side-chat.html
+npm run render        # writes dev/out/chat-tree.html and dev/out/side-chat.html
+npm run render:png    # also writes dev/out/chat-tree.png and dev/out/side-chat.png
 ```
 
-Open the files in a browser. The fixture chats are in `dev/fixtures/chats.json`.
+Open the files in a browser. `render:png` needs Google Chrome in `/Applications`. The fixture chats are in `dev/fixtures/chats.json`.
 
 ## Limits
 
 - Hermes has no API to scroll a chat to one message. A click on a node opens the chat of that node, at its usual scroll position.
 
-- A merge is staged in the composer. The pane never sends it.
+- The pane puts a merge in the main chat composer. It never sends it.
 
 - Digest is the side question and its final answer. No model writes a summary.
 
@@ -130,10 +131,9 @@ Open the files in a browser. The fixture chats are in `dev/fixtures/chats.json`.
 
 | | study-tree | This entry |
 |---|---|---|
-| Where you ask | In the main chat. An agent tool parks the question. | In a side pane. The main chat gets no message. |
-| Parts | An agent half (tools, hooks, a skill) and a Desktop half | Desktop only for side-chat and chat-tree |
-| What comes back | One checked takeaway sentence | Full text, Merge record, or Digest, as you choose |
-| How it comes back | The plugin puts the takeaway in the main thread | The text waits in the composer. You send it. |
+| Where you ask | In the main chat, through an agent tool | In a side pane, not in the main chat |
+| Parts | Agent tools, hooks, a skill, and a Desktop half | Desktop only for side-chat and chat-tree |
+| What comes back | The plugin adds one checked takeaway | You send Full text, Merge record, or Digest |
 | Tree | Side threads as a tree | One node for each exchange, with exact fork points and merge curves |
 
 ## Credits

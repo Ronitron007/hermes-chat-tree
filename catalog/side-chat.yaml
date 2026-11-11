@@ -17,7 +17,7 @@ tier: community
 category: desktop
 requires_hermes: ">=0.23"
 version: "0.1.0"
-docs_url: https://github.com/Ronitron007/hermes-concept-links#readme
+docs_url: https://github.com/Ronitron007/hermes-concept-links/tree/main/side-chat#readme
 readme: true
 platforms: []
 known_issues:

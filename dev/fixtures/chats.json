@@ -98,7 +98,7 @@
       },
       {
         "role": "user",
-        "content": "From side chat: Side: Explain virtualenv\n\nYou:\nExplain virtualenv\n\nAssistant:\nA virtualenv is a folder with its own Python interpreter and its own site-packages. Packages you install while it is active go into that folder, not into the system Python.\n\nCreate one with `python -m venv .venv`, activate it with `source .venv/bin/activate`, and leave it with `deactivate`. Build and upload tools such as `build` and `twine` then stay out of your global install.",
+        "content": "From side chat: Explain virtualenv\n\nYou:\nExplain virtualenv\n\nAssistant:\nA virtualenv is a folder with its own Python interpreter and its own site-packages. Packages you install while it is active go into that folder, not into the system Python.\n\nCreate one with `python -m venv .venv`, activate it with `source .venv/bin/activate`, and leave it with `deactivate`. Build and upload tools such as `build` and `twine` then stay out of your global install.",
         "timestamp": 1794424440
       },
       {
@@ -222,7 +222,7 @@
       },
       {
         "role": "user",
-        "content": "From side chat: Side: Explain virtualenv\n\nYou:\nExplain virtualenv\n\nAssistant:\nA virtualenv is a folder with its own Python interpreter and its own site-packages. Packages you install while it is active go into that folder, not into the system Python.\n\nCreate one with `python -m venv .venv`, activate it with `source .venv/bin/activate`, and leave it with `deactivate`. Build and upload tools such as `build` and `twine` then stay out of your global install.",
+        "content": "From side chat: Explain virtualenv\n\nYou:\nExplain virtualenv\n\nAssistant:\nA virtualenv is a folder with its own Python interpreter and its own site-packages. Packages you install while it is active go into that folder, not into the system Python.\n\nCreate one with `python -m venv .venv`, activate it with `source .venv/bin/activate`, and leave it with `deactivate`. Build and upload tools such as `build` and `twine` then stay out of your global install.",
         "timestamp": 1794424440
       },
       {
@@ -304,7 +304,7 @@
       },
       {
         "role": "user",
-        "content": "From side chat: Side: Explain virtualenv\n\nYou:\nExplain virtualenv\n\nAssistant:\nA virtualenv is a folder with its own Python interpreter and its own site-packages. Packages you install while it is active go into that folder, not into the system Python.\n\nCreate one with `python -m venv .venv`, activate it with `source .venv/bin/activate`, and leave it with `deactivate`. Build and upload tools such as `build` and `twine` then stay out of your global install.",
+        "content": "From side chat: Explain virtualenv\n\nYou:\nExplain virtualenv\n\nAssistant:\nA virtualenv is a folder with its own Python interpreter and its own site-packages. Packages you install while it is active go into that folder, not into the system Python.\n\nCreate one with `python -m venv .venv`, activate it with `source .venv/bin/activate`, and leave it with `deactivate`. Build and upload tools such as `build` and `twine` then stay out of your global install.",
         "timestamp": 1794424440
       },
       {
