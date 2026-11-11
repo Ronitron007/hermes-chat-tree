@@ -65,6 +65,13 @@ flowchart TD
   NM -->|chosen, Rohan 00:58| NM1[Hermes names chats, the plugin never passes name]
   NM -->|dropped| NM2[Plugin names branches]
   F2 --> FD[Fork digest: the part above the fork, via ctx.llm]
+  M6 --> DR{How the pane reaches ctx.llm}
+  DR -->|chosen 01:15| DR1[Plugin RPC digest.write plus a session event, as Hermes documents]
+  DR -->|dropped 01:15| DR2[Dashboard route with a shared module, not documented]
+  W1 --> HR{How the tree reads other chats}
+  HR -->|dropped 01:22| HR1[session.history: answers only for chats in memory]
+  HR -->|chosen 01:22| HR2[Plugin RPC history.read on hermes_state SessionDB]
+  W1 --> PL[Model pill only on the open node, Rohan 01:10]
   F2 --> BM{Branch model}
   BM -->|chosen, Rohan 01:05| BM1[User picks in ModelCatalogMenu: model, provider, reasoning]
   BM -->|dropped| BM2[Assume a cheap model]
