@@ -3,10 +3,14 @@
 // exchange they share. A parent exchange that starts with `From side chat: <side question>` is a
 // merge node, linked by a curve to the one child chat that starts with that question. Blue marks the path from the
 // first exchange of the root chat to the open node; everything else is grey. A click on a node
-// opens its chat in place. Side chats keep a Merge as-is button that stages the side exchange
-// verbatim in the parent composer (never sends it). Live subagents show below the graph.
+// opens its chat in place. Every action lives in this pane. Branch here on an exchange of the open
+// chat forks it there (session.branch with count) and asks the branch a question (prompt.submit).
+// One merge section for the open chat stages it, as is or as a digest, in the composer of the
+// parent or any older ancestor. It never sends. Digests come from this plugin's Python half: the
+// plugin RPC plugin.chat-tree.digest.write answers { job }, and the gateway event
+// plugin.chat-tree.digest.written brings { job, digest } or { job, error }. Live subagents show below the graph.
 // Plain ESM with no imports: the SDK pieces and timers are injected so it runs under node --test.
-// Spec: docs/specs/2026-11-12-competition-build/spec.md (unit.tree_view)
+// Spec: docs/specs/2026-11-12-competition-build/spec.md (unit.tree_view, unit.tree_actions)
 
 export const PLUGIN_ID = 'chat-tree';
 export const PANE_ID = 'pane';
@@ -31,6 +35,24 @@ export const MERGE_STAGED_TEXT =
   'The draft is in the main chat composer. Edit it and send. After sending, session.undo on an idle parent can drop that turn.';
 export const MERGE_HIDDEN_TEXT = "The main chat's composer is not visible. Open the main chat and try again.";
 export const MERGE_NO_COMPOSER_TEXT = 'The composer draft API is missing. Nothing was written.';
+export const MERGE_ROOT_TEXT = 'This is the root chat. It has no parent chat to merge into.';
+export const MERGE_PARENT_MISSING_TEXT = 'The parent of this chat is not loaded. There is no chat to merge into.';
+export const MERGE_NOTHING_TEXT = 'Nothing to merge: this chat has no question and answer of its own after its fork point.';
+export const DIGEST_MISSING_TEXT = 'The digest backend is not available (the chat-tree Python half is not enabled). Nothing was staged.';
+export const DIGEST_TIMEOUT_TEXT = 'No digest came back in 60 seconds.';
+export const BRANCH_BUSY_TEXT = 'This chat is running. Branch here works again when the run ends.';
+// ctx.storage keys (stored as hermes.plugin.chat-tree.<key>). BRANCH_IDS_KEY lists the ids of the
+// branches this pane made. MODEL_KEY is the last branch model. A fork digest sits under digestKey.
+export const BRANCH_IDS_KEY = 'branchIds';
+export const MODEL_KEY = 'branchModel';
+export const digestKey = (chatId, index) => `digest:${chatId}:${index}`;
+// The digest contract with the plugin's Python half. The request answers { job } at once; the
+// result comes as a gateway event to the clients that view session_id, matched on job.
+export const DIGEST_METHOD = 'plugin.chat-tree.digest.write';
+export const DIGEST_EVENT = 'plugin.chat-tree.digest.written';
+export const DIGEST_TIMEOUT_MS = 60_000;
+// side-chat's saved side model, read raw: the branch form's default before this pane saves its own.
+const SIDE_CHAT_MODEL_STORAGE = 'hermes.plugin.side-chat.sideChat:model';
 
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text' };
 const HISTORY_CONCURRENCY = 4;
@@ -39,6 +61,10 @@ const HISTORY_CACHE_MAX = 200;
 const str = (v) => (typeof v === 'string' ? v.trim() : '');
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
 const errorText = (error) => str(error?.message) || str(error) || 'Unknown error';
+const isThenable = (v) => v != null && typeof v.then === 'function';
+// Copied from side-chat: the gateway refuses a mutation it cannot run now as reason `session_busy`
+// (hermes_state_mutation_guards.py busy_refusal; a branch needs an idle chat, hermes_state_mutation_branch.py:58).
+const isBusy = (error) => /busy/i.test(`${error?.data?.reason ?? ''} ${errorText(error)}`);
 
 // ── Pure tree logic (ported from apps/desktop/src/lib/session-branch-tree.ts) ──────────────
 
@@ -217,8 +243,12 @@ export function isKnownSideBranch(id) {
   return typeof id === 'string' && id !== '' && idSet(SIDE_BRANCH_IDS).has(id);
 }
 
-export function isSideChat(row) {
-  return isSideTitle(row?.title) || isKnownSideBranch(row?.id);
+// A side chat: a branch this pane made (ids: its stored branch ids, a Set or an array). The old
+// marks are a read fallback only: a `Side: ` title, or an id side-chat recorded on globalThis.
+export function isSideChat(row, ids) {
+  const id = row?.id;
+  if (typeof id === 'string' && id && (ids instanceof Set ? ids.has(id) : Array.isArray(ids) && ids.includes(id))) return true;
+  return isSideTitle(row?.title) || isKnownSideBranch(id);
 }
 
 // ── Merge-back helpers (copied from side-chat/src/side-chat.js; plugins cannot import each other) ──
@@ -231,16 +261,6 @@ export function rowText(row) {
   if (typeof content === 'string') return content.trim();
   if (!Array.isArray(content)) return '';
   return content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('').trim();
-}
-
-// A side chat is a copy of its parent, then its own turns. Walk both lists from the start while
-// role and text match: that is the copied history. The remainder of the side list is new.
-export function rowsAfterSharedPrefix(sideRows, parentRows) {
-  const side = Array.isArray(sideRows) ? sideRows : [];
-  const parent = Array.isArray(parentRows) ? parentRows : [];
-  let i = 0;
-  while (i < side.length && i < parent.length && side[i]?.role === parent[i]?.role && rowText(side[i]) === rowText(parent[i])) i += 1;
-  return side.slice(i);
 }
 
 // ASCII path of agent/model_metadata.py estimate_tokens_rough: CHARS_PER_TOKEN = 4, (len+3)//4.
@@ -282,52 +302,183 @@ export function parseContextHeadroom(payload) {
   return null;
 }
 
-// Every user/assistant pair. Tool and system rows are not turns. Each user starts a turn.
-// Following non-empty assistant texts until the next user are that answer, joined with newlines.
-export function turnsFromRows(rows) {
-  const turns = [];
-  let question = '';
-  let parts = [];
-  const flush = () => {
-    if (question && parts.length) turns.push({ question, answer: parts.join('\n') });
-    question = '';
-    parts = [];
-  };
-  for (const row of Array.isArray(rows) ? rows : []) {
-    const role = row?.role;
-    if (role === 'tool' || role === 'system') continue;
-    if (role === 'user') {
-      flush();
-      question = rowText(row);
-      continue;
-    }
-    if (role === 'assistant' && question) {
-      const text = rowText(row);
-      if (text) parts.push(text);
-    }
-  }
-  flush();
-  return turns;
-}
-
-export function formatSideVerbatim(title, turns) {
-  const name = str(title) || 'Side chat';
-  const list = Array.isArray(turns) ? turns : [];
-  const blocks = list.map((turn) => `You:\n${turn.question}\n\nAssistant:\n${turn.answer}`);
-  return `${MERGE_HEADER}${name}\n\n${blocks.join('\n\n')}`;
-}
-
+// fields.mode: the button label; fields.target: the target chat's title (the parent by default).
+// The notice is held until dismissed, so it names both. Wording copied from side-chat.
 export function formatNoFitNotice(fields) {
   const src = fields || {};
   const sideEstimated = src.sideEstimated === true;
   const windowEstimated = src.windowEstimated === true;
+  const mode = str(src.mode);
+  const target = str(src.target) || 'parent';
   const side = `${formatTokenCount(src.sideTokens)} tokens${sideEstimated ? ' (estimated)' : ''}`;
   const parent = `${formatTokenCount(src.used)} used of ${formatTokenCount(src.max)}${windowEstimated ? ', estimated' : ''}`;
-  return `Doesn't fit: side chat is ${side}, parent has ${formatTokenCount(src.available)} available (${parent}).`;
+  return `Doesn't fit${mode ? ` (${mode})` : ''}: side chat is ${side}, ${target} has ${formatTokenCount(src.available)} available (${parent}).`;
 }
 
 export function formatMissingWindowNotice(sideTokens) {
   return `${MERGE_STAGED_TEXT} Side chat is about ${formatTokenCount(sideTokens)} tokens (estimated). The parent context window was not reported.`;
+}
+
+// ── Concept-link markup removal (copied verbatim from side-chat/src/side-chat.js) ──
+// Merged text is plain prose: `::termline{v=… t=…}` becomes its v sentence, `::term{name=… def=…}`
+// its name, and `[[name|def]]` its name. Rules copied from src/termline.js (the bundle has no
+// imports). Fenced and inline code stay as written: a directive never goes in code, and code may
+// hold `[[ a || b ]]`. Anything that does not parse stays as written.
+
+const TERMLINE_OPEN = '::termline{';
+const TERM_OPEN = '::term{';
+// termline.js unescapeTermlineValue's set, plus the quotes a quoted attribute value may escape.
+const ATTR_ESCAPED = /\\([\\`*_~[\]<>$&"'])/g;
+const ATTR_KEY = /[A-Za-z_][\w.:-]*/y;
+const ATTR_BARE = /[^\s"'=<>`{}]+/y;
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})\s*$/;
+
+// termline.js scanMarkers, sentence only. An earlier unmatched `[[` stays text, and a marker with
+// an empty name keeps its characters. needPipe: outside a termline only `[[name|def]]` is markup.
+function stripMarkers(input, needPipe) {
+  let out = '';
+  let pos = 0;
+  while (pos < input.length) {
+    const first = input.indexOf('[[', pos);
+    const close = first === -1 ? -1 : input.indexOf(']]', first + 2);
+    if (close === -1) break;
+    const open = input.lastIndexOf('[[', close - 2);
+    const inner = input.slice(open + 2, close);
+    const sep = inner.indexOf('|');
+    const name = (sep === -1 ? inner : inner.slice(0, sep)).trim();
+    if (name === '' || (needPipe && sep === -1)) {
+      out += input.slice(pos, open + 2);
+      pos = open + 2;
+      continue;
+    }
+    out += input.slice(pos, open) + name;
+    pos = close + 2;
+  }
+  return out + input.slice(pos);
+}
+
+// Index of the quote that closes the value opened at j, or -1. A backslash escapes the next character.
+function quoteEnd(s, j) {
+  for (let k = j + 1; k < s.length; k++) {
+    if (s[k] === '\\') k += 1;
+    else if (s[k] === s[j]) return k;
+    else if (s[k] === '\n' || s[k] === '\r') return -1;
+  }
+  return -1;
+}
+
+// The directive at i as { end, text }, or null. Values are "double", 'single' or bare.
+function directiveAt(s, i) {
+  const termline = s.startsWith(TERMLINE_OPEN, i);
+  if (!termline && !s.startsWith(TERM_OPEN, i)) return null;
+  const attrs = Object.create(null);
+  let j = i + (termline ? TERMLINE_OPEN : TERM_OPEN).length;
+  for (;;) {
+    while (s[j] === ' ' || s[j] === '\t') j += 1;
+    if (s[j] === '}') break;
+    ATTR_KEY.lastIndex = j;
+    const key = ATTR_KEY.exec(s);
+    if (!key) return null;
+    j = ATTR_KEY.lastIndex;
+    let value = '';
+    if (s[j] === '=') {
+      j += 1;
+      if (s[j] === '"' || s[j] === "'") {
+        const end = quoteEnd(s, j);
+        if (end === -1) return null;
+        value = s.slice(j + 1, end).replace(ATTR_ESCAPED, '$1');
+        j = end + 1;
+      } else {
+        ATTR_BARE.lastIndex = j;
+        const bare = ATTR_BARE.exec(s);
+        if (!bare) return null;
+        value = bare[0];
+        j = ATTR_BARE.lastIndex;
+      }
+    }
+    attrs[key[0]] = value;
+  }
+  if (termline) {
+    const sentence = (attrs.v ?? '').trim() || (attrs.text ?? '').trim();
+    return { end: j + 1, text: stripMarkers(sentence, false) };
+  }
+  const name = (attrs.name ?? '').trim();
+  return name ? { end: j + 1, text: name } : null;
+}
+
+// End of the code span whose opening run of `run` backticks starts at i, or -1 (the run is text).
+function codeSpanEnd(s, i, run) {
+  let j = s.indexOf('`', i + run);
+  while (j !== -1) {
+    let k = j;
+    while (s[k] === '`') k += 1;
+    if (k - j === run) return k;
+    j = s.indexOf('`', k);
+  }
+  return -1;
+}
+
+// One paragraph: code spans stay, directives become their text, markers their name.
+function stripInline(s) {
+  let out = '';
+  let text = '';
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === '`') {
+      let run = 1;
+      while (s[i + run] === '`') run += 1;
+      const end = codeSpanEnd(s, i, run);
+      if (end === -1) {
+        text += s.slice(i, i + run);
+        i += run;
+      } else {
+        out += stripMarkers(text, true) + s.slice(i, end);
+        text = '';
+        i = end;
+      }
+      continue;
+    }
+    const directive = s[i] === ':' ? directiveAt(s, i) : null;
+    if (directive) {
+      out += stripMarkers(text, true) + directive.text;
+      text = '';
+      i = directive.end;
+      continue;
+    }
+    text += s[i];
+    i += 1;
+  }
+  return out + stripMarkers(text, true);
+}
+
+export function stripConceptMarkup(text) {
+  if (typeof text !== 'string') return '';
+  const out = [];
+  let para = [];
+  let fence = null;
+  const flush = () => {
+    if (para.length) out.push(stripInline(para.join('\n')));
+    para = [];
+  };
+  for (const line of text.split('\n')) {
+    if (fence) {
+      out.push(line);
+      const close = FENCE_CLOSE.exec(line);
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null;
+      continue;
+    }
+    const open = FENCE_OPEN.exec(line);
+    if (open || !line.trim()) {
+      flush();
+      out.push(line);
+      if (open) fence = open[1];
+      continue;
+    }
+    para.push(line);
+  }
+  flush();
+  return out.join('\n');
 }
 
 // The compact readout next to the notice. Side tokens are always an estimate.
@@ -387,6 +538,119 @@ export function sharedExchangeCount(child, parent) {
   return n;
 }
 
+// ── Branch here: the `count` of session.branch ─────────────────────────────────────────────
+//
+// session.branch keeps history[:count] of the parent's branch source history. That history holds
+// only user and assistant rows with visible text (tui_gateway/methods_session_branch.py
+// _visible_branch_history). The desktop's own branch from a message counts the same rows
+// (apps/desktop/src/app/session/hooks/use-session-actions/utils.ts toBranchMessages).
+//
+// The pane numbers exchanges from the same history rows it reads (session.transcript or
+// session.history), as exchangesFromRows does: each user row starts the next exchange. For
+// exchange `index`:
+//   count   = the number of user and assistant rows with non-empty text, from the first row up to
+//             and including the last assistant row with text in that exchange.
+//   through = the highest row_id in that exchange up to that row, or null when rows carry no
+//             row_id. It goes out as through_message_id: the canonical gateway cuts at that row and
+//             refuses `count` alone. The legacy client strips it and uses `count`
+//             (apps/desktop/src/api/client.ts LEGACY_STRIP, as the desktop's branchThroughRowId).
+// Not counted: tool rows, system rows, rows with no text (an assistant tool call, an empty user
+// row). Counted: an assistant row before the first user row, because the gateway keeps it.
+// Example: [user q1, assistant a1, user q2, assistant (tool call, no text), tool, assistant a2]
+// gives exchange 0 -> count 2, exchange 1 -> count 4.
+// null when the exchange does not exist or has no answer yet: the branch would end on a question.
+export function branchCount(rows, index) {
+  if (!Number.isInteger(index) || index < 0) return null;
+  let exchange = -1;
+  let visible = 0;
+  let maxId = 0;
+  let found = null;
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const role = row?.role;
+    if (role === 'user') {
+      exchange += 1;
+      if (exchange > index) break;
+    }
+    const text = rowText(row);
+    if ((role === 'user' || role === 'assistant') && text) visible += 1;
+    if (exchange !== index) continue;
+    if (Number.isInteger(row?.row_id) && row.row_id > maxId) maxId = row.row_id;
+    if (role === 'assistant' && text) found = { count: visible, through: maxId > 0 ? maxId : null };
+  }
+  return found;
+}
+
+// ── Merge back: targets, the merged part, the staged text, digests ─────────────────────────
+
+// The merge targets of the open chat: its ancestors in the loaded tree, parent first, up to the root.
+export function mergeTargets(lanes, openId) {
+  const byId = new Map((Array.isArray(lanes) ? lanes : []).map((lane) => [lane.id, lane]));
+  const out = [];
+  const seen = new Set([openId]);
+  for (let lane = byId.get(openId); lane?.parentId && !seen.has(lane.parentId); ) {
+    const parent = byId.get(lane.parentId);
+    if (!parent) break;
+    seen.add(parent.id);
+    out.push({ id: parent.id, title: parent.title });
+    lane = parent;
+  }
+  return out;
+}
+
+// The picked target while it is still an ancestor of the open chat, else the parent (the default).
+export function selectedTarget(targets, selection, openId) {
+  const list = Array.isArray(targets) ? targets : [];
+  const picked = selection && selection.chatId === openId ? list.find((t) => t.id === selection.id) : null;
+  return picked ?? list[0] ?? null;
+}
+
+// The open chat's own part, from its fork point on. question: its first own user message, the
+// merge header (the tree links a merge node to its chat by it). turns: the answered own exchanges.
+export function ownPart(exchanges, fork) {
+  const own = (Array.isArray(exchanges) ? exchanges : []).slice(Math.max(0, Number.isInteger(fork) ? fork : 0));
+  return {
+    question: own.length ? own[0].user : '',
+    turns: own.filter((ex) => str(ex.reply)).map((ex) => ({ question: ex.user, answer: ex.reply })),
+  };
+}
+
+// The Merge as-is body: `You:` and `Assistant:` blocks, as side-chat's formatSideVerbatim writes them.
+export const verbatimBody = (turns) =>
+  (Array.isArray(turns) ? turns : []).map((turn) => `You:\n${turn.question}\n\nAssistant:\n${turn.answer}`).join('\n\n');
+
+// The staged text: `From side chat: <question>` on one line, a blank line, then the body with
+// concept-link markup removed. Whitespace runs in the question become one space, so a question
+// with blank lines still ends the header at its first blank line and still matches its chat.
+export function formatMergeText(question, body) {
+  return `${MERGE_HEADER}${normalizeText(question) || 'Side chat'}\n\n${stripConceptMarkup(str(body))}`;
+}
+
+// The digest request without its session_id. purpose: 'fork' (the part a branch fixed) or
+// 'merge' (a chat's own part).
+export function digestRequest(purpose, title, exchanges) {
+  return {
+    purpose,
+    title: str(title),
+    exchanges: (Array.isArray(exchanges) ? exchanges : []).map((ex) => ({
+      question: typeof ex?.question === 'string' ? ex.question : '',
+      answer: typeof ex?.answer === 'string' ? ex.answer : '',
+    })),
+  };
+}
+
+// The job id of a digest request or event: a non-empty string or a number, as a string; else ''.
+export const digestJob = (job) => (typeof job === 'number' && Number.isFinite(job) ? String(job) : str(job));
+
+// A digest event, checked. The gateway puts the plugin's fields under `payload`
+// (apps/shared/src/gateway-events.ts GatewayEvent); a flat event is read too.
+// { job, ok: true, digest } or { job, ok: false, error }; job is '' when the event names none.
+export function digestResult(event) {
+  const p = event?.payload && typeof event.payload === 'object' ? event.payload : event;
+  const job = digestJob(p?.job);
+  if (typeof p?.digest === 'string' && p.digest.trim() && !str(p?.error)) return { job, ok: true, digest: p.digest.trim() };
+  return { job, ok: false, error: str(p?.error) || 'The digest backend sent no digest.' };
+}
+
 // A history is read again only when its chat's message count or last activity moved.
 // null (no metadata) means: always read.
 export function historyKey(row) {
@@ -396,8 +660,9 @@ export function historyKey(row) {
 }
 
 // One lane per chat: { id, row, title, model, side, parentId, exchanges, fork }. fork is the
-// number of exchanges shared with the parent lane (0 for the root).
-export function buildLanes(chats, exchangesById) {
+// number of exchanges shared with the parent lane (0 for the root). sideIds: the branch ids this
+// pane stored (isSideChat).
+export function buildLanes(chats, exchangesById, sideIds) {
   const lanes = [];
   const byId = new Map();
   for (const { row, parentId } of Array.isArray(chats) ? chats : []) {
@@ -408,7 +673,7 @@ export function buildLanes(chats, exchangesById) {
       row,
       title: str(row.title) || 'Untitled',
       model: str(row.model),
-      side: isSideChat(row),
+      side: isSideChat(row, sideIds),
       parentId: parent ? parent.id : null,
       exchanges,
       fork: parent ? sharedExchangeCount(exchanges, parent.exchanges) : 0,
@@ -421,20 +686,9 @@ export function buildLanes(chats, exchangesById) {
 
 // ── Graph plan: row order, forks, merges, the blue path, collapse, and columns ──────────────
 
-// rows: [{ kind: 'node', key, lane, index, label, merge, mergeFrom, blue, open, first } |
-//        { kind: 'more', key, runKey, lane, index, count, blue }], oldest first, each with col.
-// lanes: [{ id, col, rows, firstRow, lastRow, anchorRow, anchorCol }] for lanes with rows.
-// merges: [{ from, fromRow, to, toRow }]: a curve from a side lane's last row to a merge node.
-// A node `lane:index` is drawn once, on the lane that owns it: the shared exchanges of a child
-// are its parent's. options: { focusedId, open: { chatId, index } | null, expanded: { [runKey]: true } }.
-export function planGraph(lanes, options = {}) {
-  const list = Array.isArray(lanes) ? lanes : [];
-  const byId = new Map(list.map((lane) => [lane.id, lane]));
-  const start = (lane) => (lane.parentId ? Math.min(lane.fork, lane.exchanges.length) : 0);
-  const nodeKey = (id, index) => `${id}:${index}`;
-
-  // The lane that draws exchange `index` of chat `id`: up the parents while it is shared.
-  const resolve = (id, index) => {
+// The lane that draws exchange `index` of chat `id`: up the parents while that exchange is shared.
+function drawer(byId) {
+  return (id, index) => {
     let lane = byId.get(id);
     const seen = new Set();
     while (lane && lane.parentId && index < lane.fork && !seen.has(lane.id)) {
@@ -443,6 +697,25 @@ export function planGraph(lanes, options = {}) {
     }
     return lane ? { lane: lane.id, index } : null;
   };
+}
+
+// rows: [{ kind: 'node', key, lane, index, label, merge, mergeFrom, blue, open, first, target,
+//          branchable, digest } |
+//        { kind: 'more', key, runKey, lane, index, count, blue, target }], oldest first, each with col.
+// lanes: [{ id, col, rows, firstRow, lastRow, anchorRow, anchorCol, target }] for lanes with rows.
+// merges: [{ from, fromRow, to, toRow }]: a curve from a side lane's last row to a merge node.
+// A node `lane:index` is drawn once, on the lane that owns it: the shared exchanges of a child
+// are its parent's. options: { focusedId, open: { chatId, index } | null, expanded: { [runKey]: true },
+// target: the merge target lane id (its rows and lane get target: true), digests: { 'chatId:index':
+// fork digest } (each goes to the node that draws that exchange) }. branchable: an answered
+// exchange of the focused chat, where Branch here applies.
+export function planGraph(lanes, options = {}) {
+  const list = Array.isArray(lanes) ? lanes : [];
+  const byId = new Map(list.map((lane) => [lane.id, lane]));
+  const start = (lane) => (lane.parentId ? Math.min(lane.fork, lane.exchanges.length) : 0);
+  const nodeKey = (id, index) => `${id}:${index}`;
+  const resolve = drawer(byId);
+  const mergeLane = typeof options.target === 'string' && byId.has(options.target) ? options.target : null;
 
   // Each child leaves its parent at the node of the last shared exchange. A child that shares
   // nothing has no fork node: it starts its own lane after its parent's rows.
@@ -480,6 +753,26 @@ export function planGraph(lanes, options = {}) {
     for (let i = start(lane); i <= at.index; i++) blue.add(nodeKey(lane.id, i));
   }
 
+  // Branch here: every answered exchange of the focused chat, on the node that draws it.
+  const branchable = new Set();
+  if (focused) {
+    focused.exchanges.forEach((ex, i) => {
+      const at = str(ex.reply) ? resolve(focused.id, i) : null;
+      if (at) branchable.add(nodeKey(at.lane, at.index));
+    });
+  }
+  // Fork digests, joined per node when two chats forked at one shared exchange.
+  const digestOf = new Map();
+  for (const [key, text] of Object.entries(options.digests ?? {})) {
+    const cut = key.lastIndexOf(':');
+    const index = Number(key.slice(cut + 1));
+    const lane = byId.get(key.slice(0, cut));
+    const at = lane && Number.isInteger(index) && index >= 0 && index < lane.exchanges.length && str(text) ? resolve(lane.id, index) : null;
+    if (!at) continue;
+    const node = nodeKey(at.lane, at.index);
+    digestOf.set(node, digestOf.has(node) ? `${digestOf.get(node)}\n\n${str(text)}` : str(text));
+  }
+
   // Rows, depth first: a lane's own exchanges in order, each fork node followed by its children.
   const expanded = options.expanded ?? {};
   const rows = [];
@@ -487,7 +780,21 @@ export function planGraph(lanes, options = {}) {
   const pushNode = (lane, i) => {
     const ex = lane.exchanges[i];
     const key = nodeKey(lane.id, i);
-    rows.push({ kind: 'node', key, lane: lane.id, index: i, label: ex.label, merge: ex.merge, mergeFrom: null, blue: blue.has(key), open: key === openKey, first: false });
+    rows.push({
+      kind: 'node',
+      key,
+      lane: lane.id,
+      index: i,
+      label: ex.label,
+      merge: ex.merge,
+      mergeFrom: null,
+      blue: blue.has(key),
+      open: key === openKey,
+      first: false,
+      target: lane.id === mergeLane,
+      branchable: branchable.has(key),
+      digest: digestOf.get(key) ?? null,
+    });
   };
   const emit = (lane) => {
     if (visited.has(lane.id)) return;
@@ -510,7 +817,7 @@ export function planGraph(lanes, options = {}) {
       while (j < n && !keep.has(j)) j += 1;
       const runKey = nodeKey(lane.id, i);
       if (j - i >= 3 && !expanded[runKey]) {
-        rows.push({ kind: 'more', key: `more:${runKey}`, runKey, lane: lane.id, index: i, count: j - i, blue: blue.has(runKey) });
+        rows.push({ kind: 'more', key: `more:${runKey}`, runKey, lane: lane.id, index: i, count: j - i, blue: blue.has(runKey), target: lane.id === mergeLane });
       } else {
         for (let k = i; k < j; k++) pushNode(lane, k);
       }
@@ -524,7 +831,7 @@ export function planGraph(lanes, options = {}) {
   const rowOf = new Map(rows.map((row, index) => [row.key, index]));
   const info = new Map();
   rows.forEach((row, index) => {
-    const entry = info.get(row.lane) ?? { id: row.lane, rows: [], firstRow: index, lastRow: index, anchorRow: -1, anchorCol: -1, col: 0, end: index };
+    const entry = info.get(row.lane) ?? { id: row.lane, rows: [], firstRow: index, lastRow: index, anchorRow: -1, anchorCol: -1, col: 0, end: index, target: row.lane === mergeLane };
     entry.rows.push(index);
     entry.lastRow = index;
     entry.end = index;
@@ -587,8 +894,9 @@ export function planGraph(lanes, options = {}) {
 const laneX = (col) => GRAPH_PAD + col * LANE_GAP;
 const rowY = (row) => row * ROW_H + ROW_H / 2;
 
-// { width, height, circles: [{ key, cx, cy, r, color, filled }], paths: [{ key, d, color }] }.
-// Lane lines stop at circle edges. A fork leaves its node sideways, turns down with a rounded
+// { width, height, circles: [{ key, cx, cy, r, color, filled, target }], paths: [{ key, d, color, target }] }.
+// target marks the merge target lane: its line, fork elbow and nodes. The pane draws them thicker and
+// the line dashed, in their usual colour: the graph keeps exactly two colours. Lane lines stop at circle edges. A fork leaves its node sideways, turns down with a rounded
 // corner, and runs to the child's first node. A merge runs down from the side lane's last node
 // and turns into the merge node. Merge curves are always grey: a merged chat is not on the path.
 export function graphGeometry(plan) {
@@ -605,13 +913,13 @@ export function graphGeometry(plan) {
     for (let k = 1; k < lane.rows.length; k++) {
       const a = lane.rows[k - 1];
       const b = lane.rows[k];
-      paths.push({ key: `lane:${lane.id}:${a}`, d: `M ${x} ${rowY(a) + edge(a)} V ${rowY(b) - edge(b)}`, color: colour(rows[b].blue) });
+      paths.push({ key: `lane:${lane.id}:${a}`, d: `M ${x} ${rowY(a) + edge(a)} V ${rowY(b) - edge(b)}`, color: colour(rows[b].blue), target: lane.target === true });
     }
     if (lane.anchorRow >= 0) {
       const xa = laneX(lane.anchorCol);
       const ya = rowY(lane.anchorRow);
       const d = `M ${xa + NODE_R} ${ya} H ${x - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 1 ${x} ${ya + CURVE_R} V ${rowY(lane.firstRow) - NODE_R}`;
-      paths.push({ key: `fork:${lane.id}`, d, color: colour(rows[lane.firstRow].blue) });
+      paths.push({ key: `fork:${lane.id}`, d, color: colour(rows[lane.firstRow].blue), target: lane.target === true });
     }
   }
   for (const merge of Array.isArray(plan?.merges) ? plan.merges : []) {
@@ -622,12 +930,12 @@ export function graphGeometry(plan) {
     let d = `M ${xs} ${y0} V ${y1 - NODE_R}`;
     if (xs > xt) d = `M ${xs} ${y0} V ${y1 - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 1 ${xs - CURVE_R} ${y1} H ${xt + NODE_R}`;
     else if (xs < xt) d = `M ${xs} ${y0} V ${y1 - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 0 ${xs + CURVE_R} ${y1} H ${xt - NODE_R}`;
-    paths.push({ key: `merge:${merge.from}:${merge.toRow}`, d, color: GREY });
+    paths.push({ key: `merge:${merge.from}:${merge.toRow}`, d, color: GREY, target: false });
   }
   const circles = [];
   rows.forEach((row, index) => {
     if (row.kind !== 'node') return;
-    circles.push({ key: row.key, cx: laneX(row.col), cy: rowY(index), r: NODE_R, color: colour(row.blue), filled: row.open === true });
+    circles.push({ key: row.key, cx: laneX(row.col), cy: rowY(index), r: NODE_R, color: colour(row.blue), filled: row.open === true, target: row.target === true });
   });
   return { width, height, circles, paths };
 }
@@ -711,17 +1019,27 @@ const PILL = {
   lineHeight: '14px',
 };
 
+// A small action button inside a one-line row, and a merge target chip.
+const ROW_ACTION = { ...SELECTABLE, flex: '0 0 auto', fontSize: 10, lineHeight: '14px', padding: '0 4px' };
+const CHIP = { ...SELECTABLE, maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+const INPUT_STYLE = { ...SELECTABLE, width: '100%', boxSizing: 'border-box' };
+
 export function createChatTree(deps) {
   const { host, jsx, jsxs, atom, useValue, Button, ScrollArea } = deps;
+  const Input = deps.Input ?? 'input';
 
   // rows: last good session rows. agents: last good subagents, for agentsFor (a runtime id).
-  // exchanges: { [chat id]: exchanges } for the chats of the focused tree.
-  const $data = atom({ rows: [], agents: [], agentsFor: null, exchanges: {} });
+  // exchanges: { [chat id]: exchanges } for the chats of the focused tree. branchIds: the ids of
+  // the branches this pane made (ctx.storage). digests: { 'chatId:index': fork digest } (ctx.storage).
+  const $data = atom({ rows: [], agents: [], agentsFor: null, exchanges: {}, branchIds: [], digests: {} });
   // note: why live subagents are not shown (not an error).
   const $status = atom({ loading: false, error: null, note: null });
-  // In memory only, never stored: open: { chatId, index } the clicked node; expanded: { [run key]:
-  // true } the +N runs the user opened; merge: { [side chat id]: { busy, notice, fit, sideTokens, available } }.
-  const freshUi = () => ({ open: null, expanded: {}, merge: {} });
+  // In memory only, never stored. open: { chatId, index } the clicked node. expanded: { [run key]:
+  // true } the +N runs the user opened. merge: the last merge result { busy, kind, notice, fit,
+  // sideTokens, available }. held: a no-fit notice that only Dismiss clears. target: { chatId, id }
+  // the merge target picked for chat chatId. branch: the Branch here form { chatId, index, label,
+  // question, model, busy, error }. forkNotice: a failed fork digest, until Dismiss.
+  const freshUi = () => ({ open: null, expanded: {}, merge: {}, held: null, target: null, branch: null, forkNotice: null });
   const $ui = atom(freshUi());
   // Stand-in so the pane calls useValue the same number of times when host.state lacks an atom.
   const $none = atom(null);
@@ -735,6 +1053,13 @@ export function createChatTree(deps) {
   let cancelTimer = null;
   let lastKey = null;
   let scopedTimeout = null;
+  // ctx.storage of this activation; null when the host has none.
+  let storage = null;
+  // Digest jobs in flight: job id -> finish(result). early: results whose event came before the
+  // request's { job } reply. listening: this activation hears the digest event.
+  const jobs = new Map();
+  const early = new Map();
+  let listening = false;
   // chat id -> { key, exchanges }: a history is read again only when historyKey(row) moves.
   let historyCache = new Map();
   const unsubscribers = [];
@@ -754,6 +1079,44 @@ export function createChatTree(deps) {
     const clear = deps.clearTimeout ?? ((id) => globalThis.clearTimeout(id));
     const id = set(fn, ms);
     return () => clear(id);
+  }
+
+  // ── ctx.storage (write copied from side-chat; best effort, a store that throws never breaks the pane) ──
+
+  const write = (key, value) => {
+    if (disposed) return;
+    try {
+      const pending = storage?.set?.(key, value);
+      if (isThenable(pending)) pending.then(null, () => {});
+    } catch {
+      // Storage is best effort; the pane still works for this session.
+    }
+  };
+  // The desktop's ctx.storage is synchronous (contrib/plugin.ts createPluginStorage). A
+  // promise-based store reads as empty here.
+  const read = (key) => {
+    try {
+      const value = storage?.get?.(key);
+      return isThenable(value) ? undefined : value;
+    } catch {
+      return undefined;
+    }
+  };
+  const storedBranchIds = () => {
+    const ids = read(BRANCH_IDS_KEY);
+    return Array.isArray(ids) ? ids.filter((id) => typeof id === 'string' && id) : [];
+  };
+
+  // Fork digests of every exchange in the tree, read on each load (never in render).
+  function readDigests(exchangesById) {
+    const out = {};
+    for (const [id, list] of Object.entries(exchangesById ?? {})) {
+      for (let i = 0; i < (Array.isArray(list) ? list.length : 0); i++) {
+        const text = read(digestKey(id, i));
+        if (typeof text === 'string' && text.trim()) out[`${id}:${i}`] = text.trim();
+      }
+    }
+    return out;
   }
 
   // Reads both sources. Each failure shows its text and keeps that source's last good data.
@@ -838,6 +1201,10 @@ export function createChatTree(deps) {
       next.exchanges = histories.exchanges;
       errors.push(...histories.errors);
     }
+    // A branch or a fork digest may have landed while the reads ran: keep the newest.
+    const now = $data.get();
+    next.branchIds = now.branchIds;
+    next.digests = storage ? { ...now.digests, ...readDigests(next.exchanges) } : now.digests;
     $data.set(next);
     $status.set({
       loading: false,
@@ -900,11 +1267,15 @@ export function createChatTree(deps) {
   const stop = (event) => {
     event?.stopPropagation?.();
   };
+  // Copied from side-chat: Hermes listens for keys on window capture; the composer takes whatever still bubbles.
+  const stopHostEvent = (event) => {
+    event?.stopPropagation?.();
+    event?.stopImmediatePropagation?.();
+  };
 
   // ── UI state (all in $ui; render only reads it) ───────────────────────────────────────────
 
   const setUi = (patch) => $ui.set({ ...$ui.get(), ...patch });
-  const setMerge = (id, state) => setUi({ merge: { ...$ui.get().merge, [id]: state } });
 
   // A click on a node makes it the open node and opens its chat in place.
   function selectNode(chatId, index) {
@@ -918,8 +1289,24 @@ export function createChatTree(deps) {
     event.preventDefault?.();
     fn();
   };
+  const pickTarget = (chatId, id) => setUi({ target: { chatId, id } });
+  const dismissHeld = () => setUi({ held: null });
+  const dismissForkNotice = () => setUi({ forkNotice: null });
 
-  // ── Merge as-is: stage a side chat verbatim in its parent's composer. Never sends. ───────────
+  // The tree as the pane draws it now, for the click handlers (render never runs an action).
+  function currentView() {
+    const data = $data.get();
+    const tree = buildTree(data.rows, atomOf('focusedStoredSessionId').get() ?? runtimeId());
+    const lanes = buildLanes(lineageChats(tree), data.exchanges, data.branchIds);
+    const open = tree ? (lanes.find((lane) => lane.id === tree.focused.id) ?? null) : null;
+    return { lanes, open };
+  }
+
+  // host.state.busyBySession is keyed by runtime id (side-chat reads it the same way). A branch
+  // needs an idle chat (hermes_state_mutation_branch.py:58 require_idle).
+  const chatBusy = (busyMap, ids) => ids.some((id) => typeof id === 'string' && id !== '' && Boolean(busyMap?.[id]));
+
+  // ── Reads ─────────────────────────────────────────────────────────────────────────────────
 
   // This Hermes (v0.23) has no session.transcript: fall back to session.history, a complete snapshot.
   async function readRows(sessionId) {
@@ -948,24 +1335,71 @@ export function createChatTree(deps) {
     return Array.isArray(history?.messages) ? history.messages : [];
   }
 
-  // Parent context window. Never the side chat's own: it holds a copy of the parent's history.
-  async function parentHeadroom(parentId, sideId) {
-    const ids = [];
-    if (typeof parentId === 'string' && parentId) ids.push(parentId);
-    const focused = atomOf('focusedSessionId').get();
-    const focusedIsSide = atomOf('focusedStoredSessionId').get() === sideId;
-    if (!focusedIsSide && typeof focused === 'string' && focused && !ids.includes(focused)) ids.push(focused);
+  // The open chat's rows by its stored id, as the tree read them, so exchange numbers match the
+  // nodes. Its runtime id when that read fails: a legacy gateway serves live runtime ids only.
+  async function readOpenRows(openId) {
+    try {
+      return await readRows(openId);
+    } catch (error) {
+      const runtime = atomOf('focusedStoredSessionId').get() === openId ? runtimeId() : null;
+      if (!runtime || runtime === openId) throw error;
+      return readRows(runtime);
+    }
+  }
+
+  // The target's context window: session.usage, then session.stats, then session.context_breakdown.
+  // Never the open chat's own window: a branch holds a copy of its parent's history.
+  async function targetHeadroom(targetId) {
     for (const method of ['session.usage', 'session.stats', 'session.context_breakdown']) {
-      for (const session_id of ids) {
-        try {
-          const window = parseContextHeadroom(await host.request(method, { session_id }));
-          if (window) return window;
-        } catch {
-          // A throw or a payload with no context max tries the next id, then the next method.
-        }
+      try {
+        const window = parseContextHeadroom(await host.request(method, { session_id: targetId }));
+        if (window) return window;
+      } catch {
+        // A throw or a payload with no context max tries the next method.
       }
     }
     return null;
+  }
+
+  // The digest event: finishes its job, or keeps the result until the request's reply names it.
+  function onDigestEvent(event) {
+    const result = digestResult(event);
+    if (!result.job) return;
+    const finish = jobs.get(result.job);
+    if (finish) return finish(result);
+    early.set(result.job, result);
+    while (early.size > 20) early.delete(early.keys().next().value);
+  }
+
+  // Asks the plugin's Python half for a digest and waits for its event, at most 60 seconds.
+  // sessionId: a session this window views, because the event reaches only those clients.
+  // Never throws: { ok: true, digest } or { ok: false, error, missing } (missing: no backend).
+  async function requestDigest(sessionId, purpose, title, exchanges) {
+    if (!listening) return { ok: false, missing: true, error: DIGEST_MISSING_TEXT };
+    let job;
+    try {
+      job = digestJob((await host.request(DIGEST_METHOD, { session_id: sessionId, ...digestRequest(purpose, title, exchanges) }))?.job);
+    } catch (error) {
+      // -32601 (method not found): the plugin's Python half is not enabled.
+      const missing = error?.code === -32601 || /method not found|unknown method/i.test(errorText(error));
+      return { ok: false, missing, error: missing ? DIGEST_MISSING_TEXT : errorText(error) };
+    }
+    if (!job) return { ok: false, error: 'The digest backend returned no job.' };
+    if (early.has(job)) {
+      const result = early.get(job);
+      early.delete(job);
+      return result;
+    }
+    return new Promise((resolve) => {
+      let cancel = null;
+      const finish = (result) => {
+        jobs.delete(job);
+        if (typeof cancel === 'function') cancel();
+        resolve(result);
+      };
+      jobs.set(job, finish);
+      cancel = schedule(() => finish({ job, ok: false, error: DIGEST_TIMEOUT_TEXT }), DIGEST_TIMEOUT_MS);
+    });
   }
 
   async function tryDraft(sessionId, text) {
@@ -976,76 +1410,95 @@ export function createChatTree(deps) {
     }
   }
 
-  // Click handler: reads, fit check, open the parent, stage the draft. Never throws, never sends,
-  // and never merges unless the user clicked. The check happens here, not in render.
-  async function mergeAsIs(row) {
-    const sideId = row?.id;
-    if (!sideId || $ui.get().merge[sideId]?.busy) return;
+  // ── Merge: stage the open chat in an ancestor's composer. Never sends. ─────────────────────
+
+  // Click handler of Merge as-is (kind 'asis') and Digest (kind 'digest'). Reads the open chat,
+  // builds the text, checks it against the target's window, opens the target in place, and stages
+  // the draft. Never throws, and never merges unless the user clicked.
+  async function merge(kind) {
+    if ($ui.get().merge?.busy) return;
     const act = activation;
     const alive = () => !disposed && act === activation;
     const show = (state) => {
-      if (alive()) setMerge(sideId, state);
+      if (alive()) setUi({ merge: state });
     };
+    const mode = kind === 'digest' ? 'Digest' : 'Merge as-is';
     try {
+      const { lanes, open } = currentView();
+      if (!open) return show({ notice: 'Open a chat first.' });
+      const targets = mergeTargets(lanes, open.id);
+      if (!targets.length) return show({ notice: forkParentId(open.row) ? MERGE_PARENT_MISSING_TEXT : MERGE_ROOT_TEXT });
       if (typeof host?.composer?.setDraft !== 'function') return show({ notice: MERGE_NO_COMPOSER_TEXT });
-      const parentId = forkParentId(row);
-      if (!parentId) return show({ notice: 'This side chat has no parent chat to merge into.' });
-      show({ busy: true });
+      const target = selectedTarget(targets, $ui.get().target, open.id);
+      show({ busy: true, kind });
 
-      let sideRows;
-      let parentRows;
+      let exchanges;
       try {
-        sideRows = await readRows(sideId);
+        exchanges = exchangesFromRows(await readOpenRows(open.id));
       } catch (error) {
-        return show({ notice: `Could not read the side chat: ${errorText(error)}` });
+        return show({ notice: `Could not read this chat: ${errorText(error)}` });
       }
       if (!alive()) return;
-      try {
-        parentRows = await readRows(parentId);
-      } catch (error) {
-        return show({ notice: `Could not read the parent chat: ${errorText(error)}` });
+      // The fork point: against the parent as the tree loaded it, else a fresh read of the parent.
+      let parentExchanges = lanes.find((lane) => lane.id === open.parentId)?.exchanges ?? [];
+      if (!parentExchanges.length) {
+        try {
+          parentExchanges = exchangesFromRows(await readRows(open.parentId));
+        } catch (error) {
+          return show({ notice: `Could not read the parent chat: ${errorText(error)}` });
+        }
+        if (!alive()) return;
       }
-      if (!alive()) return;
+      const { question, turns } = ownPart(exchanges, sharedExchangeCount(exchanges, parentExchanges));
+      if (!turns.length) return show({ notice: MERGE_NOTHING_TEXT });
 
-      const turns = turnsFromRows(rowsAfterSharedPrefix(sideRows, parentRows));
-      if (!turns.length) {
-        return show({ notice: 'Nothing to merge: the side chat has no new question and answer after the shared history.' });
+      let body = verbatimBody(turns);
+      if (kind === 'digest') {
+        // The open chat's session: this window views it while the pane waits, before the target opens.
+        const viewing = atomOf('focusedStoredSessionId').get() === open.id ? runtimeId() || open.id : open.id;
+        const reply = await requestDigest(viewing, 'merge', open.title, turns);
+        if (!alive()) return;
+        if (!reply.ok) return show({ notice: reply.missing ? DIGEST_MISSING_TEXT : `Digest failed: ${reply.error.replace(/[.\s]+$/, '')}. Nothing was staged.` });
+        body = reply.digest;
       }
-      const verbatim = formatSideVerbatim(row.title, turns);
-      const sideTokens = estimateTokens(verbatim);
+      const text = formatMergeText(question, body);
+      const sideTokens = estimateTokens(text);
 
-      const headroom = await parentHeadroom(parentId, sideId);
+      const headroom = await targetHeadroom(target.id);
       if (!alive()) return;
       if (headroom && sideTokens > headroom.available) {
-        return show({
-          fit: 'no',
-          sideTokens,
-          available: headroom.available,
-          notice: formatNoFitNotice({
+        // Held: later merges, loads and focus changes leave it. Only Dismiss clears it.
+        setUi({
+          merge: { fit: 'no', sideTokens, available: headroom.available },
+          held: formatNoFitNotice({
             sideTokens,
             available: headroom.available,
             used: headroom.used,
             max: headroom.max,
             sideEstimated: true,
             windowEstimated: headroom.estimated === true,
+            mode,
+            target: target.title,
           }),
         });
+        return;
       }
 
+      // setDraft fails closed on a composer that is not mounted (sdk/composer.ts): open the target first.
       if (typeof host.openSession === 'function') {
         try {
-          await host.openSession(parentId, { intent: 'in-place' });
+          await host.openSession(target.id, openOptions(atomOf('focusedSessionOwner').get(), 'in-place'));
         } catch {
-          // setDraft is fail-closed when the parent composer is not mounted.
+          // A failed open still tries the draft: the target may be open already.
         }
       }
       if (!alive()) return;
-      let ok = await tryDraft(parentId, verbatim);
+      let ok = await tryDraft(target.id, text);
       if (!ok) {
-        // Never stage into the side chat itself.
-        const focused = atomOf('focusedSessionId').get();
-        if (typeof focused === 'string' && focused && atomOf('focusedStoredSessionId').get() !== sideId) {
-          ok = await tryDraft(focused, verbatim);
+        // The target's runtime id once focus is on the target. Never the merged chat itself.
+        const focusedRuntime = atomOf('focusedSessionId').get();
+        if (typeof focusedRuntime === 'string' && focusedRuntime && atomOf('focusedStoredSessionId').get() === target.id) {
+          ok = await tryDraft(focusedRuntime, text);
         }
       }
       if (!alive()) return;
@@ -1053,40 +1506,184 @@ export function createChatTree(deps) {
       const fit = headroom ? 'yes' : 'unknown';
       const base = { fit, sideTokens, available: headroom?.available };
       if (!ok) return show({ ...base, notice: MERGE_HIDDEN_TEXT });
-      // Staged. Once the user sends it, the parent's next history read shows the merge node.
+      // Staged. Once the user sends it, the target's next history read shows the Merged node.
       show({ ...base, notice: headroom ? MERGE_STAGED_TEXT : formatMissingWindowNotice(sideTokens) });
     } catch (error) {
       show({ notice: `Merge failed: ${errorText(error)}` });
     }
   }
 
-  // ── Graph rows ─────────────────────────────────────────────────────────────────────────────
+  // ── Branch here: fork the open chat at an exchange and ask the branch a question ──────────
 
-  // `title · model`, and `side chat of X` for a side chat. A native tooltip: rows never grow.
-  function tooltip(lane, lanesById) {
-    const head = [lane.title, lane.model].filter(Boolean).join(' · ');
-    if (!lane.side) return head;
-    const parent = lane.parentId ? lanesById.get(lane.parentId) : null;
-    return `${head}\nside chat of ${parent ? parent.title : 'a chat that is not loaded'}`;
+  // The form's model, as side-chat picks its side model: the last one typed (ctx.storage), else
+  // side-chat's saved side model, else blank, which keeps the chat's own model (no override).
+  function defaultModel() {
+    const saved = read(MODEL_KEY);
+    if (saved && typeof saved === 'object' && typeof saved.model === 'string') return str(saved.model);
+    try {
+      const raw = globalThis.localStorage?.getItem?.(SIDE_CHAT_MODEL_STORAGE);
+      const side = raw ? JSON.parse(raw) : null;
+      return side && typeof side === 'object' ? str(side.model) : '';
+    } catch {
+      return '';
+    }
   }
 
-  function nodeLine(row, lane, lanesById, indent) {
+  function openBranchForm(chatId, index, label) {
+    setUi({ branch: { chatId, index, label, question: '', model: defaultModel(), busy: false, error: null } });
+  }
+
+  function setBranchField(key, value) {
+    const form = $ui.get().branch;
+    if (!form) return;
+    const text = typeof value === 'string' ? value : '';
+    setUi({ branch: { ...form, [key]: text } });
+    if (key === 'model') write(MODEL_KEY, { model: str(text) });
+  }
+
+  const cancelBranch = () => setUi({ branch: null });
+
+  // Records a branch this pane made, so its lane shows the side pill, also after a reload.
+  function recordBranch(ids) {
+    const next = [...new Set([...storedBranchIds(), ...$data.get().branchIds, ...ids.filter((id) => typeof id === 'string' && id)])];
+    $data.set({ ...$data.get(), branchIds: next });
+    write(BRANCH_IDS_KEY, next);
+  }
+
+  // The fork digest of the part a branch just fixed, stored under digestKey(chatId, index) and
+  // shown on that node's tooltip. It runs after the branch opens and never holds it up. The
+  // request names the new branch's session: Branch here opens it before the digest returns.
+  async function forkDigest(branchSessionId, chatId, index, title, exchanges) {
+    const act = activation;
+    const reply = await requestDigest(branchSessionId, 'fork', title, exchanges);
+    if (disposed || act !== activation) return;
+    if (!reply.ok) {
+      setUi({ forkNotice: reply.missing ? `No fork digest. ${DIGEST_MISSING_TEXT.replace(' Nothing was staged.', '')}` : `Fork digest failed: ${reply.error}` });
+      return;
+    }
+    write(digestKey(chatId, index), reply.digest);
+    const data = $data.get();
+    $data.set({ ...data, digests: { ...data.digests, [`${chatId}:${index}`]: reply.digest } });
+  }
+
+  // Submit of the Branch here form. Forks the open chat after the form's exchange, asks the branch
+  // the question on the form's model, and opens the branch in place. Never throws. Errors stay in the form.
+  async function submitBranch() {
+    const form = $ui.get().branch;
+    if (!form || form.busy) return;
+    const act = activation;
+    const alive = () => !disposed && act === activation;
+    const fail = (error) => {
+      const now = $ui.get().branch;
+      if (alive() && now) setUi({ branch: { ...now, busy: false, error } });
+    };
+    const question = str(form.question);
+    if (!question) return fail('Type a question for the branch.');
+    const { open } = currentView();
+    const runtime = runtimeId();
+    if (!open || open.id !== form.chatId || !runtime) return fail('The open chat changed. Click Branch on a node again.');
+    if (chatBusy(atomOf('busyBySession').get(), [runtime, open.id])) return fail(BRANCH_BUSY_TEXT);
+    setUi({ branch: { ...form, busy: true, error: null } });
+
+    let rows;
+    try {
+      rows = await readOpenRows(open.id);
+    } catch (error) {
+      return fail(`Could not read this chat: ${errorText(error)}`);
+    }
+    if (!alive()) return;
+    const cut = branchCount(rows, form.index);
+    if (!cut) return fail('This exchange has no answer yet. Branch at an answered exchange.');
+
+    // No name: Hermes names a branch its own way.
+    const params = { session_id: runtime, count: cut.count, ...(cut.through ? { through_message_id: cut.through } : {}) };
+    let branch;
+    try {
+      branch = await host.request('session.branch', params);
+    } catch (error) {
+      return fail(isBusy(error) ? `${BRANCH_BUSY_TEXT} ${errorText(error)}` : `Branch failed: ${errorText(error)}`);
+    }
+    if (!alive()) return;
+    const sessionId = str(branch?.session_id);
+    if (!sessionId) return fail('Branch failed: the gateway returned no session.');
+    const storedId = str(branch?.stored_session_id) || sessionId;
+    recordBranch([sessionId, storedId]);
+
+    const model = str(form.model);
+    const submit = { session_id: sessionId, text: question };
+    // A blank model keeps the chat's own model: no override at all (side-chat's rule).
+    if (model) submit.model_override = { model };
+    try {
+      await host.request('prompt.submit', submit);
+    } catch (error) {
+      return fail(`The branch was made, but the question was not sent: ${errorText(error)}`);
+    }
+    if (!alive()) return;
+    setUi({ branch: null });
+    openChat(storedId, 'in-place');
+    const fixed = exchangesFromRows(rows)
+      .slice(0, form.index + 1)
+      .map((ex) => ({ question: ex.user, answer: ex.reply }));
+    forkDigest(sessionId, open.id, form.index, open.title, fixed).then(null, () => {});
+  }
+
+  // ── Graph rows ─────────────────────────────────────────────────────────────────────────────
+
+  // `title · model`, `side chat of X` for a side chat, and the fork digest of the node. A native
+  // tooltip: rows never grow.
+  function tooltip(lane, lanesById, digest) {
+    let text = [lane.title, lane.model].filter(Boolean).join(' · ');
+    if (lane.side) {
+      const parent = lane.parentId ? lanesById.get(lane.parentId) : null;
+      text = `${text}\nside chat of ${parent ? parent.title : 'a chat that is not loaded'}`;
+    }
+    return digest ? `${text}\n\nFork digest:\n${digest}` : text;
+  }
+
+  // actions: { openId, busy, model }: the open chat's id, its busy flag, and its model. A
+  // branchable node carries a Branch button for the open chat.
+  function nodeLine(row, lane, lanesById, indent, actions) {
     const children = [
       jsx(
         'span',
-        { style: { ...LABEL_STYLE, ...(row.blue ? {} : { opacity: 0.72 }), ...(row.open ? { fontWeight: 600 } : {}) }, children: row.label },
+        { style: { ...LABEL_STYLE, ...(row.blue ? {} : { opacity: 0.72 }), ...(row.open ? { fontWeight: 600 } : {}) }, 'data-selectable-text': 'true', children: row.label },
         'label',
       ),
     ];
-    if (row.first && lane.model) children.push(jsx('span', { style: PILL, 'data-pill': 'model', children: modelName(lane.model) }, 'model'));
-    if (row.first && lane.side) children.push(jsx('span', { style: PILL, 'data-pill': 'side', children: 'side' }, 'side'));
+    // The model pill sits on the open node only (Rohan, 2026-11-12 01:10): the open chat's model.
+    const model = row.open ? actions.model || lane.model : '';
+    if (model) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'model', children: modelName(model) }, 'model'));
+    if (row.first && lane.side) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'side', children: 'side' }, 'side'));
+    if (row.branchable && actions.openId) {
+      children.push(
+        jsx(
+          Button,
+          {
+            type: 'button',
+            size: 'xs',
+            variant: 'ghost',
+            style: ROW_ACTION,
+            'data-branch-here': row.key,
+            disabled: actions.busy,
+            title: actions.busy ? BRANCH_BUSY_TEXT : 'Branch here: fork this chat after this exchange and ask the branch a question.',
+            onClick: (event) => {
+              stop(event);
+              if (!actions.busy) openBranchForm(actions.openId, row.index, row.label);
+            },
+            onKeyDown: stop,
+            children: 'Branch',
+          },
+          'branch',
+        ),
+      );
+    }
     const select = () => selectNode(row.lane, row.index);
     return jsxs(
       'div',
       {
         role: 'button',
         tabIndex: 0,
-        title: tooltip(lane, lanesById),
+        title: tooltip(lane, lanesById, row.digest),
         className: row.open ? '' : 'hover:bg-muted',
         style: { ...ROW_STYLE, paddingLeft: indent, ...(row.open ? OPEN_ROW : {}) },
         'data-selectable-text': 'true',
@@ -1095,7 +1692,9 @@ export function createChatTree(deps) {
         'data-exchange': row.index,
         ...(row.blue ? { 'data-blue': 'true' } : {}),
         ...(row.open ? { 'data-open': 'true', 'aria-current': 'true' } : {}),
+        ...(row.target ? { 'data-target-lane': 'true' } : {}),
         ...(row.merge !== null ? { 'data-merge-node': row.mergeFrom ?? '' } : {}),
+        ...(row.digest ? { 'data-fork-digest': 'true' } : {}),
         onClick: () => {
           if (!selecting()) select();
         },
@@ -1129,16 +1728,42 @@ export function createChatTree(deps) {
   }
 
   // The rows, with one decorative SVG over them. The SVG takes no clicks; the graph column is
-  // the rows' left padding, so no line runs over text.
-  function graphView(plan, lanes) {
+  // the rows' left padding, so no line runs over text. The merge target lane is drawn thicker
+  // with a dashed line, in its usual colour.
+  function graphView(plan, lanes, actions) {
     const geo = graphGeometry(plan);
     const lanesById = new Map(lanes.map((lane) => [lane.id, lane]));
     const indent = geo.width + 2;
     const shapes = [
       ...geo.paths.map((p) =>
-        jsx('path', { d: p.d, fill: 'none', stroke: p.color, strokeWidth: p.color === BLUE ? 2 : 1.5, strokeLinecap: 'round' }, p.key),
+        jsx(
+          'path',
+          {
+            d: p.d,
+            fill: 'none',
+            stroke: p.color,
+            strokeWidth: (p.color === BLUE ? 2 : 1.5) + (p.target ? 1 : 0),
+            strokeLinecap: 'round',
+            ...(p.target ? { strokeDasharray: '4 3', 'data-target': 'true' } : {}),
+          },
+          p.key,
+        ),
       ),
-      ...geo.circles.map((c) => jsx('circle', { cx: c.cx, cy: c.cy, r: c.r, fill: c.filled ? c.color : 'none', stroke: c.color, strokeWidth: 1.5 }, `c:${c.key}`)),
+      ...geo.circles.map((c) =>
+        jsx(
+          'circle',
+          {
+            cx: c.cx,
+            cy: c.cy,
+            r: c.r,
+            fill: c.filled ? c.color : 'none',
+            stroke: c.color,
+            strokeWidth: c.target ? 2.5 : 1.5,
+            ...(c.target ? { 'data-target': 'true' } : {}),
+          },
+          `c:${c.key}`,
+        ),
+      ),
     ];
     return jsxs(
       'div',
@@ -1147,7 +1772,7 @@ export function createChatTree(deps) {
         'data-selectable-text': 'true',
         'data-tree-graph': 'true',
         children: [
-          ...plan.rows.map((row) => (row.kind === 'more' ? moreLine(row, indent) : nodeLine(row, lanesById.get(row.lane), lanesById, indent))),
+          ...plan.rows.map((row) => (row.kind === 'more' ? moreLine(row, indent) : nodeLine(row, lanesById.get(row.lane), lanesById, indent, actions))),
           jsxs(
             'svg',
             {
@@ -1167,6 +1792,95 @@ export function createChatTree(deps) {
     );
   }
 
+  // A line of pane text.
+  const note = (text, extra, key) =>
+    jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, 'data-selectable-text': 'true', ...extra, children: text }, key);
+
+  // The Branch here form, below the graph so the rows never move. busy: the open chat is running.
+  function branchForm(form, busy) {
+    const blocked = busy || form.busy;
+    const submit = () => (blocked ? undefined : submitBranch());
+    const field = (key, placeholder, extra = {}) =>
+      jsx(
+        Input,
+        {
+          value: form[key],
+          placeholder,
+          style: INPUT_STYLE,
+          'data-selectable-text': 'true',
+          'data-branch-field': key,
+          disabled: form.busy,
+          onChange: (event) => setBranchField(key, event?.target?.value),
+          onKeyDown: stopHostEvent,
+          onKeyUp: stopHostEvent,
+          onPointerDown: stopHostEvent,
+          ...extra,
+        },
+        key,
+      );
+    return jsxs(
+      'div',
+      {
+        className: 'flex flex-col gap-1 rounded border p-2',
+        style: { ...SELECTABLE, marginTop: 6 },
+        'data-selectable-text': 'true',
+        'data-branch-form': `${form.chatId}:${form.index}`,
+        onClick: stop,
+        children: [
+          jsx('p', { className: 'text-xs font-semibold', style: SELECTABLE, 'data-selectable-text': 'true', children: `Branch here: ${form.label}` }, 'head'),
+          field('question', 'Question for the branch', {
+            onKeyDown: (event) => {
+              stopHostEvent(event);
+              if (event?.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault?.();
+                submit();
+              }
+            },
+          }),
+          field('model', "Model (blank: this chat's model)"),
+          jsxs(
+            'div',
+            {
+              className: 'flex flex-wrap items-center gap-1',
+              style: SELECTABLE,
+              'data-selectable-text': 'true',
+              children: [
+                jsx(Button, {
+                  type: 'button',
+                  'data-branch-submit': 'true',
+                  disabled: blocked,
+                  onClick: (event) => {
+                    stop(event);
+                    return submit();
+                  },
+                  children: 'Branch and ask',
+                }),
+                jsx(Button, {
+                  type: 'button',
+                  variant: 'ghost',
+                  'data-branch-cancel': 'true',
+                  disabled: form.busy,
+                  onClick: (event) => {
+                    stop(event);
+                    cancelBranch();
+                  },
+                  children: 'Cancel',
+                }),
+                form.busy ? jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, 'data-selectable-text': 'true', children: 'Branching...' }) : null,
+              ].filter(Boolean),
+            },
+            'buttons',
+          ),
+          busy ? note(BRANCH_BUSY_TEXT, { 'data-branch-busy': 'true' }, 'busy') : null,
+          form.error
+            ? jsx('p', { className: 'text-xs text-destructive', style: SELECTABLE, 'data-selectable-text': 'true', 'data-branch-error': 'true', children: form.error }, 'error')
+            : null,
+        ].filter(Boolean),
+      },
+      'branch-form',
+    );
+  }
+
   function mergeResult(state) {
     return jsxs('div', {
       className: 'flex flex-col',
@@ -1175,86 +1889,135 @@ export function createChatTree(deps) {
       'data-merge-result': 'true',
       ...(state.fit ? { 'data-token-fit': state.fit } : {}),
       children: [
-        jsx('p', {
-          className: 'text-xs',
-          style: SELECTABLE,
-          'data-selectable-text': 'true',
-          'data-merge-notice': 'true',
-          children: state.notice,
-        }),
-        state.fit ? jsx('span', { className: 'text-xs opacity-70', style: SELECTABLE, 'data-token-readout': 'true', children: fitReadout(state) }) : null,
+        state.notice
+          ? jsx('p', {
+              className: 'text-xs',
+              style: SELECTABLE,
+              'data-selectable-text': 'true',
+              'data-merge-notice': 'true',
+              children: state.notice,
+            })
+          : null,
+        state.fit ? jsx('span', { className: 'text-xs opacity-70', style: SELECTABLE, 'data-selectable-text': 'true', 'data-token-readout': 'true', children: fitReadout(state) }) : null,
       ].filter(Boolean),
     });
   }
 
-  // Merge controls of a side chat. A click here must not open the chat behind it.
-  function mergeControls(row, state) {
-    const busy = state?.busy === true;
-    return jsxs('div', {
-      className: 'flex flex-col gap-1',
-      style: { ...SELECTABLE, marginTop: 4 },
-      'data-merge-controls': 'true',
-      onClick: stop,
-      children: [
-        jsxs('div', {
-          className: 'flex flex-wrap items-center gap-1',
-          children: [
-            jsx(Button, {
-              type: 'button',
-              'data-merge': 'asis',
-              disabled: busy,
-              title: 'Stage this side chat in the parent composer as it is. Nothing is sent.',
-              onClick: (event) => {
-                stop(event);
-                return mergeAsIs(row);
-              },
-              children: 'Merge as-is',
-            }),
-            jsx(Button, {
-              type: 'button',
-              'data-merge': 'digest',
-              disabled: true,
-              title: 'A short digest is planned. It is not built yet.',
-              onClick: stop,
-              children: 'Digest (later)',
-            }),
-            busy ? jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: 'Checking...' }) : null,
-          ].filter(Boolean),
-        }),
-        state?.notice ? mergeResult(state) : null,
-      ].filter(Boolean),
-    });
-  }
-
-  // One entry per side chat of the tree, below the graph, so a notice never moves the rows.
-  function sideEntries(lanes, ui) {
-    const sides = lanes.filter((lane) => lane.side);
-    if (!sides.length) return null;
+  // A notice that stays until Dismiss: the no-fit notice, or a failed fork digest.
+  function heldNotice(text, kind, onDismiss) {
     return jsxs(
       'div',
       {
-        className: 'flex flex-col gap-2',
+        className: 'flex items-start justify-between gap-2',
+        style: SELECTABLE,
+        'data-selectable-text': 'true',
+        'data-held-notice': kind,
+        onClick: stop,
+        children: [
+          jsx('p', { className: 'text-xs', style: SELECTABLE, 'data-selectable-text': 'true', children: text }),
+          jsx(Button, {
+            type: 'button',
+            size: 'xs',
+            variant: 'ghost',
+            'data-dismiss': kind,
+            onClick: (event) => {
+              stop(event);
+              onDismiss();
+            },
+            children: 'Dismiss',
+          }),
+        ],
+      },
+      `held:${kind}`,
+    );
+  }
+
+  // The one merge section, for the open chat: the target chips (parent first, then older
+  // ancestors) and the two buttons. On the root chat it is disabled with its reason.
+  function mergeSection(open, targets, target, ui) {
+    const state = ui.merge ?? {};
+    const busy = state.busy === true;
+    const reason = targets.length ? null : forkParentId(open.row) ? MERGE_PARENT_MISSING_TEXT : MERGE_ROOT_TEXT;
+    const button = (kind, label, title) =>
+      jsx(Button, {
+        type: 'button',
+        'data-merge': kind,
+        disabled: busy || reason !== null,
+        title,
+        onClick: (event) => {
+          stop(event);
+          return merge(kind);
+        },
+        children: label,
+      });
+    return jsxs(
+      'div',
+      {
+        className: 'flex flex-col gap-1',
         style: { ...SELECTABLE, marginTop: 8 },
         'data-selectable-text': 'true',
-        'data-side-chats': 'true',
-        children: sides.map((lane) =>
+        'data-merge-section': open.id,
+        ...(reason ? { 'data-merge-disabled': 'true' } : {}),
+        onClick: stop,
+        children: [
+          jsx('p', { className: 'text-xs font-semibold', style: SELECTABLE, 'data-selectable-text': 'true', children: `Merge ${open.title}` }, 'head'),
+          reason
+            ? note(reason, { 'data-merge-reason': 'true' }, 'reason')
+            : jsxs(
+                'div',
+                {
+                  className: 'flex flex-wrap items-center gap-1',
+                  style: SELECTABLE,
+                  'data-selectable-text': 'true',
+                  'data-merge-targets': 'true',
+                  role: 'group',
+                  'aria-label': 'Merge target',
+                  children: [
+                    jsx('span', { className: 'text-xs opacity-70', style: SELECTABLE, 'data-selectable-text': 'true', children: 'into:' }, 'into'),
+                    ...targets.map((t) =>
+                      jsx(
+                        Button,
+                        {
+                          type: 'button',
+                          size: 'xs',
+                          variant: t.id === target?.id ? 'secondary' : 'ghost',
+                          style: CHIP,
+                          title: t.title,
+                          'aria-pressed': t.id === target?.id,
+                          'data-merge-target': t.id,
+                          onClick: (event) => {
+                            stop(event);
+                            pickTarget(open.id, t.id);
+                          },
+                          children: t.title,
+                        },
+                        t.id,
+                      ),
+                    ),
+                  ],
+                },
+                'targets',
+              ),
           jsxs(
             'div',
             {
-              className: 'flex flex-col',
+              className: 'flex flex-wrap items-center gap-1',
               style: SELECTABLE,
               'data-selectable-text': 'true',
-              'data-side-entry': lane.id,
               children: [
-                jsx('span', { className: 'text-xs', title: lane.title, style: { ...LABEL_STYLE, opacity: 0.85 }, children: lane.title }),
-                mergeControls(lane.row, ui.merge[lane.id]),
-              ],
+                button('asis', 'Merge as-is', 'Stage this chat after its fork point in the target composer as it is. Nothing is sent.'),
+                button('digest', 'Digest', 'Stage a short digest of this chat after its fork point in the target composer. Nothing is sent.'),
+                busy
+                  ? jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, 'data-selectable-text': 'true', children: state.kind === 'digest' ? 'Writing the digest...' : 'Checking...' })
+                  : null,
+              ].filter(Boolean),
             },
-            `side:${lane.id}`,
+            'buttons',
           ),
-        ),
+          state.notice || state.fit ? mergeResult(state) : null,
+        ].filter(Boolean),
       },
-      'sides',
+      'merge',
     );
   }
 
@@ -1278,13 +2041,15 @@ export function createChatTree(deps) {
     );
   }
 
-  // Hook order is fixed: six useValue calls, every render, before any branch (React error 300).
-  // The sixth is the in-memory UI atom. Render only reads state; loading happens on focus change
-  // and on the timer, in register(); merging happens in a click handler. Row builders have no hooks.
+  // Hook order is fixed: seven useValue calls, every render, before any branch (React error 300).
+  // The last is the in-memory UI atom. Render only reads state; loading happens on focus change
+  // and on the timer, in register(); branching and merging happen in click handlers. Row builders
+  // have no hooks.
   function renderPane() {
     const stored = useValue(atomOf('focusedStoredSessionId'));
     const focused = useValue(atomOf('focusedSessionId'));
     const active = useValue(atomOf('activeSessionId'));
+    const busyMap = useValue(atomOf('busyBySession'));
     const data = useValue($data);
     const status = useValue($status);
     const ui = useValue($ui);
@@ -1292,9 +2057,14 @@ export function createChatTree(deps) {
     const runtime = focused ?? active ?? null;
     const tree = buildTree(data.rows, stored ?? runtime);
     const chats = lineageChats(tree);
-    const lanes = buildLanes(chats, data.exchanges);
-    const plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded });
+    const lanes = buildLanes(chats, data.exchanges, data.branchIds);
+    const open = tree ? (lanes.find((lane) => lane.id === tree.focused.id) ?? null) : null;
+    const targets = open ? mergeTargets(lanes, open.id) : [];
+    const target = open ? selectedTarget(targets, ui.target, open.id) : null;
+    const plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded, target: target?.id, digests: data.digests });
     const agents = runtime && data.agentsFor === runtime ? data.agents : [];
+    const busy = open ? chatBusy(busyMap, [runtime, open.id]) : false;
+    const form = ui.branch && open && ui.branch.chatId === open.id ? ui.branch : null;
 
     let notice = null;
     if (!stored && !runtime) notice = 'Open a chat to see its tree.';
@@ -1336,11 +2106,15 @@ export function createChatTree(deps) {
           notice ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: notice }) : null,
           capped ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: capped }) : null,
           status.note ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: status.note }) : null,
-          plan.rows.length ? graphView(plan, lanes) : null,
+          plan.rows.length ? graphView(plan, lanes, { openId: open?.id ?? null, busy, model: open?.model ?? '' }) : null,
+          form ? branchForm(form, busy) : null,
+          !form && busy && plan.rows.some((row) => row.branchable) ? note(BRANCH_BUSY_TEXT, { 'data-branch-busy': 'true' }, 'busy') : null,
+          ui.forkNotice ? heldNotice(ui.forkNotice, 'fork', dismissForkNotice) : null,
           agents.length
             ? jsx('div', { className: 'flex flex-col', style: { ...SELECTABLE, marginTop: 4 }, 'data-subagents': 'true', children: agents.map(agentLine) }, 'agents')
             : null,
-          sideEntries(lanes, ui),
+          open && plan.rows.length ? mergeSection(open, targets, target, ui) : null,
+          ui.held ? heldNotice(ui.held, 'merge', dismissHeld) : null,
         ].filter(Boolean),
       }),
     });
@@ -1352,6 +2126,10 @@ export function createChatTree(deps) {
     generation += 1;
     if (typeof cancelTimer === 'function') cancelTimer();
     cancelTimer = null;
+    // Pending digests end now; their callers see the dead activation and do nothing.
+    for (const finish of [...jobs.values()]) finish({ ok: false, error: 'The pane was closed.' });
+    early.clear();
+    listening = false;
     for (const off of unsubscribers.splice(0)) {
       try {
         off();
@@ -1371,8 +2149,21 @@ export function createChatTree(deps) {
     lastKey = null;
     scopedTimeout = null;
     historyCache = new Map();
+    storage = ctx?.storage ?? null;
+    // ctx.onEvent is tracked and removed with the plugin (contrib/plugin.ts); host.onEvent is the fallback.
+    const listen = typeof ctx?.onEvent === 'function' ? ctx.onEvent : typeof host?.onEvent === 'function' ? host.onEvent : null;
+    if (listen) {
+      try {
+        const off = listen(DIGEST_EVENT, onDigestEvent);
+        if (typeof off === 'function') unsubscribers.push(off);
+        listening = true;
+      } catch {
+        listening = false;
+      }
+    }
     $status.set({ loading: false, error: null, note: null });
     $ui.set(freshUi());
+    $data.set({ ...$data.get(), branchIds: storedBranchIds() });
     // ctx.setTimeout: the host clears it on unload (apps/desktop/src/contrib/plugin.ts).
     if (typeof ctx?.setTimeout === 'function') scopedTimeout = (fn, ms) => ctx.setTimeout(fn, ms);
     if (typeof ctx?.onDispose === 'function') ctx.onDispose(dispose);
@@ -1395,7 +2186,7 @@ export function createChatTree(deps) {
       data: {
         id: 'open-chat-tree',
         label: 'Open chat tree',
-        keywords: ['tree', 'branch', 'subagent', 'lineage'],
+        keywords: ['tree', 'branch', 'subagent', 'lineage', 'merge'],
         run: () => {
           if (typeof host?.revealPane === 'function') host.revealPane(`${PLUGIN_ID}:${PANE_ID}`);
         },

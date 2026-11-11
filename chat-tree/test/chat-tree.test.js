@@ -135,6 +135,7 @@ function fakeHost({
     focusedSessionOwner: atom(owner),
     connectionId: atom(active.connectionId),
     profile: atom(active.profile),
+    busyBySession: atom({}),
   };
   // A method payload is a value, a function of the params, an Error to throw, or undefined
   // (the method is unknown on this Hermes).
@@ -162,9 +163,26 @@ function fakeHost({
     breakdown: undefined,
     // setDraft result: true, false, an Error to throw, or a function([id, text]).
     setDraftResult: true,
+    // session.branch and prompt.submit results: a value, a function of the params, or an Error.
+    branchResult: { session_id: 'nb-rt', stored_session_id: 'nb', title: 'b2 (branch)' },
+    submitResult: { status: 'queued' },
+    // true: an open moves focus to the opened chat, as the desktop does.
+    moveFocusOnOpen: false,
+    // plugin.chat-tree.digest.write: digestError throws; else it answers { job } and, when
+    // digestEvent(params) gives { digest } or { error }, emits the digest event after the reply.
+    // flatEvent: emit the fields at the top level instead of under payload.
+    digestError: null,
+    digestEvent: undefined,
+    flatEvent: false,
+    jobs: 0,
+    emit: null,
     openSession: async (id, opts) => {
       opened.push([id, opts]);
       order.push(['open', id, opts]);
+      if (host.moveFocusOnOpen) {
+        state.focusedStoredSessionId.set(id);
+        state.focusedSessionId.set(`rt-${id}`);
+      }
     },
     revealPane: () => {},
     composer: {
@@ -200,6 +218,25 @@ function fakeHost({
           return answer(method, host.stats, params);
         case 'session.context_breakdown':
           return answer(method, host.breakdown, params);
+        case 'session.branch':
+          order.push(['branch', params]);
+          return answer(method, host.branchResult, params);
+        case 'prompt.submit':
+          order.push(['prompt', params]);
+          return answer(method, host.submitResult, params);
+        case 'plugin.chat-tree.digest.write': {
+          order.push(['digest', params]);
+          if (host.digestError) throw host.digestError;
+          const job = `job-${++host.jobs}`;
+          const body = typeof host.digestEvent === 'function' ? host.digestEvent(params) : null;
+          if (body) {
+            const event = host.flatEvent
+              ? { type: 'plugin.chat-tree.digest.written', job, ...body }
+              : { type: 'plugin.chat-tree.digest.written', session_id: params.session_id, payload: { job, ...body } };
+            Promise.resolve().then(() => host.emit?.('plugin.chat-tree.digest.written', event));
+          }
+          return { job };
+        }
         default:
           throw new Error(`unexpected ${method}`);
       }
@@ -208,9 +245,29 @@ function fakeHost({
   return host;
 }
 
-function setup({ host = fakeHost(), clock = fakeClock(), useValue } = {}) {
+// ctx.storage as the desktop gives it: synchronous JSON get/set.
+function fakeStorage(seed = {}) {
+  const map = new Map(Object.entries(seed));
+  return {
+    map,
+    get: (key) => (map.has(key) ? structuredClone(map.get(key)) : undefined),
+    set: (key, value) => map.set(key, structuredClone(value)),
+  };
+}
+
+// events: false gives a ctx with no onEvent (an older host).
+function setup({ host = fakeHost(), clock = fakeClock(), useValue, storage = fakeStorage(), events = true } = {}) {
   const registered = [];
   const disposers = [];
+  // ctx.onEvent as the desktop gives it: listeners by type, a disposer back.
+  const listeners = new Map();
+  const onEvent = (type, fn) => {
+    const set = listeners.get(type) ?? new Set();
+    set.add(fn);
+    listeners.set(type, set);
+    return () => set.delete(fn);
+  };
+  host.emit = (type, event) => [...(listeners.get(type) ?? [])].forEach((fn) => fn(event));
   const tree = createChatTree({
     host,
     jsx: el,
@@ -224,11 +281,15 @@ function setup({ host = fakeHost(), clock = fakeClock(), useValue } = {}) {
     register: (c) => registered.push(c),
     setTimeout: clock.setTimeout,
     onDispose: (fn) => disposers.push(fn),
+    storage,
+    ...(events ? { onEvent } : {}),
   });
   return {
     tree,
     host,
     clock,
+    storage,
+    listeners,
     registered,
     unload: () => disposers.forEach((fn) => fn()),
     pane: registered.find((c) => c.area === 'panes'),
@@ -731,10 +792,12 @@ test('the pane draws one row per exchange with the lane pills and the open node'
   await flush();
   const tree = ctx.pane.render();
   assert.deepEqual(nodeKeys(tree), MAIN_KEYS);
-  assert.deepEqual(pills(nodeOf(tree, 'root:0')), ['model:m1']);
-  assert.deepEqual(pills(nodeOf(tree, 'b3:1')), ['model:m1', 'side:side']);
-  assert.deepEqual(pills(nodeOf(tree, 'b1:2')), ['model:m1']);
+  // The model pill is on the open node only; the side pill stays on a side lane's first row.
+  assert.deepEqual(pills(nodeOf(tree, 'root:0')), []);
+  assert.deepEqual(pills(nodeOf(tree, 'b3:1')), ['side:side']);
+  assert.deepEqual(pills(nodeOf(tree, 'b1:2')), []);
   assert.deepEqual(pills(nodeOf(tree, 'root:1')), []);
+  assert.deepEqual(pills(nodeOf(tree, 'b2:3')), ['model:m1']);
   // The open node: filled circle, row highlight, left accent.
   const open = nodeOf(tree, 'b2:3');
   assert.equal(open.props['data-open'], 'true');
@@ -829,7 +892,7 @@ test('a merged side chat shows a Merged node on the parent lane with a grey curv
   const tree = ctx.pane.render();
   const merged = nodeOf(tree, 'par:1');
   assert.equal(merged.props['data-merge-node'], 'sd');
-  assert.match(textOf(merged), /^Merged: what is a monad\?$/);
+  assert.equal(merged.props.children[0].props.children, 'Merged: what is a monad?');
   const curve = findAll(byAttr(tree, 'data-graph', 'true')[0], (n) => n.type === 'path' && n.key === 'merge:sd:2')[0];
   assert.equal(curve.props.stroke, GREY);
   ctx.unload();
@@ -1029,12 +1092,13 @@ test('each render calls the same hooks in the same order (React error 300)', asy
   host.state.focusedStoredSessionId.set('missing');
   await flush();
   states.push(order()); // not in list
-  // Five host/data atoms, then the in-memory UI atom ($ui) last.
+  // Four host atoms (busyBySession included), two data atoms, then the in-memory UI atom ($ui) last.
   for (const s of states) {
-    assert.equal(s.length, 6);
+    assert.equal(s.length, 7);
     assert.deepEqual(s, states[0]);
   }
-  assert.equal(states[0][5], ctx.tree.$ui);
+  assert.equal(states[0][3], host.state.busyBySession);
+  assert.equal(states[0][6], ctx.tree.$ui);
   ctx.unload();
 });
 
@@ -1063,7 +1127,7 @@ test('register after dispose (disable, then enable) works again with fresh UI st
   const disposers = [];
   ctx.tree.register({ register: () => {}, setTimeout: clock.setTimeout, onDispose: (fn) => disposers.push(fn) });
   await flush();
-  assert.deepEqual(ctx.tree.$ui.get(), { open: null, expanded: {}, merge: {} });
+  assert.deepEqual(ctx.tree.$ui.get(), { open: null, expanded: {}, merge: {}, held: null, target: null, branch: null, forkNotice: null });
   assert.deepEqual(nodeKeys(ctx.pane.render()), ['root:0', 'root:9']);
   const before = listCalls(host);
   host.state.focusedStoredSessionId.set('root2');
@@ -1176,37 +1240,6 @@ test('rowText takes trimmed text, then string content, then joined part text', (
   assert.equal(mod.rowText(null), '');
 });
 
-test('turnsFromRows skips tool and system rows and joins assistant texts until the next user', () => {
-  const rows = [
-    { role: 'system', text: 'sys' },
-    { role: 'assistant', text: 'orphan answer before any question' },
-    { role: 'user', text: 'q1' },
-    { role: 'tool', text: 'tool out' },
-    { role: 'assistant', text: 'a1 part 1' },
-    { role: 'assistant', text: '   ' },
-    { role: 'assistant', content: [{ text: 'a1 part 2' }] },
-    { role: 'user', text: 'q2' },
-    { role: 'assistant', text: 'a2' },
-    { role: 'user', text: 'q3 never answered' },
-  ];
-  assert.deepEqual(mod.turnsFromRows(rows), [
-    { question: 'q1', answer: 'a1 part 1\na1 part 2' },
-    { question: 'q2', answer: 'a2' },
-  ]);
-  assert.deepEqual(mod.turnsFromRows(null), []);
-});
-
-test('formatSideVerbatim writes the side-chat shape: blank lines after the header and between blocks', () => {
-  assert.equal(
-    mod.formatSideVerbatim('  Side: q  ', [
-      { question: 'q1', answer: 'a1' },
-      { question: 'q2', answer: 'a2' },
-    ]),
-    'From side chat: Side: q\n\nYou:\nq1\n\nAssistant:\na1\n\nYou:\nq2\n\nAssistant:\na2',
-  );
-  assert.equal(mod.formatSideVerbatim('', [{ question: 'q', answer: 'a' }]), 'From side chat: Side chat\n\nYou:\nq\n\nAssistant:\na');
-});
-
 test('formatNoFitNotice and formatMissingWindowNotice use the side-chat wording', () => {
   assert.equal(
     mod.formatNoFitNotice({ sideTokens: 12400, available: 3200, used: 124800, max: 128000, sideEstimated: true }),
@@ -1222,32 +1255,54 @@ test('formatNoFitNotice and formatMissingWindowNotice use the side-chat wording'
   );
 });
 
-test('rowsAfterSharedPrefix drops the shared start and keeps the side-only remainder', () => {
-  const shared = [
-    { role: 'user', text: 'main q' },
-    { role: 'assistant', content: [{ text: 'main a' }] },
-    { role: 'tool', text: '' },
-  ];
-  const side = [
-    { role: 'user', content: ' main q ' },
-    { role: 'assistant', text: 'main a' },
-    { role: 'tool', text: '' },
-    { role: 'user', text: 'side q' },
-    { role: 'assistant', text: 'side a' },
-  ];
-  assert.deepEqual(mod.rowsAfterSharedPrefix(side, shared), side.slice(3));
-  // The parent moved on after the fork: the walk stops at the first row that differs.
-  const moved = [...shared, { role: 'user', text: 'parent kept going' }];
-  assert.deepEqual(mod.rowsAfterSharedPrefix(side, moved), side.slice(3));
-  // A same role with different text, and a same text with a different role, both end the prefix.
-  assert.deepEqual(mod.rowsAfterSharedPrefix([{ role: 'user', text: 'x' }], [{ role: 'user', text: 'y' }]), [{ role: 'user', text: 'x' }]);
-  assert.deepEqual(mod.rowsAfterSharedPrefix([{ role: 'user', text: 'x' }], [{ role: 'assistant', text: 'x' }]), [{ role: 'user', text: 'x' }]);
-  assert.deepEqual(mod.rowsAfterSharedPrefix(side, []), side);
-  assert.deepEqual(mod.rowsAfterSharedPrefix(shared, shared), []);
-  assert.deepEqual(mod.rowsAfterSharedPrefix(null, null), []);
+
+test('formatNoFitNotice names the button and the target when given', () => {
+  assert.equal(
+    mod.formatNoFitNotice({ sideTokens: 20, available: 10, used: 127990, max: 128000, sideEstimated: true, mode: 'Digest', target: 'Main' }),
+    "Doesn't fit (Digest): side chat is 20 tokens (estimated), Main has 10 available (127,990 used of 128,000).",
+  );
 });
 
-// ── Merge as-is (unchanged behaviour; the controls sit in the side chat list below the graph) ──
+test('stripConceptMarkup (copied from side-chat) keeps the plain sentence, and code as written', () => {
+  assert.equal(mod.stripConceptMarkup('A [[monad|a type]] wraps values.'), 'A monad wraps values.');
+  assert.equal(mod.stripConceptMarkup('::termline{v="Plain sentence." t="x"}'), 'Plain sentence.');
+  assert.equal(mod.stripConceptMarkup('Use `[[ a || b ]]` here.'), 'Use `[[ a || b ]]` here.');
+  assert.equal(mod.stripConceptMarkup(null), '');
+});
+
+// ── Branch here: the count mapping ──────────────────────────────────────────────────────────
+
+test('branchCount: user and assistant rows with text, through the exchange last answer', () => {
+  const rows = [
+    { role: 'assistant', text: 'hello, how can I help?' }, // a greeting: the gateway keeps it
+    { role: 'user', text: 'q1', row_id: 11 },
+    { role: 'assistant', text: 'a1', row_id: 12 },
+    { role: 'user', text: 'q2', row_id: 13 },
+    { role: 'assistant', text: '', row_id: 14 }, // a tool call with no text
+    { role: 'tool', text: 'tool out', row_id: 15 },
+    { role: 'assistant', content: [{ text: 'a2' }], row_id: 16 },
+    { role: 'system', text: 'note' },
+    { role: 'user', text: '   ', row_id: 17 }, // an empty user row is an exchange, not a counted row
+    { role: 'assistant', text: 'a3', row_id: 18 },
+    { role: 'user', text: 'q4 never answered', row_id: 19 },
+  ];
+  assert.deepEqual(mod.branchCount(rows, 0), { count: 3, through: 12 });
+  assert.deepEqual(mod.branchCount(rows, 1), { count: 5, through: 16 });
+  assert.deepEqual(mod.branchCount(rows, 2), { count: 6, through: 18 });
+  // No answer yet, past the end, or a bad index: no branch.
+  assert.equal(mod.branchCount(rows, 3), null);
+  assert.equal(mod.branchCount(rows, 4), null);
+  assert.equal(mod.branchCount(rows, -1), null);
+  assert.equal(mod.branchCount(rows, 1.5), null);
+  // Exchange numbers match exchangesFromRows, so a node index maps to its rows.
+  assert.equal(mod.exchangesFromRows(rows).length, 4);
+  // Rows with no row_id give no row boundary; two answer rows count twice.
+  const plain = msgs(['q1', 'a1'], ['q2', 'a2']);
+  assert.deepEqual(mod.branchCount(plain, 1), { count: 4, through: null });
+  assert.deepEqual(mod.branchCount([...msgs(['q', 'a']), { role: 'assistant', text: 'a more' }], 0), { count: 3, through: null });
+});
+
+// ── Merge section ───────────────────────────────────────────────────────────────────────────
 
 const SHARED = [
   { role: 'user', text: 'main q' },
@@ -1259,87 +1314,322 @@ const SIDE_ROWS = [
   { role: 'tool', text: 'ls out' },
   { role: 'assistant', text: 'a burrito' },
 ];
-const DRAFT = 'From side chat: Side: what is a monad?\n\nYou:\nwhat is a monad?\n\nAssistant:\na burrito';
+// Header: the side chat's first own question. Body: its own pairs, tool rows skipped.
+const DRAFT = 'From side chat: what is a monad?\n\nYou:\nwhat is a monad?\n\nAssistant:\na burrito';
 
-async function mergeCtx({ rows = MERGE_ROWS, stored = 'par', runtime = 'rt-par', prepare } = {}) {
+// Focus on the side chat `sd`; its parent is `par` (title Main).
+async function mergeCtx({ rows = MERGE_ROWS, stored = 'sd', runtime = 'rt-sd', prepare, events = true } = {}) {
   const host = fakeHost({ rows, stored, runtime, history: { par: SHARED, sd: SIDE_ROWS } });
   host.usage = { context_used: 1000, context_max: 128000 };
   if (prepare) prepare(host);
-  const ctx = setup({ host });
+  const ctx = setup({ host, events });
   await flush();
   ctx.mark = host.calls.length;
   return ctx;
 }
-const sideEntry = (ctx, id = 'sd') => byAttr(ctx.pane.render(), 'data-side-entry', id)[0];
-const mergeButton = (ctx, kind = 'asis', id = 'sd') => byAttr(sideEntry(ctx, id), 'data-merge', kind)[0];
-const fitOf = (ctx, id = 'sd') => byAttr(sideEntry(ctx, id), 'data-token-fit')[0];
+const section = (ctx) => byAttr(ctx.pane.render(), 'data-merge-section')[0];
+const mergeButton = (ctx, kind = 'asis') => byAttr(section(ctx), 'data-merge', kind)[0];
+const chip = (ctx, id) => byAttr(section(ctx), 'data-merge-target', id)[0];
+const fitOf = (ctx) => byAttr(ctx.pane.render(), 'data-token-fit')[0];
 // session.* calls since the merge context was ready, so the tree's own history reads do not count.
 const sessionCalls = (ctx) => ctx.host.calls.slice(ctx.mark).filter(([m]) => m.startsWith('session.'));
 const exactText = (tree, text) => findAll(tree, (n) => n.props?.children === text)[0];
+const OPEN_HERE = { intent: 'in-place', profile: 'default' };
 
-test('the draft in the tests has 21 estimated tokens', () => {
-  assert.equal(mod.estimateTokens(DRAFT), 21);
+test('the draft in the tests has 20 estimated tokens', () => {
+  assert.equal(mod.estimateTokens(DRAFT), 20);
 });
 
-test('Merge as-is and a disabled Digest (later) show for side chats only, below the graph', async () => {
-  const ctx = await mergeCtx();
+test('one merge section for the open chat: two buttons, ancestor chips, the parent picked', async () => {
+  const ctx = setup(); // focus b2: parent b1, then root
+  await flush();
   const tree = ctx.pane.render();
-  assert.deepEqual(byAttr(tree, 'data-side-entry').map((n) => n.props['data-side-entry']), ['sd']);
-  assert.match(textOf(sideEntry(ctx)), /Side: what is a monad\?/);
-  const asis = mergeButton(ctx);
-  assert.equal(asis.type, 'Button');
-  assert.equal(asis.props.children, 'Merge as-is');
-  const digest = mergeButton(ctx, 'digest');
-  assert.equal(digest.props.children, 'Digest (later)');
-  assert.equal(digest.props.disabled, true);
-  // Not inside the graph rows.
-  assert.equal(byAttr(byAttr(tree, 'data-tree-graph', 'true')[0], 'data-merge').length, 0);
-  const event = fakeEvent();
-  await digest.props.onClick(event);
-  assert.equal(event.stopped, 1);
-  assert.equal(sessionCalls(ctx).length, 0);
-  assert.equal(ctx.host.opened.length, 0);
+  const sections = byAttr(tree, 'data-merge-section');
+  assert.equal(sections.length, 1);
+  assert.equal(sections[0].props['data-merge-section'], 'b2');
+  assert.deepEqual(byAttr(sections[0], 'data-merge').map((b) => b.props.children), ['Merge as-is', 'Digest']);
+  assert.ok(byAttr(sections[0], 'data-merge').every((b) => b.type === 'Button' && b.props.disabled === false));
+  assert.doesNotMatch(textOf(tree), /Merge record|Digest \(later\)/);
+  // into: <parent> <grandparent>, the parent pressed.
+  const chips = byAttr(sections[0], 'data-merge-target');
+  assert.deepEqual(chips.map((c) => [c.props['data-merge-target'], c.props.children, c.props['aria-pressed']]), [
+    ['b1', 'b1', true],
+    ['root', 'root', false],
+  ]);
+  assert.match(textOf(byAttr(sections[0], 'data-merge-targets')[0]), /^into:/);
+  // The old per-side-chat rows are gone.
+  assert.equal(byAttr(tree, 'data-side-entry').length, 0);
+  assert.equal(byAttr(tree, 'data-side-chats').length, 0);
+  // A chip click picks that ancestor.
+  chip(ctx, 'root').props.onClick(fakeEvent());
+  assert.deepEqual(chip(ctx, 'root').props['aria-pressed'], true);
+  assert.deepEqual(chip(ctx, 'b1').props['aria-pressed'], false);
   ctx.unload();
 });
 
-test('rendering the pane does not read the parent context window', async () => {
-  const ctx = await mergeCtx();
-  ctx.pane.render();
-  ctx.pane.render();
-  assert.equal(sessionCalls(ctx).length, 0);
-  assert.equal(ctx.host.drafts.length, 0);
+test('mergeTargets lists the ancestors parent first; selectedTarget defaults to the parent', () => {
+  const { lanes } = planFor(ROWS, 'b2', HIST);
+  const targets = mod.mergeTargets(lanes, 'b2');
+  assert.deepEqual(targets, [
+    { id: 'b1', title: 'b1' },
+    { id: 'root', title: 'root' },
+  ]);
+  assert.deepEqual(mod.mergeTargets(lanes, 'root'), []);
+  assert.equal(mod.selectedTarget(targets, null, 'b2').id, 'b1');
+  assert.equal(mod.selectedTarget(targets, { chatId: 'b2', id: 'root' }, 'b2').id, 'root');
+  // A pick made for another chat, or an id that is no ancestor, falls back to the parent.
+  assert.equal(mod.selectedTarget(targets, { chatId: 'b1', id: 'root' }, 'b2').id, 'b1');
+  assert.equal(mod.selectedTarget(targets, { chatId: 'b2', id: 'b3' }, 'b2').id, 'b1');
+  assert.equal(mod.selectedTarget([], null, 'root'), null);
+});
+
+test('the merge target lane lights up in the plan and the geometry, in the same two colours', async () => {
+  const { plan } = planFor(ROWS, 'b2', HIST, { target: 'root' });
+  assert.deepEqual(plan.rows.filter((r) => r.target).map((r) => r.key), ['root:0', 'root:1', 'root:2']);
+  assert.deepEqual(plan.lanes.filter((l) => l.target).map((l) => l.id), ['root']);
+  const geo = mod.graphGeometry(plan);
+  assert.deepEqual(geo.paths.filter((p) => p.target).map((p) => p.key), ['lane:root:0', 'lane:root:2']);
+  assert.deepEqual(geo.circles.filter((c) => c.target).map((c) => c.key), ['root:0', 'root:1', 'root:2']);
+  // No target, or an unknown one: nothing lights up.
+  assert.equal(planFor(ROWS, 'b2', HIST).plan.rows.some((r) => r.target), false);
+  assert.equal(planFor(ROWS, 'b2', HIST, { target: 'nope' }).plan.rows.some((r) => r.target), false);
+
+  // The pane: the parent lane by default, then the picked chip's lane. Dashed and thicker, never a third colour.
+  const ctx = setup();
+  await flush();
+  const lit = () => {
+    const svg = byAttr(ctx.pane.render(), 'data-graph', 'true')[0];
+    return findAll(svg, (n) => n.props?.['data-target'] === 'true');
+  };
+  const keys = (shapes) => shapes.map((n) => n.key);
+  assert.deepEqual(keys(lit()), ['fork:b1', 'c:b1:2']);
+  chip(ctx, 'root').props.onClick(fakeEvent());
+  const shapes = lit();
+  assert.deepEqual(keys(shapes), ['lane:root:0', 'lane:root:2', 'c:root:0', 'c:root:1', 'c:root:2']);
+  for (const p of shapes.filter((n) => n.type === 'path')) {
+    assert.equal(p.props.strokeDasharray, '4 3');
+    assert.ok(p.props.strokeWidth > 2);
+  }
+  for (const c of shapes.filter((n) => n.type === 'circle')) assert.equal(c.props.strokeWidth, 2.5);
+  const svg = byAttr(ctx.pane.render(), 'data-graph', 'true')[0];
+  const colours = new Set(findAll(svg, (n) => n.type === 'path' || n.type === 'circle').map((n) => n.props.stroke));
+  assert.deepEqual([...colours].sort(), [BLUE, GREY].sort());
+  // The node rows of that lane say so too.
+  assert.deepEqual(nodeRows(ctx.pane.render()).filter((n) => n.props['data-target-lane']).map((n) => n.props['data-node']), ['root:0', 'root:1', 'root:2']);
   ctx.unload();
 });
 
-test('Merge as-is opens the parent in place and stages the side exchange verbatim, never sending', async () => {
+test('on the root chat the merge section is disabled with a one-line reason', async () => {
+  const ctx = setup({ host: fakeHost({ stored: 'root', runtime: 'rt-root' }) });
+  await flush();
+  ctx.mark = ctx.host.calls.length;
+  const s = section(ctx);
+  assert.equal(s.props['data-merge-disabled'], 'true');
+  assert.equal(textOf(byAttr(s, 'data-merge-reason')[0]), mod.MERGE_ROOT_TEXT);
+  assert.equal(byAttr(s, 'data-merge-target').length, 0);
+  assert.ok(byAttr(s, 'data-merge').every((b) => b.props.disabled === true));
+  await mergeButton(ctx).props.onClick(fakeEvent());
+  assert.equal(sessionCalls(ctx).length, 0);
+  assert.deepEqual(ctx.host.order, []);
+  ctx.unload();
+});
+
+test('Merge as-is stages the header and the own pairs into the parent, opens it in place, never sends', async () => {
   const ctx = await mergeCtx();
   const event = fakeEvent();
-  mergeButton(ctx).props.onClick(event);
+  const done = mergeButton(ctx).props.onClick(event);
   assert.equal(event.stopped, 1);
+  await done;
   await flush();
   assert.deepEqual(ctx.host.order, [
-    ['open', 'par', { intent: 'in-place' }],
+    ['open', 'par', OPEN_HERE],
     ['draft', 'par', DRAFT],
   ]);
-  assert.equal(ctx.host.order.some(([kind]) => kind === 'submit'), false);
-  assert.deepEqual(ctx.host.opened, [['par', { intent: 'in-place' }]]);
-  // Reads: transcript is unknown on v0.23, so history, side then parent, then the window.
+  assert.equal(ctx.host.order.some(([kind]) => kind === 'submit' || kind === 'prompt'), false);
+  // Reads: this chat (transcript unknown on v0.23, so history), then the target's window.
+  // The fork point comes from the parent as the tree loaded it: no fresh parent read.
   assert.deepEqual(sessionCalls(ctx).map(([m, p]) => [m, p.session_id]), [
     ['session.transcript', 'sd'],
     ['session.history', 'sd'],
-    ['session.transcript', 'par'],
-    ['session.history', 'par'],
     ['session.usage', 'par'],
   ]);
   const tree = ctx.pane.render();
-  const fit = fitOf(ctx);
-  assert.equal(fit.props['data-token-fit'], 'yes');
+  assert.equal(fitOf(ctx).props['data-token-fit'], 'yes');
   const notice = exactText(tree, MERGE_STAGED_TEXT);
   assert.equal(notice.props.style.userSelect, 'text');
   assert.equal(notice.props['data-selectable-text'], 'true');
-  assert.match(textOf(fit), /21/);
-  assert.match(textOf(fit), /estimated/);
-  assert.match(textOf(fit), /127,000/);
+  assert.match(textOf(fitOf(ctx)), /20/);
+  assert.match(textOf(fitOf(ctx)), /127,000/);
+  ctx.unload();
+});
+
+test('a merge into a grandparent uses the open chat own part and the grandparent window', async () => {
+  const host = fakeHost();
+  host.usage = { context_used: 1000, context_max: 128000 };
+  const ctx = setup({ host });
+  await flush();
+  ctx.mark = host.calls.length;
+  chip(ctx, 'root').props.onClick(fakeEvent());
+  await mergeButton(ctx).props.onClick(fakeEvent());
+  // b2 shares three exchanges with b1, so its own part is b2q only.
+  assert.deepEqual(host.order, [
+    ['open', 'root', OPEN_HERE],
+    ['draft', 'root', 'From side chat: b2q\n\nYou:\nb2q\n\nAssistant:\nb2a'],
+  ]);
+  assert.deepEqual(sessionCalls(ctx).find(([m]) => m === 'session.usage'), ['session.usage', { session_id: 'root' }]);
+  ctx.unload();
+});
+
+test('Digest asks the plugin RPC on the open chat session, waits for its event, then stages header + digest', async () => {
+  for (const flat of [false, true]) {
+    const ctx = await mergeCtx({
+      prepare: (host) => {
+        host.flatEvent = flat;
+        host.digestEvent = () => ({ digest: 'A [[monad|a type]] is ::termline{v="a burrito." t="t"}' });
+      },
+    });
+    // An event for another job changes nothing.
+    ctx.host.emit('plugin.chat-tree.digest.written', { payload: { job: 'other', digest: 'wrong' } });
+    await mergeButton(ctx, 'digest').props.onClick(fakeEvent());
+    await flush();
+    assert.deepEqual(ctx.host.order, [
+      [
+        'digest',
+        {
+          session_id: 'rt-sd',
+          purpose: 'merge',
+          title: 'Side: what is a monad?',
+          exchanges: [{ question: 'what is a monad?', answer: 'a burrito' }],
+        },
+      ],
+      ['open', 'par', OPEN_HERE],
+      ['draft', 'par', 'From side chat: what is a monad?\n\nA monad is a burrito.'],
+    ]);
+    assert.ok(exactText(ctx.pane.render(), MERGE_STAGED_TEXT));
+    ctx.unload();
+  }
+});
+
+test('digestResult reads the event payload, or a flat event, and checks it', () => {
+  assert.deepEqual(mod.digestResult({ type: 't', payload: { job: 'j', digest: ' d ' } }), { job: 'j', ok: true, digest: 'd' });
+  assert.deepEqual(mod.digestResult({ job: 7, digest: 'd' }), { job: '7', ok: true, digest: 'd' });
+  assert.deepEqual(mod.digestResult({ payload: { job: 'j', error: 'no model' } }), { job: 'j', ok: false, error: 'no model' });
+  assert.deepEqual(mod.digestResult({ payload: { job: 'j', digest: '' } }), { job: 'j', ok: false, error: 'The digest backend sent no digest.' });
+  assert.equal(mod.digestResult(null).job, '');
+});
+
+test('Merge as-is also removes concept markup from the body and keeps the header on one line', () => {
+  assert.equal(
+    mod.formatMergeText('first line\n\n  second', mod.verbatimBody([{ question: 'q', answer: 'see [[monad|a type]]' }])),
+    'From side chat: first line second\n\nYou:\nq\n\nAssistant:\nsee monad',
+  );
+  assert.equal(mod.mergeHeader(mod.formatMergeText('a\n\nb', 'body')), 'a b');
+});
+
+test('a digest failure shows a notice and stages nothing: an error event, -32601, a failed request, a bad event, 60 s of silence, no event stream', async () => {
+  const notFound = Object.assign(new Error('Method not found: plugin.chat-tree.digest.write'), { code: -32601 });
+  const cases = [
+    [{ prepare: (host) => (host.digestEvent = () => ({ error: 'model down.' })) }, 'Digest failed: model down. Nothing was staged.'],
+    [{ prepare: (host) => (host.digestError = notFound) }, mod.DIGEST_MISSING_TEXT],
+    [{ prepare: (host) => (host.digestError = new Error('gateway hiccup')) }, 'Digest failed: gateway hiccup. Nothing was staged.'],
+    [{ prepare: (host) => (host.digestEvent = () => ({ digest: 42 })) }, 'Digest failed: The digest backend sent no digest. Nothing was staged.'],
+    [{}, `Digest failed: ${mod.DIGEST_TIMEOUT_TEXT.replace(/\.$/, '')}. Nothing was staged.`],
+    [{ events: false }, mod.DIGEST_MISSING_TEXT],
+  ];
+  for (const [options, text] of cases) {
+    const ctx = await mergeCtx(options);
+    let done;
+    await assert.doesNotReject(async () => {
+      done = mergeButton(ctx, 'digest').props.onClick(fakeEvent());
+      await flush();
+      await ctx.clock.tick(mod.DIGEST_TIMEOUT_MS);
+      await done;
+    });
+    await flush();
+    assert.deepEqual(ctx.host.order.filter(([k]) => k !== 'digest'), [], text);
+    assert.deepEqual(ctx.host.drafts, []);
+    const notice = exactText(ctx.pane.render(), text);
+    assert.ok(notice, text);
+    assert.equal(notice.props.style.userSelect, 'text');
+    ctx.unload();
+  }
+});
+
+test('a no-fit notice holds until Dismiss; nothing opens or stages', async () => {
+  const ctx = await mergeCtx({ prepare: (host) => (host.usage = { context_used: 127990, context_max: 128000 }) });
+  await assert.doesNotReject(async () => mergeButton(ctx).props.onClick(fakeEvent()));
+  await flush();
+  assert.deepEqual(ctx.host.order, []);
+  const text = "Doesn't fit (Merge as-is): side chat is 20 tokens (estimated), Main has 10 available (127,990 used of 128,000).";
+  const held = () => byAttr(ctx.pane.render(), 'data-held-notice', 'merge')[0];
+  assert.equal(textOf(held()).split('\n')[0], text);
+  assert.equal(fitOf(ctx).props['data-token-fit'], 'no');
+  assert.match(textOf(fitOf(ctx)), /20/);
+  // A refresh, a focus change, and a later merge that fits all leave it.
+  await ctx.clock.tick(REFRESH_MS);
+  assert.ok(held());
+  ctx.host.state.focusedStoredSessionId.set('par');
+  ctx.host.state.focusedSessionId.set('rt-par');
+  await flush();
+  assert.ok(held());
+  ctx.host.state.focusedStoredSessionId.set('sd');
+  ctx.host.state.focusedSessionId.set('rt-sd');
+  await flush();
+  ctx.host.usage = { context_used: 1000, context_max: 128000 };
+  await mergeButton(ctx).props.onClick(fakeEvent());
+  assert.equal(ctx.host.drafts.length, 1);
+  assert.ok(held());
+  // Dismiss clears it.
+  byAttr(held(), 'data-dismiss', 'merge')[0].props.onClick(fakeEvent());
+  assert.equal(held(), undefined);
+  ctx.unload();
+});
+
+test('a window that fits exactly is allowed', async () => {
+  const ctx = await mergeCtx({ prepare: (host) => (host.usage = { context_used: 127980, context_max: 128000 }) });
+  await mergeButton(ctx).props.onClick(fakeEvent());
+  assert.equal(ctx.host.drafts.length, 1);
+  assert.equal(fitOf(ctx).props['data-token-fit'], 'yes');
+  ctx.unload();
+});
+
+test('the target window is read from usage, then stats, then context_breakdown, for the target id only', async () => {
+  const ctx = await mergeCtx({
+    prepare: (host) => {
+      host.usage = new Error('no usage');
+      host.stats = { calls: 1, total: 3 }; // no max: try on
+      host.breakdown = { context_used: 100, context_max: 1000 };
+    },
+  });
+  await mergeButton(ctx).props.onClick(fakeEvent());
+  assert.deepEqual(
+    sessionCalls(ctx).filter(([m]) => /usage|stats|breakdown/.test(m)).map(([m, p]) => [m, p.session_id]),
+    [
+      ['session.usage', 'par'],
+      ['session.stats', 'par'],
+      ['session.context_breakdown', 'par'],
+    ],
+  );
+  assert.equal(fitOf(ctx).props['data-token-fit'], 'yes');
+  assert.equal(ctx.host.drafts.length, 1);
+  ctx.unload();
+});
+
+test('when no window is reported, the draft is still staged and the notice says so', async () => {
+  const ctx = await mergeCtx({
+    prepare: (host) => {
+      host.usage = new Error('usage down');
+      host.stats = new Error('stats down');
+      host.breakdown = new Error('breakdown down');
+    },
+  });
+  await mergeButton(ctx).props.onClick(fakeEvent());
+  assert.deepEqual(ctx.host.order, [
+    ['open', 'par', OPEN_HERE],
+    ['draft', 'par', DRAFT],
+  ]);
+  assert.ok(exactText(ctx.pane.render(), mod.formatMissingWindowNotice(20)));
+  assert.equal(fitOf(ctx).props['data-token-fit'], 'unknown');
   ctx.unload();
 });
 
@@ -1357,77 +1647,7 @@ test('Merge as-is reads session.transcript with the oldest order when the host h
   ctx.unload();
 });
 
-test('the merge target is the parent of the side chat, not the focused chat', async () => {
-  // Focused on b2; b3 is a side chat of root. Its parent window and draft go to root.
-  const host = fakeHost({
-    history: { ...HIST, root: SHARED, b3: [...SHARED, { role: 'user', text: 'what is x?' }, { role: 'assistant', text: 'x is y' }] },
-  });
-  host.usage = { context_used: 1000, context_max: 128000 };
-  const ctx = setup({ host });
-  await flush();
-  ctx.mark = host.calls.length;
-  await mergeButton(ctx, 'asis', 'b3').props.onClick(fakeEvent());
-  assert.deepEqual(host.order, [
-    ['open', 'root', { intent: 'in-place' }],
-    ['draft', 'root', 'From side chat: Side: what is x?\n\nYou:\nwhat is x?\n\nAssistant:\nx is y'],
-  ]);
-  assert.deepEqual(sessionCalls(ctx).find(([m]) => m === 'session.usage'), ['session.usage', { session_id: 'root' }]);
-  ctx.unload();
-});
-
-test('a parent window with no room does not open, does not stage, and does not throw', async () => {
-  const ctx = await mergeCtx({ prepare: (host) => (host.usage = { context_used: 127990, context_max: 128000 }) });
-  await assert.doesNotReject(async () => mergeButton(ctx).props.onClick(fakeEvent()));
-  await flush();
-  assert.deepEqual(ctx.host.order, []);
-  assert.deepEqual(ctx.host.opened, []);
-  const tree = ctx.pane.render();
-  const text = "Doesn't fit: side chat is 21 tokens (estimated), parent has 10 available (127,990 used of 128,000).";
-  const notice = exactText(tree, text);
-  assert.ok(notice);
-  assert.equal(notice.props.style.userSelect, 'text');
-  const fit = fitOf(ctx);
-  assert.equal(fit.props['data-token-fit'], 'no');
-  assert.match(textOf(fit), /21/);
-  assert.match(textOf(fit), /10/);
-  ctx.unload();
-});
-
-test('a window that fits exactly is allowed', async () => {
-  const ctx = await mergeCtx({ prepare: (host) => (host.usage = { context_used: 127979, context_max: 128000 }) });
-  await mergeButton(ctx).props.onClick(fakeEvent());
-  assert.equal(ctx.host.drafts.length, 1);
-  assert.equal(fitOf(ctx).props['data-token-fit'], 'yes');
-  ctx.unload();
-});
-
-test('the window is read from usage, then stats, then context_breakdown, parent id first then the focused id', async () => {
-  const ctx = await mergeCtx({
-    prepare: (host) => {
-      host.usage = new Error('no usage');
-      host.stats = { calls: 1, total: 3 }; // no max: try on
-      host.breakdown = (params) => (params.session_id === 'par' ? { calls: 0 } : { context_used: 100, context_max: 1000 });
-    },
-  });
-  await mergeButton(ctx).props.onClick(fakeEvent());
-  assert.deepEqual(
-    sessionCalls(ctx).filter(([m]) => /usage|stats|breakdown/.test(m)).map(([m, p]) => [m, p.session_id]),
-    [
-      ['session.usage', 'par'],
-      ['session.usage', 'rt-par'],
-      ['session.stats', 'par'],
-      ['session.stats', 'rt-par'],
-      ['session.context_breakdown', 'par'],
-      ['session.context_breakdown', 'rt-par'],
-    ],
-  );
-  // 21 tokens against 900 available fits.
-  assert.equal(fitOf(ctx).props['data-token-fit'], 'yes');
-  assert.equal(ctx.host.drafts.length, 1);
-  ctx.unload();
-});
-
-test('two side pairs after the shared prefix are both staged; copied parent rows and tool rows are not', async () => {
+test('two own pairs are both staged; copied parent rows and tool rows are not', async () => {
   const ctx = await mergeCtx({
     prepare: (host) => {
       host.history.sd = [
@@ -1443,33 +1663,8 @@ test('two side pairs after the shared prefix are both staged; copied parent rows
   });
   await mergeButton(ctx).props.onClick(fakeEvent());
   const draft = ctx.host.drafts[0][1];
-  assert.equal(
-    draft,
-    'From side chat: Side: what is a monad?\n\nYou:\nq1\n\nAssistant:\na1\n\nYou:\nq2\n\nAssistant:\na2 first\na2 second',
-  );
+  assert.equal(draft, 'From side chat: q1\n\nYou:\nq1\n\nAssistant:\na1\n\nYou:\nq2\n\nAssistant:\na2 first\na2 second');
   assert.doesNotMatch(draft, /main q|main a|TOOL-OUT/);
-  ctx.unload();
-});
-
-test('when usage, stats and context_breakdown all throw, the draft is still staged and the notice says so', async () => {
-  const ctx = await mergeCtx({
-    prepare: (host) => {
-      host.usage = new Error('usage down');
-      host.stats = new Error('stats down');
-      host.breakdown = new Error('breakdown down');
-    },
-  });
-  await assert.doesNotReject(async () => mergeButton(ctx).props.onClick(fakeEvent()));
-  assert.deepEqual(ctx.host.order, [
-    ['open', 'par', { intent: 'in-place' }],
-    ['draft', 'par', DRAFT],
-  ]);
-  const tree = ctx.pane.render();
-  const notice = exactText(tree, mod.formatMissingWindowNotice(21));
-  assert.ok(notice);
-  assert.match(notice.props.children, /window was not reported/);
-  assert.equal(notice.props.style.userSelect, 'text');
-  assert.equal(fitOf(ctx).props['data-token-fit'], 'unknown');
   ctx.unload();
 });
 
@@ -1478,36 +1673,35 @@ test('a missing composer draft API shows a notice, opens nothing and writes noth
     const ctx = await mergeCtx({ prepare: strip });
     await assert.doesNotReject(async () => mergeButton(ctx).props.onClick(fakeEvent()));
     await flush();
-    assert.deepEqual(ctx.host.opened, []);
     assert.deepEqual(ctx.host.order, []);
     assert.equal(sessionCalls(ctx).length, 0);
-    const notice = exactText(ctx.pane.render(), MERGE_NO_COMPOSER_TEXT);
-    assert.ok(notice);
-    assert.equal(notice.props.style.userSelect, 'text');
+    assert.ok(exactText(ctx.pane.render(), MERGE_NO_COMPOSER_TEXT));
     ctx.unload();
   }
 });
 
-test('a false or thrown setDraft retries the focused runtime id, then shows the hidden-composer notice', async () => {
+test('a false or thrown setDraft retries the target runtime id once focus is on the target, else shows the hidden notice', async () => {
   for (const result of [false, new Error('composer gone')]) {
     const ctx = await mergeCtx({ prepare: (host) => (host.setDraftResult = result) });
-    await assert.doesNotReject(async () => mergeButton(ctx).props.onClick(fakeEvent()));
+    ctx.host.moveFocusOnOpen = true;
+    await mergeButton(ctx).props.onClick(fakeEvent());
     await flush();
-    assert.deepEqual(
-      ctx.host.order.map((step) => step.slice(0, 2)),
-      [['open', 'par'], ['draft', 'par'], ['draft', 'rt-par']],
-    );
-    assert.equal(ctx.host.order.some(([kind]) => kind === 'submit'), false);
-    const notice = exactText(ctx.pane.render(), MERGE_HIDDEN_TEXT);
-    assert.ok(notice);
-    assert.equal(notice.props.style.userSelect, 'text');
+    assert.deepEqual(ctx.host.order.filter(([k]) => k !== 'branch').map((step) => step.slice(0, 2)), [['open', 'par'], ['draft', 'par'], ['draft', 'rt-par']]);
+    assert.ok(exactText(ctx.pane.render(), MERGE_HIDDEN_TEXT));
     ctx.unload();
   }
+  // Focus still on the merged chat: never stage into it.
+  const stay = await mergeCtx({ prepare: (host) => (host.setDraftResult = false) });
+  await mergeButton(stay).props.onClick(fakeEvent());
+  assert.deepEqual(stay.host.drafts.map(([id]) => id), ['par']);
+  stay.unload();
 });
 
-test('a setDraft that fails on the stored id but works on the runtime id stages the draft', async () => {
+test('a setDraft that works on the target runtime id stages the draft', async () => {
   const ctx = await mergeCtx({ prepare: (host) => (host.setDraftResult = ([id]) => id === 'rt-par') });
+  ctx.host.moveFocusOnOpen = true;
   await mergeButton(ctx).props.onClick(fakeEvent());
+  await flush();
   assert.deepEqual(ctx.host.drafts.map(([id]) => id), ['par', 'rt-par']);
   assert.ok(exactText(ctx.pane.render(), MERGE_STAGED_TEXT));
   ctx.unload();
@@ -1526,42 +1720,27 @@ test('a failed open does not stop the draft', async () => {
   ctx.unload();
 });
 
-test('a side chat with nothing new, no parent, or an unreadable parent writes nothing', async () => {
-  const nothing = await mergeCtx({ prepare: (host) => (host.history.sd = SHARED) });
+test('a chat with nothing of its own, or one that cannot be read, writes nothing', async () => {
+  const nothing = await mergeCtx({ prepare: (host) => (host.history.sd = [...SHARED, { role: 'user', text: 'unanswered' }]) });
   await mergeButton(nothing).props.onClick(fakeEvent());
-  assert.match(textOf(nothing.pane.render()), /Nothing to merge/);
+  assert.ok(exactText(nothing.pane.render(), mod.MERGE_NOTHING_TEXT));
   assert.deepEqual(nothing.host.order, []);
   assert.equal(sessionCalls(nothing).some(([m]) => /usage|stats|breakdown/.test(m)), false);
   nothing.unload();
 
-  const orphan = await mergeCtx({
-    rows: [row('lone', { title: 'Side: alone' })],
-    stored: 'lone',
-    runtime: 'rt-lone',
-    prepare: (host) => (host.history.lone = msgs(['q', 'a'])),
-  });
-  await mergeButton(orphan, 'asis', 'lone').props.onClick(fakeEvent());
-  assert.match(textOf(orphan.pane.render()), /no parent chat/);
-  assert.deepEqual(orphan.host.order, []);
-  orphan.unload();
-
-  const unreadable = await mergeCtx({
-    prepare: (host) => {
-      const base = host.request;
-      host.request = async (method, params) => {
-        if (method === 'session.history' && params.session_id === 'par' && host.failParent) throw new Error('parent gone');
-        return base(method, params);
-      };
-    },
-  });
-  unreadable.host.failParent = true;
+  const unreadable = await mergeCtx();
+  const base = unreadable.host.request;
+  unreadable.host.request = async (method, params) => {
+    if (method === 'session.history') throw new Error('chat gone');
+    return base(method, params);
+  };
   await assert.doesNotReject(async () => mergeButton(unreadable).props.onClick(fakeEvent()));
-  assert.match(textOf(unreadable.pane.render()), /Could not read the parent chat: parent gone/);
+  assert.match(textOf(unreadable.pane.render()), /Could not read this chat: chat gone/);
   assert.deepEqual(unreadable.host.order, []);
   unreadable.unload();
 });
 
-test('Merge as-is does not also open the side chat, and a double click stages once', async () => {
+test('Merge as-is never opens the merged chat itself, and a double click stages once', async () => {
   const ctx = await mergeCtx();
   const a = mergeButton(ctx).props.onClick(fakeEvent());
   const b = mergeButton(ctx).props.onClick(fakeEvent());
@@ -1569,37 +1748,263 @@ test('Merge as-is does not also open the side chat, and a double click stages on
   await flush();
   assert.equal(ctx.host.drafts.length, 1);
   assert.equal(ctx.host.opened.some(([id]) => id === 'sd'), false);
-  // The side chat's node still opens its chat in place.
-  nodeOf(ctx.pane.render(), 'sd:1').props.onClick();
-  await flush();
-  assert.deepEqual(ctx.host.opened.at(-1), ['sd', { intent: 'in-place', profile: 'default' }]);
   ctx.unload();
 });
 
-test('selectable text covers the nodes, pills, side list and merge notices', async () => {
+// ── Branch here ─────────────────────────────────────────────────────────────────────────────
+
+const branchButton = (ctx, key) => byAttr(nodeOf(ctx.pane.render(), key), 'data-branch-here', key)[0];
+const form = (ctx) => byAttr(ctx.pane.render(), 'data-branch-form')[0];
+const formField = (ctx, key) => byAttr(form(ctx), 'data-branch-field', key)[0];
+const typeInto = (ctx, key, value) => formField(ctx, key).props.onChange({ target: { value } });
+const submitForm = (ctx) => byAttr(form(ctx), 'data-branch-submit', 'true')[0].props.onClick(fakeEvent());
+
+test('Branch here sits on the answered exchanges of the open chat only', async () => {
+  const ctx = setup({ host: fakeHost({ history: { ...HIST, b2: [...HIST.b2, { role: 'user', text: 'pending' }] } }) });
+  await flush();
+  const tree = ctx.pane.render();
+  // b2 is open: its exchanges are drawn on root, b1 and b2. b3 and root:2 are not b2's.
+  assert.deepEqual(byAttr(tree, 'data-branch-here').map((n) => n.props['data-branch-here']), ['root:0', 'root:1', 'b1:2', 'b2:3']);
+  // A click opens the form and does not open the node's chat.
+  const event = fakeEvent();
+  branchButton(ctx, 'root:1').props.onClick(event);
+  assert.equal(event.stopped, 1);
+  await flush();
+  assert.deepEqual(ctx.host.opened, []);
+  assert.equal(form(ctx).props['data-branch-form'], 'b2:1');
+  assert.match(textOf(form(ctx)), /Branch here: q2/);
+  ctx.unload();
+});
+
+test('Branch here: session.branch with the count and no name, prompt.submit with the model, open in place', async () => {
+  const ctx = setup();
+  await flush();
+  ctx.mark = ctx.host.calls.length;
+  branchButton(ctx, 'root:1').props.onClick(fakeEvent());
+  assert.equal(formField(ctx, 'model').props.value, '');
+  typeInto(ctx, 'question', 'why q2?');
+  typeInto(ctx, 'model', 'cheap-model');
+  await submitForm(ctx);
+  await flush();
+  // b2's rows: q1 a1 q2 a2 b1q b1a b2q b2a. Exchange 1 ends at a2: four rows.
+  const branch = ctx.host.order.find(([k]) => k === 'branch');
+  assert.deepEqual(branch[1], { session_id: 'rt-b2', count: 4 });
+  assert.equal('name' in branch[1], false);
+  assert.deepEqual(ctx.host.order.find(([k]) => k === 'prompt')[1], {
+    session_id: 'nb-rt',
+    text: 'why q2?',
+    model_override: { model: 'cheap-model' },
+  });
+  assert.deepEqual(ctx.host.opened, [['nb', OPEN_HERE]]);
+  // Order: read, branch, ask, then the fork digest (after the open).
+  assert.deepEqual(ctx.host.calls.slice(ctx.mark).map(([m]) => m).filter((m) => m !== 'session.transcript'), [
+    'session.history',
+    'session.branch',
+    'prompt.submit',
+    'plugin.chat-tree.digest.write',
+  ]);
+  assert.equal(form(ctx), undefined);
+  // Stored: the branch ids (both) and the model for the next form.
+  assert.deepEqual(ctx.storage.map.get(mod.BRANCH_IDS_KEY), ['nb-rt', 'nb']);
+  assert.deepEqual(ctx.storage.map.get(mod.MODEL_KEY), { model: 'cheap-model' });
+  branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+  assert.equal(formField(ctx, 'model').props.value, 'cheap-model');
+  // The new branch, retitled by Hermes, shows the side pill from the stored ids.
+  ctx.host.rows = [...ROWS, row('nb', { _branched_from: 'b2', title: 'Hermes named it', started_at: 50 })];
+  ctx.host.history.nb = [...msgs(['q1', 'a1'], ['q2', 'a2']), ...msgs(['why q2?', 'because'])];
+  ctx.host.state.focusedStoredSessionId.set('nb');
+  ctx.host.state.focusedSessionId.set('nb-rt');
+  await flush();
+  assert.ok(pills(nodeOf(ctx.pane.render(), 'nb:2')).includes('side:side'));
+  ctx.unload();
+
+  // A reload reads the ids back from storage.
+  const again = setup({ host: fakeHost({ rows: [...ROWS, row('nb', { _branched_from: 'b2', title: 'Hermes named it', started_at: 50 })], stored: 'nb', runtime: 'nb-rt', history: { ...HIST, nb: [...msgs(['q1', 'a1'], ['q2', 'a2']), ...msgs(['why q2?', 'because'])] } }), storage: ctx.storage });
+  await flush();
+  assert.ok(pills(nodeOf(again.pane.render(), 'nb:2')).includes('side:side'));
+  again.unload();
+});
+
+test('Branch here sends through_message_id when the rows carry row ids, and no override for a blank model', async () => {
+  const host = fakeHost();
+  host.transcript = { b2: HIST.b2.map((m, i) => ({ ...m, row_id: 100 + i })) };
+  const ctx = setup({ host });
+  await flush();
+  branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+  typeInto(ctx, 'question', 'more?');
+  await submitForm(ctx);
+  await flush();
+  assert.deepEqual(host.order.find(([k]) => k === 'branch')[1], { session_id: 'rt-b2', count: 8, through_message_id: 107 });
+  assert.deepEqual(host.order.find(([k]) => k === 'prompt')[1], { session_id: 'nb-rt', text: 'more?' });
+  ctx.unload();
+});
+
+test('a failed session.branch shows its error in the form; nothing is asked or opened', async () => {
+  const busy = Object.assign(new Error('session is busy'), { data: { reason: 'session_busy' } });
+  for (const [result, text] of [
+    [new Error('nothing to branch'), 'Branch failed: nothing to branch'],
+    [busy, `${mod.BRANCH_BUSY_TEXT} session is busy`],
+    [{}, 'Branch failed: the gateway returned no session.'],
+  ]) {
+    const host = fakeHost();
+    host.branchResult = result;
+    const ctx = setup({ host });
+    await flush();
+    branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+    typeInto(ctx, 'question', 'q?');
+    await assert.doesNotReject(async () => submitForm(ctx));
+    await flush();
+    const error = byAttr(form(ctx), 'data-branch-error', 'true')[0];
+    assert.equal(error.props.children, text);
+    assert.equal(error.props.style.userSelect, 'text');
+    assert.equal(host.order.some(([k]) => k === 'prompt'), false);
+    assert.deepEqual(host.opened, []);
+    ctx.unload();
+  }
+  // An empty question never reaches the gateway.
+  const empty = setup();
+  await flush();
+  branchButton(empty, 'b2:3').props.onClick(fakeEvent());
+  await submitForm(empty);
+  assert.equal(empty.host.order.some(([k]) => k === 'branch'), false);
+  assert.match(textOf(form(empty)), /Type a question/);
+  empty.unload();
+});
+
+test('Branch here is disabled with a reason while the open chat runs', async () => {
+  const ctx = setup();
+  await flush();
+  branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+  typeInto(ctx, 'question', 'q?');
+  ctx.host.state.busyBySession.set({ 'rt-b2': true });
+  const tree = ctx.pane.render();
+  for (const b of byAttr(tree, 'data-branch-here')) {
+    assert.equal(b.props.disabled, true);
+    assert.equal(b.props.title, mod.BRANCH_BUSY_TEXT);
+  }
+  assert.equal(byAttr(form(ctx), 'data-branch-submit', 'true')[0].props.disabled, true);
+  assert.equal(textOf(byAttr(form(ctx), 'data-branch-busy', 'true')[0]), mod.BRANCH_BUSY_TEXT);
+  await byAttr(form(ctx), 'data-branch-submit', 'true')[0].props.onClick(fakeEvent());
+  assert.equal(ctx.host.order.some(([k]) => k === 'branch'), false);
+  // Without the form, the reason is one line below the graph.
+  byAttr(form(ctx), 'data-branch-cancel', 'true')[0].props.onClick(fakeEvent());
+  assert.equal(textOf(byAttr(ctx.pane.render(), 'data-branch-busy', 'true')[0]), mod.BRANCH_BUSY_TEXT);
+  ctx.host.state.busyBySession.set({});
+  assert.equal(byAttr(ctx.pane.render(), 'data-branch-busy').length, 0);
+  ctx.unload();
+});
+
+test('the fork digest is requested after the branch, stored under digest:<chat>:<index>, and shown on that node', async () => {
+  const host = fakeHost();
+  host.digestEvent = () => ({ digest: 'Fixed: q1 and q2.' });
+  const ctx = setup({ host });
+  await flush();
+  branchButton(ctx, 'root:1').props.onClick(fakeEvent());
+  typeInto(ctx, 'question', 'why q2?');
+  await submitForm(ctx);
+  await flush();
+  assert.deepEqual(ctx.host.opened, [['nb', OPEN_HERE]]);
+  // After the branch opens, on the new branch's session (the window now views it).
+  const kinds = host.order.map(([k]) => k);
+  assert.ok(kinds.indexOf('digest') > kinds.indexOf('prompt'));
+  assert.deepEqual(host.order.find(([k]) => k === 'digest')[1], {
+    session_id: 'nb-rt',
+    purpose: 'fork',
+    title: 'b2',
+    exchanges: [
+      { question: 'q1', answer: 'a1' },
+      { question: 'q2', answer: 'a2' },
+    ],
+  });
+  assert.equal(ctx.storage.map.get('digest:b2:1'), 'Fixed: q1 and q2.');
+  // b2's exchange 1 is drawn on root:1. The tooltip keeps title · model, then the digest.
+  const node = nodeOf(ctx.pane.render(), 'root:1');
+  assert.equal(node.props.title, 'root · m1\n\nFork digest:\nFixed: q1 and q2.');
+  assert.equal(node.props['data-fork-digest'], 'true');
+  ctx.unload();
+
+  // Stored: a new activation reads it back on load.
+  const again = setup({ storage: ctx.storage });
+  await flush();
+  assert.equal(nodeOf(again.pane.render(), 'root:1').props.title, 'root · m1\n\nFork digest:\nFixed: q1 and q2.');
+  again.unload();
+});
+
+test('a failed fork digest shows a notice until Dismiss and never blocks the branch', async () => {
+  for (const events of [true, false]) {
+    const host = fakeHost();
+    host.digestEvent = () => ({ error: 'no model' });
+    const ctx = setup({ host, events });
+    await flush();
+    branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+    typeInto(ctx, 'question', 'q?');
+    await submitForm(ctx);
+    await flush();
+    assert.deepEqual(ctx.host.opened, [['nb', OPEN_HERE]]);
+    assert.equal([...ctx.storage.map.keys()].some((k) => k.startsWith('digest:')), false);
+    const held = byAttr(ctx.pane.render(), 'data-held-notice', 'fork')[0];
+    assert.match(textOf(held), events ? /Fork digest failed: no model/ : /digest backend is not available/);
+    byAttr(held, 'data-dismiss', 'fork')[0].props.onClick(fakeEvent());
+    assert.equal(byAttr(ctx.pane.render(), 'data-held-notice', 'fork').length, 0);
+    ctx.unload();
+  }
+});
+
+test('exactly one model pill, on the open node, and it moves with the open node', async () => {
+  const ctx = setup();
+  await flush();
+  const modelPills = () =>
+    nodeRows(ctx.pane.render()).flatMap((n) => byAttr(n, 'data-pill', 'model').map((p) => [n.props['data-node'], p.props.children]));
+  assert.deepEqual(modelPills(), [['b2:3', 'm1']]);
+  // Focus moves to b1 after a click on its node: the pill moves to that node.
+  nodeOf(ctx.pane.render(), 'b1:2').props.onClick();
+  ctx.host.state.focusedStoredSessionId.set('b1');
+  ctx.host.state.focusedSessionId.set('rt-b1');
+  await flush();
+  assert.deepEqual(modelPills(), [['b1:2', 'm1']]);
+  // A click on an earlier node of the open chat moves it again.
+  ctx.host.rows = ROWS.map((r) => (r.id === 'b1' ? { ...r, model: 'anthropic/claude-x' } : r));
+  await ctx.clock.tick(REFRESH_MS);
+  nodeOf(ctx.pane.render(), 'root:0').props.onClick();
+  ctx.host.state.focusedStoredSessionId.set('root');
+  ctx.host.state.focusedSessionId.set('rt-root');
+  await flush();
+  assert.deepEqual(modelPills(), [['root:0', 'm1']]);
+  ctx.unload();
+});
+
+test('selectable text covers the nodes, pills, the branch form, the merge section and every notice', async () => {
   const ctx = await mergeCtx({ prepare: (host) => (host.usage = { context_used: 127990, context_max: 128000 }) });
   await mergeButton(ctx).props.onClick(fakeEvent());
+  branchButton(ctx, 'sd:1').props.onClick(fakeEvent());
+  await submitForm(ctx); // empty question: an error line in the form
   const tree = ctx.pane.render();
   const holders = findAll(
     tree,
     (n) => n.type !== 'Button' && n.type !== 'ScrollArea' && n.props && [n.props.children].flat().some((c) => typeof c === 'string'),
   );
-  assert.ok(holders.length >= 6, `only ${holders.length} text nodes`);
+  assert.ok(holders.length >= 8, `only ${holders.length} text nodes`);
   for (const n of holders) assert.equal(n.props.style?.userSelect, 'text', `${n.type} ${JSON.stringify(n.props.children)}`);
-  for (const key of ['data-pill', 'data-side-entry', 'data-merge-result']) {
+  for (const key of ['data-pill', 'data-branch-form', 'data-branch-error', 'data-merge-section', 'data-merge-targets', 'data-merge-result', 'data-held-notice']) {
     const nodes = byAttr(tree, key);
     assert.ok(nodes.length >= 1, key);
-    for (const n of nodes) assert.equal(n.props.style.userSelect, 'text', key);
+    for (const n of nodes) {
+      assert.equal(n.props.style.userSelect, 'text', key);
+      assert.equal(n.props['data-selectable-text'], 'true', key);
+    }
   }
-  const noFit = exactText(tree, "Doesn't fit: side chat is 21 tokens (estimated), parent has 10 available (127,990 used of 128,000).");
-  assert.equal(noFit.props['data-selectable-text'], 'true');
+  for (const input of byAttr(tree, 'data-branch-field')) assert.equal(input.props.style.userSelect, 'text');
   ctx.unload();
 });
 
-test('the pane code never touches host transcript DOM, never sends, and has no imports', async () => {
+test('the pane code never touches host transcript DOM, never sends a draft, and has no imports', async () => {
   const { readFile } = await import('node:fs/promises');
   const src = await readFile(new URL('../src/chat-tree.js', import.meta.url), 'utf8');
   assert.doesNotMatch(src, /data-message-/);
-  assert.doesNotMatch(src, /\.submit\b/);
+  // The composer is only ever drafted. The one send is the branch question, by prompt.submit.
+  assert.doesNotMatch(src, /composer\.submit|\.submit\(/);
+  assert.equal(src.match(/'prompt\.submit'/g).length, 1);
   assert.doesNotMatch(src, /^import /m);
+  // Hermes names branches: the branch call carries no name.
+  assert.doesNotMatch(src, /session\.branch_whole|name: branchName/);
 });
