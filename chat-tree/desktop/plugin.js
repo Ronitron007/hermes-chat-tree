@@ -1430,7 +1430,7 @@ function createChatTree(deps) {
   // title, anchor, fit, sideTokens, available }, shown under its row until Dismiss or the next
   // merge. branch: the Branch here form { chatId, index, label, question, model, busy, error }.
   // forkNotice: a failed fork digest, until Dismiss.
-  const freshUi = () => ({ open: null, expanded: {}, pick: null, result: null, branch: null, forkNotice: null, mode: EXCHANGES_MODE });
+  const freshUi = () => ({ open: null, expanded: {}, pick: null, result: null, branch: null, forkNotice: null, mode: EXCHANGES_MODE, rename: null });
   const $ui = atom(freshUi());
   // The node rows under the pointer and under keyboard focus: { pointer, focus } node keys, in
   // memory only. The pointer's node gets the hover path; either one reveals its Branch button.
@@ -1638,6 +1638,7 @@ function createChatTree(deps) {
     next.digests = storage ? { ...now.digests, ...readDigests(next.exchanges) } : now.digests;
     $data.set(next);
     settlePendingBranch();
+    settlePendingRename();
     $status.set({
       loading: false,
       error: errors.length ? errors.join('\n') : null,
@@ -2450,9 +2451,9 @@ function createChatTree(deps) {
         ...(row.digest ? { 'data-fork-digest': 'true' } : {}),
         ...(row.stub ? { 'data-stub': 'true' } : {}),
         onClick: () => {
-          if (!selecting()) select();
+          if (!selecting() && actions.rename?.chatId !== row.lane) select();
         },
-        onKeyDown: onKey(select),
+        onKeyDown: actions.rename?.chatId === row.lane ? undefined : onKey(select),
         onMouseEnter: () => hoverSet('pointer', row.key),
         onMouseLeave: () => hoverClear('pointer', row.key),
         onFocus: () => hoverSet('focus', row.key),
@@ -2775,6 +2776,55 @@ function createChatTree(deps) {
     );
   }
 
+  // ── Rename: a double-click on a name opens a one-line box; Enter saves, Escape or leaving cancels ──
+  // Hermes renames a chat with session.title (tui_gateway/methods_session.py:1214), which needs the
+  // chat loaded, so a chat that is not open opens first and is renamed once it is the open chat.
+  let pendingRename = null;
+  const startRename = (chatId, title) => setUi({ rename: { chatId, text: str(title) } });
+  const setRenameText = (text) => {
+    const now = $ui.get().rename;
+    if (now) setUi({ rename: { ...now, text: typeof text === 'string' ? text : '' } });
+  };
+  const cancelRename = () => setUi({ rename: null });
+  async function sendRename(title) {
+    const runtime = runtimeId();
+    if (!runtime) return;
+    try {
+      await host.request('session.title', { session_id: runtime, title });
+      reload();
+    } catch (error) {
+      if (!disposed) setUi({ forkNotice: `Rename failed: ${errorText(error)}` });
+    }
+  }
+  function commitRename(lanesById) {
+    const edit = $ui.get().rename;
+    setUi({ rename: null });
+    if (!edit) return;
+    const title = str(edit.text);
+    const lane = lanesById?.get?.(edit.chatId);
+    if (!title || title === str(lane?.title)) return;
+    const { open } = currentView();
+    if (open && open.id === edit.chatId && runtimeId()) {
+      sendRename(title).then(null, () => {});
+      return;
+    }
+    pendingRename = { chatId: edit.chatId, title, at: Date.now() };
+    openChat(edit.chatId, 'in-place');
+  }
+  function settlePendingRename() {
+    if (!pendingRename) return;
+    if (Date.now() - pendingRename.at > PENDING_BRANCH_MS) {
+      pendingRename = null;
+      return;
+    }
+    const { open } = currentView();
+    if (open && open.id === pendingRename.chatId && runtimeId()) {
+      const { title } = pendingRename;
+      pendingRename = null;
+      sendRename(title).then(null, () => {});
+    }
+  }
+
   // A name row: the chat's Hermes title at the start of its lane (never a node). A click opens the
   // chat in place: on the lane's first own exchange (or its stub) in the exchanges view, on the
   // chat's last exchange in the branches view.
@@ -2782,16 +2832,42 @@ function createChatTree(deps) {
     const branches = actions.mode === BRANCHES_MODE;
     const children = [
       jsx('span', { style: { ...SELECTABLE, flex: '0 0 auto', display: 'inline-flex', color: MUTED }, 'data-name-glyph': 'true', children: nameGlyph() }, 'glyph'),
-      jsx(
-        'span',
-        {
-          style: { ...LABEL_STYLE, ...(branches ? {} : NAME_TEXT), ...(branches && !row.blue ? { opacity: 0.72 } : {}), ...(row.open ? { fontWeight: 600 } : {}) },
-          'data-selectable-text': 'true',
-          'data-label': 'true',
-          children: row.label,
-        },
-        'label',
-      ),
+      actions.rename?.chatId === row.lane
+        ? jsx(
+            Input,
+            {
+              value: actions.rename.text,
+              autoFocus: true,
+              'aria-label': 'Rename chat',
+              'data-rename-input': row.lane,
+              style: { ...SELECTABLE, flex: '1 1 auto', minWidth: 0, height: 20, fontSize: 12, padding: '0 4px', boxSizing: 'border-box' },
+              onChange: (event) => setRenameText(event?.target?.value),
+              onClick: stop,
+              onDoubleClick: stop,
+              onKeyDown: (event) => {
+                stopHostEvent(event);
+                if (event?.key === 'Enter') commitRename(lanesById);
+                else if (event?.key === 'Escape') cancelRename();
+              },
+              onBlur: () => cancelRename(),
+            },
+            'rename',
+          )
+        : jsx(
+            'span',
+            {
+              style: { ...LABEL_STYLE, ...(branches ? {} : NAME_TEXT), ...(branches && !row.blue ? { opacity: 0.72 } : {}), ...(row.open ? { fontWeight: 600 } : {}) },
+              'data-selectable-text': 'true',
+              'data-label': 'true',
+              title: 'Double-click to rename',
+              onDoubleClick: (event) => {
+                stop(event);
+                startRename(row.lane, lane?.title ?? row.label);
+              },
+              children: row.label,
+            },
+            'label',
+          ),
     ];
     if (branches) {
       children.push(jsx('span', { style: { ...NAME_MODEL, maxWidth: 110 }, 'data-selectable-text': 'true', 'data-count': row.count, children: `(${row.count} ${row.count === 1 ? 'exchange' : 'exchanges'})` }, 'count'));
@@ -3210,6 +3286,7 @@ function createChatTree(deps) {
     const busy = open ? chatBusy(busyMap, [runtime, open.id]) : false;
     const form = ui.branch && open && ui.branch.chatId === open.id ? ui.branch : null;
     const actions = {
+      rename: ui.rename ?? null,
       openId: open?.id ?? null,
       busy,
       model: open?.model ?? '',

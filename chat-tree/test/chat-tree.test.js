@@ -234,6 +234,8 @@ function fakeHost({
         }
         case 'config.set':
           return answer(method, host.configSet, params);
+        case 'session.title':
+          return answer(method, host.title ?? { ok: true }, params);
         case 'session.usage':
           return answer(method, host.usage, params);
         case 'session.stats':
@@ -1366,7 +1368,7 @@ test('register after dispose (disable, then enable) works again with fresh UI st
   const disposers = [];
   ctx.tree.register({ register: () => {}, setTimeout: clock.setTimeout, onDispose: (fn) => disposers.push(fn) });
   await flush();
-  assert.deepEqual(ctx.tree.$ui.get(), { open: null, expanded: {}, pick: null, result: null, branch: null, forkNotice: null, mode: 'exchanges' });
+  assert.deepEqual(ctx.tree.$ui.get(), { open: null, expanded: {}, pick: null, result: null, branch: null, forkNotice: null, mode: 'exchanges', rename: null });
   assert.deepEqual(nodeKeys(ctx.pane.render()), ['root:0', 'root:9']);
   const before = listCalls(host);
   host.state.focusedStoredSessionId.set('root2');
@@ -3240,5 +3242,50 @@ test('without config.set and without a question, a picked model shows a notice a
   await flush();
   assert.ok(ctx.host.opened.length >= 1);
   assert.match(textOf(ctx.pane.render()), /did not take its model/);
+  ctx.unload();
+});
+
+const nameRowOf = (tree, chatId) => findAll(tree, (n) => n.props?.['data-name-row'] === chatId)[0];
+const nameLabelOf = (tree, chatId) => findAll(nameRowOf(tree, chatId), (n) => n.props?.['data-label'] === 'true')[0];
+const renameInput = (tree, chatId) => findAll(tree, (n) => n.props?.['data-rename-input'] === chatId)[0];
+
+test('double-click a branch name to rename it; Enter on the open chat calls session.title; Escape cancels', async () => {
+  const ctx = setup(); // b2 is open (runtime rt-b2)
+  await flush();
+  nameLabelOf(ctx.pane.render(), 'b2').props.onDoubleClick(fakeEvent());
+  const input = renameInput(ctx.pane.render(), 'b2');
+  assert.ok(input, 'an input replaces the name');
+  input.props.onChange({ target: { value: 'Token rotation' } });
+  renameInput(ctx.pane.render(), 'b2').props.onKeyDown({ key: 'Enter', stopPropagation() {}, stopImmediatePropagation() {} });
+  await flush();
+  const call = ctx.host.calls.find(([m]) => m === 'session.title');
+  assert.deepEqual(call[1], { session_id: 'rt-b2', title: 'Token rotation' });
+  assert.equal(renameInput(ctx.pane.render(), 'b2'), undefined);
+  // Escape leaves the name as it was and sends nothing.
+  ctx.host.calls.length = 0;
+  nameLabelOf(ctx.pane.render(), 'b2').props.onDoubleClick(fakeEvent());
+  renameInput(ctx.pane.render(), 'b2').props.onChange({ target: { value: 'nope' } });
+  renameInput(ctx.pane.render(), 'b2').props.onKeyDown({ key: 'Escape', stopPropagation() {}, stopImmediatePropagation() {} });
+  await flush();
+  assert.equal(ctx.host.calls.some(([m]) => m === 'session.title'), false);
+  ctx.unload();
+});
+
+test('renaming a chat that is not open opens it first, then renames it once it is open; Branches mode too', async () => {
+  const ctx = setup();
+  await flush();
+  ctx.tree.$ui.set({ ...ctx.tree.$ui.get(), mode: mod.BRANCHES_MODE });
+  nameLabelOf(ctx.pane.render(), 'b1').props.onDoubleClick(fakeEvent());
+  renameInput(ctx.pane.render(), 'b1').props.onChange({ target: { value: 'Setup questions' } });
+  renameInput(ctx.pane.render(), 'b1').props.onKeyDown({ key: 'Enter', stopPropagation() {}, stopImmediatePropagation() {} });
+  await flush();
+  assert.equal(ctx.host.calls.some(([m]) => m === 'session.title'), false, 'not yet: b1 is not open');
+  assert.ok(JSON.stringify(ctx.host.opened).includes('b1'));
+  ctx.host.state.focusedStoredSessionId.set('b1');
+  ctx.host.state.focusedSessionId.set('rt-b1');
+  await flush();
+  await flush();
+  const call = ctx.host.calls.find(([m]) => m === 'session.title');
+  assert.deepEqual(call?.[1], { session_id: 'rt-b1', title: 'Setup questions' });
   ctx.unload();
 });
