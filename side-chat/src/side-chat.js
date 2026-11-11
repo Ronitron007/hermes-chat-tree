@@ -1,0 +1,465 @@
+// Side chat pane: asks a side question in a fork of the focused chat, on the side model,
+// and shows the answer here. The main chat gets no new message.
+// Plain ESM with no imports: the SDK pieces, timers and clock are injected so it runs under node --test.
+// Spec: docs/research/2026-11-11-chat-tree/spec-side-chat.md
+
+export const PLUGIN_ID = 'side-chat';
+export const PANE_ID = 'pane';
+export const POLL_MS = 1500;
+export const TIMEOUT_MS = 180_000;
+export const MAX_ENTRIES = 50;
+export const PAGE_LIMIT = 200;
+export const MODEL_KEY = 'sideChat:model';
+export const BUSY_TEXT = 'The main chat is busy. Ask again when the run ends.';
+export const TIMEOUT_TEXT = 'No answer yet. Open the branch to see it.';
+
+export const listKey = (chatId) => `sideChat:${chatId}`;
+export const branchName = (question) => `Side: ${question.slice(0, 50)}`;
+
+// Pane text must be copyable; the spike log was not.
+const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text' };
+const PRE_STYLE = { ...SELECTABLE, whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0, font: 'inherit' };
+const STATUSES = new Set(['asking', 'answered', 'timeout', 'error']);
+
+const str = (v) => (typeof v === 'string' ? v.trim() : '');
+const isThenable = (v) => v != null && typeof v.then === 'function';
+const errorText = (error) => str(error?.message) || str(error) || 'Unknown error';
+// The canonical gateway refuses a mutation it cannot run now as reason `session_busy`
+// (hermes_state_mutation_guards.py busy_refusal); the desktop sends branch_whole as that mutation.
+const isBusy = (error) => /busy/i.test(`${error?.data?.reason ?? ''} ${errorText(error)}`);
+
+// Poll readout, shown under each entry so a manual run can tell whether the host reports the
+// branch as busy (finding 2 of the review on PR #10).
+const DONE_BY = new Set(['busy-signal', 'two-reads', 'timeout']);
+function cleanDiag(d) {
+  if (!d || typeof d !== 'object') return null;
+  return {
+    busySeen: d.busySeen === true,
+    reads: Number.isInteger(d.reads) && d.reads >= 0 ? d.reads : 0,
+    doneBy: DONE_BY.has(d.doneBy) ? d.doneBy : null,
+  };
+}
+export function diagText(diag) {
+  if (!diag) return '';
+  return `busy seen: ${diag.busySeen ? 'yes' : 'no'} · reads: ${diag.reads} · done by: ${diag.doneBy ?? '-'}`;
+}
+
+// Stored entries are untrusted (old versions, hand edits): keep only well-typed ones.
+function cleanEntry(e) {
+  if (!e || typeof e !== 'object') return null;
+  if (typeof e.id !== 'string' || typeof e.question !== 'string' || typeof e.session_id !== 'string') return null;
+  const opt = (v) => (typeof v === 'string' ? v : null);
+  return {
+    id: e.id,
+    question: e.question,
+    session_id: e.session_id,
+    stored_session_id: opt(e.stored_session_id),
+    model: opt(e.model),
+    provider: opt(e.provider),
+    answer: opt(e.answer),
+    error: opt(e.error),
+    status: STATUSES.has(e.status) ? e.status : 'timeout',
+    at: typeof e.at === 'number' && Number.isFinite(e.at) ? e.at : 0,
+    diag: cleanDiag(e.diag),
+  };
+}
+
+export function createSideChat(deps) {
+  const { host, jsx, jsxs, atom, useValue, Button, Input, ScrollArea } = deps;
+  const now = deps.now ?? (() => Date.now());
+
+  // stored main chat id -> entries, newest first.
+  const $lists = atom({});
+  const $form = atom({ question: '', model: '', provider: '' });
+  // stored main chat id -> { notice, pending }. pending: a fork is in flight.
+  const $status = atom({});
+  // Stand-in so the pane calls useValue the same number of times when host.state lacks an atom.
+  const $none = atom(null);
+
+  let storage = null;
+  let disposed = false;
+  let seq = 0;
+  // ctx.setTimeout once registered: the host clears it on unload (apps/desktop/src/contrib/plugin.ts).
+  let scopedTimeout = null;
+  const loaded = new Set();
+  const polls = new Map(); // entry id -> cancel function of its next tick
+  const unsubscribers = [];
+
+  function schedule(fn, ms) {
+    if (scopedTimeout) return scopedTimeout(fn, ms);
+    const set = deps.setTimeout ?? ((f, t) => globalThis.setTimeout(f, t));
+    const clear = deps.clearTimeout ?? ((id) => globalThis.clearTimeout(id));
+    const id = set(fn, ms);
+    return () => clear(id);
+  }
+
+  const write = (key, value) => {
+    if (disposed) return;
+    try {
+      const pending = storage?.set?.(key, value);
+      if (isThenable(pending)) pending.then(null, () => {});
+    } catch {
+      // Storage is best effort; the pane still works for this session.
+    }
+  };
+
+  // Storage may be sync or promise-based; handle both (as src/plugin-factory.js does).
+  const read = (key, apply) => {
+    if (!storage) return apply(undefined);
+    let value;
+    try {
+      value = storage.get(key);
+    } catch {
+      return apply(undefined);
+    }
+    if (isThenable(value)) value.then(apply, () => apply(undefined));
+    else apply(value);
+  };
+
+  const atomOf = (name) => host?.state?.[name] ?? $none;
+  const runtimeChatId = () => atomOf('focusedSessionId').get() ?? atomOf('activeSessionId').get() ?? null;
+  // Lists are keyed by the stored id: runtime ids do not survive a reload (sdk/index.ts focusedStoredSessionId).
+  const listChatId = () => atomOf('focusedStoredSessionId').get() ?? runtimeChatId();
+
+  function setStatus(chatId, patch) {
+    const all = $status.get();
+    $status.set({ ...all, [chatId ?? '']: { ...all[chatId ?? ''], ...patch } });
+  }
+
+  function setList(chatId, list) {
+    if (disposed) return;
+    const next = list.slice(0, MAX_ENTRIES);
+    $lists.set({ ...$lists.get(), [chatId]: next });
+    write(listKey(chatId), next);
+  }
+
+  const addEntry = (chatId, entry) => setList(chatId, [entry, ...($lists.get()[chatId] ?? [])]);
+
+  function updateEntry(chatId, id, patch) {
+    const list = $lists.get()[chatId] ?? [];
+    setList(chatId, list.map((e) => (e.id === id ? { ...e, ...patch } : e)));
+  }
+
+  // Loads the stored list once per main chat, on focus change (never during render).
+  // Entries added before the read lands are kept: the merge puts them first.
+  function loadList(chatId) {
+    if (!chatId || loaded.has(chatId) || disposed) return;
+    loaded.add(chatId);
+    read(listKey(chatId), (stored) => {
+      if (disposed) return;
+      const current = $lists.get()[chatId] ?? [];
+      const ids = new Set(current.map((e) => e.id));
+      // An entry still "asking" with no live poll lost its poll to a reload.
+      const restored = (Array.isArray(stored) ? stored : [])
+        .map(cleanEntry)
+        .filter((e) => e && !ids.has(e.id))
+        .map((e) => (e.status === 'asking' && !polls.has(e.id) ? { ...e, status: 'timeout' } : e));
+      const merged = [...current, ...restored].sort((a, b) => b.at - a.at).slice(0, MAX_ENTRIES);
+      $lists.set({ ...$lists.get(), [chatId]: merged });
+      if (current.length) write(listKey(chatId), merged);
+    });
+  }
+
+  const request = (params) => host.request('session.transcript', params);
+  const page = (sessionId, cursor) =>
+    request({ session_id: sessionId, order: 'oldest', limit: PAGE_LIMIT, ...(cursor ? { cursor } : {}) });
+
+  // Reads the copied history to its end before the question goes in. Only an EMPTY page means
+  // caught up: the gateway also cuts pages at 2 MiB and between tool groups (session_stored_reads.py). The poll then starts from
+  // that cursor, and a reset page drops rows at or below the highest copied row_id, so an old
+  // identical question in the main chat can never answer this one.
+  async function fence(sessionId) {
+    let cursor = null;
+    let maxRowId = null;
+    for (let i = 0; i < 1000; i++) {
+      const result = await page(sessionId, cursor);
+      const rows = Array.isArray(result?.rows) ? result.rows : [];
+      for (const row of rows) if (Number.isFinite(row?.row_id)) maxRowId = Math.max(maxRowId ?? row.row_id, row.row_id);
+      cursor = result?.next_cursor ?? cursor;
+      if (rows.length === 0) break;
+    }
+    return { cursor, maxRowId };
+  }
+
+  // Polls the branch from the fence until its turn ends, then takes the last assistant text after
+  // the question. A turn has ended when the last assistant/tool row is assistant text (no tool call
+  // still running after it), the branch is not busy in host.state.busyBySession, and either the
+  // branch was seen busy or the same text held for two reads (a host that never reports the branch).
+  function poll(chatId, entry, start) {
+    const started = now();
+    let cursor = start.cursor;
+    let questionSeen = false;
+    let tail = []; // assistant and tool rows after the question
+    let seenBusy = false;
+    let reads = 0;
+    const diag = (doneBy = null) => ({ busySeen: seenBusy, reads, doneBy });
+    let previous = null;
+
+    const live = () => polls.has(entry.id) && !disposed;
+    const finish = (patch) => {
+      polls.delete(entry.id);
+      updateEntry(chatId, entry.id, patch);
+    };
+    const isNew = (row) => start.maxRowId == null || !Number.isFinite(row?.row_id) || row.row_id > start.maxRowId;
+
+    const step = async () => {
+      if (!live()) return;
+      if (now() - started >= TIMEOUT_MS) return finish({ status: 'timeout', diag: diag('timeout') });
+      let result = null;
+      try {
+        reads += 1;
+        result = await page(entry.session_id, cursor);
+      } catch {
+        // A failed read is retried on the next tick until the timeout.
+      }
+      if (!live()) return;
+      const rows = Array.isArray(result?.rows) ? result.rows : [];
+      if (result) {
+        // reset: the reply is the first page again and replaces what was read.
+        if (result.reset) {
+          questionSeen = false;
+          tail = [];
+        }
+        for (const row of rows) {
+          if (!isNew(row)) continue;
+          if (row?.role === 'user' && str(row.text) === entry.question) {
+            questionSeen = true;
+            tail = [];
+          } else if (questionSeen && (row?.role === 'assistant' || row?.role === 'tool')) {
+            tail.push(row);
+          }
+        }
+        cursor = result.next_cursor ?? (result.reset ? null : cursor);
+        // A full page means more rows wait; read on without the delay.
+        if (rows.length >= PAGE_LIMIT) return step();
+      }
+      const busy = Boolean(atomOf('busyBySession').get()?.[entry.session_id]);
+      if (busy) seenBusy = true;
+      const last = tail[tail.length - 1];
+      const candidate = last?.role === 'assistant' ? str(last.text) || null : null;
+      if (candidate && !busy && (seenBusy || candidate === previous)) {
+        return finish({ status: 'answered', answer: candidate, diag: diag(seenBusy ? 'busy-signal' : 'two-reads') });
+      }
+      previous = candidate;
+      updateEntry(chatId, entry.id, { diag: diag() });
+      polls.set(entry.id, schedule(step, POLL_MS));
+    };
+
+    polls.set(entry.id, null);
+    step();
+  }
+
+  async function ask(chatId, runtimeId) {
+    if (disposed) return;
+    const form = $form.get();
+    const text = str(form.question);
+    if (!chatId || !runtimeId) return setStatus(chatId, { notice: 'Open a chat first.' });
+    if ($status.get()[chatId]?.pending) return;
+    if (!text) return setStatus(chatId, { notice: 'Type a question.' });
+    setStatus(chatId, { notice: 'Forking the chat...', pending: true });
+
+    let branch;
+    try {
+      branch = await host.request('session.branch_whole', {
+        session_id: runtimeId,
+        name: branchName(text),
+        idempotency_key: `side-chat-${now()}-${++seq}`,
+      });
+    } catch (error) {
+      return setStatus(chatId, { notice: isBusy(error) ? BUSY_TEXT : errorText(error), pending: false });
+    }
+    if (disposed) return;
+    if (!branch?.session_id) return setStatus(chatId, { notice: 'The fork returned no session.', pending: false });
+
+    const sideModel = str(form.model);
+    const sideProvider = str(form.provider);
+    const entry = {
+      id: branch.session_id,
+      question: text,
+      session_id: branch.session_id,
+      stored_session_id: branch.stored_session_id ?? null,
+      model: sideModel || null,
+      provider: sideModel && sideProvider ? sideProvider : null,
+      answer: null,
+      error: null,
+      status: 'asking',
+      at: now(),
+    };
+    addEntry(chatId, entry);
+    setStatus(chatId, { notice: null, pending: false });
+    // Text typed while the fork ran is a new question: keep it.
+    if ($form.get().question === form.question) $form.set({ ...$form.get(), question: '' });
+
+    // On the canonical gateway the branch's runtime and stored ids are the same id
+    // (apps/desktop/src/api/canonical-protocol.ts maps branched_session_id to both), and
+    // session.transcript resolves it (gateway/session_stored_reads.py _readable_target).
+    let start = { cursor: null, maxRowId: null };
+    try {
+      start = await fence(entry.session_id);
+    } catch {
+      // No fence: the poll reads from the first page and matches the last question row it sees.
+    }
+    if (disposed) return;
+
+    const params = { session_id: branch.session_id, text };
+    // A blank model field keeps the session model: no override at all.
+    if (sideModel) params.model_override = { model: sideModel, ...(sideProvider ? { provider: sideProvider } : {}) };
+    try {
+      await host.request('prompt.submit', params);
+    } catch (error) {
+      return updateEntry(chatId, entry.id, { status: 'error', error: errorText(error) });
+    }
+    poll(chatId, entry, start);
+  }
+
+  function openBranch(entry) {
+    if (!entry?.stored_session_id || typeof host?.openSession !== 'function') return;
+    Promise.resolve()
+      .then(() => host.openSession(entry.stored_session_id, { intent: 'tab' }))
+      .then(null, () => {});
+  }
+
+  function setField(key, value) {
+    const next = { ...$form.get(), [key]: value };
+    $form.set(next);
+    if (key !== 'question') write(MODEL_KEY, { model: next.model, provider: next.provider });
+  }
+
+  function statusText(entry) {
+    if (entry.status === 'answered') return entry.answer ?? '';
+    if (entry.status === 'timeout') return TIMEOUT_TEXT;
+    if (entry.status === 'error') return `Error: ${entry.error ?? 'unknown'}`;
+    return 'Waiting for the answer...';
+  }
+
+  // No hooks here. The pane renders it as an element, never as a function call.
+  function EntryRow({ entry }) {
+    const when = entry.at ? new Date(entry.at).toLocaleTimeString() : '';
+    const modelText = entry.model ? `${entry.model}${entry.provider ? ` (${entry.provider})` : ''}` : 'session model';
+    return jsxs('div', {
+      className: 'flex flex-col gap-1 rounded border p-2',
+      style: SELECTABLE,
+      children: [
+        jsx('p', { className: 'text-sm font-semibold', style: PRE_STYLE, children: entry.question }),
+        jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: `${modelText} · ${when}` }),
+        jsx('pre', { className: 'text-sm', style: PRE_STYLE, children: statusText(entry) }),
+        entry.diag && (entry.status === 'asking' || entry.status === 'answered' || entry.status === 'timeout')
+          ? jsx('p', { className: 'text-xs opacity-60', style: SELECTABLE, children: diagText(entry.diag) })
+          : null,
+        jsx(Button, {
+          type: 'button',
+          disabled: !entry.stored_session_id,
+          onClick: () => openBranch(entry),
+          children: 'Open',
+        }),
+      ].filter(Boolean),
+    });
+  }
+
+  // Hook order is fixed: six useValue calls, every render, before any branch (React error 300).
+  // Render only reads state; loading happens on focus change in register().
+  function renderPane() {
+    const stored = useValue(atomOf('focusedStoredSessionId'));
+    const focused = useValue(atomOf('focusedSessionId'));
+    const active = useValue(atomOf('activeSessionId'));
+    const lists = useValue($lists);
+    const form = useValue($form);
+    const statuses = useValue($status);
+
+    const runtimeId = focused ?? active ?? null;
+    const chatId = stored ?? runtimeId;
+    const entries = chatId ? lists[chatId] ?? [] : [];
+    const status = statuses[chatId ?? ''] ?? {};
+    const onAsk = () => ask(chatId, runtimeId);
+
+    return jsx(ScrollArea, {
+      children: jsxs('div', {
+        className: 'flex flex-col gap-2 p-4 text-sm',
+        style: SELECTABLE,
+        children: [
+          jsx('p', {
+            className: 'text-xs opacity-70',
+            children: chatId
+              ? 'Ask a side question. It runs in a branch of this chat, not in the chat.'
+              : 'Open a chat to ask a side question.',
+          }),
+          jsx(Input, {
+            value: form.question,
+            placeholder: 'Side question',
+            onChange: (event) => setField('question', event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault?.();
+                onAsk();
+              }
+            },
+          }),
+          jsx(Input, {
+            value: form.model,
+            placeholder: 'Side model (blank = session model)',
+            onChange: (event) => setField('model', event.target.value),
+          }),
+          jsx(Input, {
+            value: form.provider,
+            placeholder: 'Side provider (optional)',
+            onChange: (event) => setField('provider', event.target.value),
+          }),
+          jsx(Button, { type: 'button', disabled: !chatId || Boolean(status.pending), onClick: onAsk, children: 'Ask' }),
+          status.notice ? jsx('p', { className: 'text-xs', style: SELECTABLE, children: status.notice }) : null,
+          ...entries.map((entry) => jsx(EntryRow, { entry }, entry.id)),
+        ].filter(Boolean),
+      }),
+    });
+  }
+
+  // Stops every live poll and every store listener. Wired to ctx.onDispose.
+  function dispose() {
+    disposed = true;
+    for (const cancel of polls.values()) if (typeof cancel === 'function') cancel();
+    polls.clear();
+    for (const off of unsubscribers.splice(0)) {
+      try {
+        off();
+      } catch {
+        // A listener that is already gone needs no cleanup.
+      }
+    }
+  }
+
+  function register(ctx) {
+    storage = ctx?.storage ?? null;
+    if (typeof ctx?.setTimeout === 'function') scopedTimeout = (fn, ms) => ctx.setTimeout(fn, ms);
+    if (typeof ctx?.onDispose === 'function') ctx.onDispose(dispose);
+    read(MODEL_KEY, (saved) => {
+      if (!saved || typeof saved !== 'object') return;
+      $form.set({ ...$form.get(), model: str(saved.model), provider: str(saved.provider) });
+    });
+    const sync = () => loadList(listChatId());
+    for (const name of ['focusedStoredSessionId', 'focusedSessionId', 'activeSessionId']) {
+      const store = host?.state?.[name];
+      if (typeof store?.listen === 'function') unsubscribers.push(store.listen(sync));
+    }
+    sync();
+    ctx.register({
+      id: PANE_ID,
+      area: 'panes',
+      title: 'Side chat',
+      data: { placement: 'right', width: '360px' },
+      render: renderPane,
+    });
+    ctx.register({
+      id: 'open-side-chat',
+      area: 'palette',
+      data: {
+        id: 'open-side-chat',
+        label: 'Open side chat',
+        keywords: ['side', 'branch', 'question', 'btw'],
+        run: () => {
+          if (typeof host?.revealPane === 'function') host.revealPane(`${PLUGIN_ID}:${PANE_ID}`);
+        },
+      },
+    });
+  }
+
+  return { register, renderPane, EntryRow, ask, openBranch, dispose, $lists, $form, $status };
+}

@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test test/*.test.js",
-    "assemble": "node scripts/assemble.mjs"
+    "test": "node --test test/*.test.js side-chat/test/*.test.js",
+    "test:side-chat": "node --test side-chat/test/*.test.js",
+    "assemble": "node scripts/assemble.mjs",
+    "assemble:side-chat": "node side-chat/scripts/assemble.mjs"
   }
 }
