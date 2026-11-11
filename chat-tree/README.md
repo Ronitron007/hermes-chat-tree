@@ -20,7 +20,7 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
 
 - A merge brings a branch back into any ancestor chat on its path. Choose the ancestor chat in the target list. While you use the list, the path to the target has the hover colour. Then choose the mode:
 
-  - **Merge as-is** copies the questions and answers.
+  - **Merge as-is** sends the questions and answers as a message in the ancestor chat.
 
   - **Digest** gives the ancestor a short digest by the model.
 

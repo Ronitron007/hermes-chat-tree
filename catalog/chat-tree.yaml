@@ -14,10 +14,11 @@ description: >-
   the messages of the chats in the open lineage (session.transcript,
   session.history), context sizes (session.usage, session.stats,
   session.context_breakdown) and subagent.list. It calls session.branch only
-  when you click Branch, and prompt.submit only to send the question that you
-  typed for that branch. A merge goes into the composer of
-  the ancestor chat as a draft (host.composer.setDraft), and the plugin never
-  sends it. A node click sends the app event hermes:timeline-reveal to the
+  when you click Branch. It calls prompt.submit only for the question that you
+  typed for a branch, and for Merge as-is, which sends the merge text as a
+  message in the ancestor chat that you picked. Digest puts its text into the
+  composer of the ancestor chat as a draft (host.composer.setDraft) and never
+  sends it. config.set sets the model that you picked for a branch. A node click sends the app event hermes:timeline-reveal to the
   main chat viewport and scrolls the exchange into view. It finds the
   viewport and the exchange through app markup (data-session-anchor,
   data-slot, data-message-id). This is outside the Desktop SDK surface

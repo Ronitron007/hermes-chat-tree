@@ -116,6 +116,9 @@ const UNLISTED_FOCUS_TEXT =
   "This chat is not in Hermes's session list (a subagent's chat is hidden there). The tree shows the chat you had open before, read-only.";
 const BRANCH_MODEL_NOT_SET_TEXT =
   "The branch was made, but Hermes did not take its model. It uses this chat's model. Pick a model in the branch's own model menu.";
+const FOCUS_WAIT_MS = 6000;
+const MERGE_SEND_FOCUS_TEXT = 'The target chat did not open in time. Nothing was sent.';
+const MERGE_SEND_BUSY_TEXT = 'The target chat is running. Nothing was sent.';
 const MERGE_PARENT_MISSING_TEXT = 'The parent of this chat is not loaded. There is no chat to merge into.';
 const MERGE_NOTHING_TEXT = 'Nothing to merge: this chat has no question and answer of its own after its fork point.';
 const DIGEST_MISSING_TEXT = 'The digest backend is not available (the chat-tree Python half is not enabled). Nothing was staged.';
@@ -1396,6 +1399,8 @@ function createChatTree(deps) {
   const { host, jsx, jsxs, atom, useValue, Button, ScrollArea } = deps;
   const Input = deps.Input ?? 'input';
   const BranchIcon = deps.BranchIcon ?? null;
+  // Merge as-is sends its text as a message (the default); false keeps the older staged draft.
+  const mergeSends = deps.mergeSends !== false;
   // Row and header icons (sdk.icons, sdk.Codicon) and tooltips (sdk.Tip). Each falls back: a drawn
   // icon, the native title.
   const MergeCodicon = deps.Codicon ?? null;
@@ -1958,6 +1963,17 @@ function createChatTree(deps) {
     });
   }
 
+  // The runtime id of chatId once it is the focused chat, or null after FOCUS_WAIT_MS.
+  async function waitForFocus(chatId) {
+    const end = Date.now() + FOCUS_WAIT_MS;
+    for (;;) {
+      const runtime = atomOf('focusedSessionId').get();
+      if (atomOf('focusedStoredSessionId').get() === chatId && typeof runtime === 'string' && runtime) return runtime;
+      if (disposed || Date.now() > end) return null;
+      await new Promise((resolve) => schedule(resolve, 150));
+    }
+  }
+
   async function tryDraft(sessionId, text) {
     try {
       return (await host.composer.setDraft(sessionId, text)) === true;
@@ -2060,6 +2076,20 @@ function createChatTree(deps) {
         }
       }
       if (!alive()) return;
+      if (kind !== 'digest' && mergeSends) {
+        // Merge as-is sends the text as a message in the target chat (Rohan, 2026-11-12 03:04, for the
+        // demo). Hermes needs the chat loaded, so wait until the target is the focused chat.
+        const runtime = await waitForFocus(target.id);
+        if (!alive()) return;
+        if (!runtime) return fail(MERGE_SEND_FOCUS_TEXT, { fit: headroom ? 'yes' : 'unknown', sideTokens, available: headroom?.available });
+        try {
+          await host.request('prompt.submit', { session_id: runtime, text });
+        } catch (error) {
+          return fail(isBusy(error) ? `${MERGE_SEND_BUSY_TEXT} ${errorText(error)}` : `Merge was not sent: ${errorText(error)}`);
+        }
+        if (!alive()) return;
+        return finish({ fit: headroom ? 'yes' : 'unknown', sideTokens, available: headroom?.available, ok: true, sent: true, text: '' });
+      }
       let ok = await tryDraft(target.id, text);
       if (!ok) {
         // The target's runtime id once focus is on the target. Never the merged chat itself.
@@ -2712,9 +2742,11 @@ function createChatTree(deps) {
     const text = busy
       ? result.kind === 'digest'
         ? 'Writing the digest...'
-        : 'Staging...'
+        : 'Sending...'
       : ok
-        ? `✓ Staged in the composer of "${shortLabel(result.title, 32)}". Not sent.`
+        ? result.sent
+          ? `✓ Sent to "${shortLabel(result.title, 32)}".`
+          : `✓ Staged in the composer of "${shortLabel(result.title, 32)}". Not sent.`
         : result.text;
     const detail = [ok ? result.text : '', result.fit ? fitReadout(result) : ''].filter(Boolean).join('\n');
     const link = (label, attr, onClick) =>
