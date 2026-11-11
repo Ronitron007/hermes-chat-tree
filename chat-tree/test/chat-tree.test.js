@@ -3833,15 +3833,45 @@ test('chat status: a lineage id (compression root or segment) matches its lane, 
   ctx.unload();
 });
 
-test('chat status: a failed or missing RPC shows no marks and no error; the rows and lines stay as they were', async () => {
+test('chat status: one failed read keeps the last good marks and the 3 s read, with no error', async () => {
+  const host = fakeHost();
+  host.activeList = activeReply({ root: 'working' });
+  const ctx = setup({ host });
+  await flush();
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'root:2': 'working' });
+  const r0 = statusReads(host);
+  host.activeList = new Error('gateway gone');
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.equal(statusReads(host), r0 + 1);
+  const kept = ctx.pane.render();
+  assert.deepEqual(marksOf(kept), { 'root:2': 'working' });
+  assert.equal(ctx.tree.$status.get().error, null);
+  assert.doesNotMatch(textOf(kept), /gateway gone/);
+  // The 3 s read is armed again (with the 15 s refresh): one more read.
+  assert.equal(ctx.clock.pending(), 2);
+  // That read lands: the marks follow it, and the failure count starts again.
+  host.activeList = activeReply({ root: 'waiting' });
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.equal(statusReads(host), r0 + 2);
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'root:2': 'waiting' });
+  host.activeList = new Error('gateway gone');
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'root:2': 'waiting' });
+  assert.equal(ctx.clock.pending(), 2);
+  ctx.unload();
+});
+
+test('chat status: two failed reads in a row clear the marks with no error and stop the 3 s read; the rows and lines stay as they were', async () => {
   const host = fakeHost();
   host.activeList = activeReply({ root: 'working' });
   const ctx = setup({ host });
   await flush();
   const withMarks = ctx.pane.render();
   assert.deepEqual(marksOf(withMarks), { 'root:2': 'working' });
+  const r0 = statusReads(host);
   host.activeList = new Error('gateway gone');
-  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  await ctx.clock.tick(mod.STATUS_POLL_MS * mod.STATUS_FAILS_TO_CLEAR);
+  assert.equal(statusReads(host), r0 + 2);
   const without = ctx.pane.render();
   assert.deepEqual(marksOf(without), {});
   assert.equal(byAttr(without, 'data-status-slot').length, 0);
@@ -3850,14 +3880,18 @@ test('chat status: a failed or missing RPC shows no marks and no error; the rows
   assert.deepEqual(nodeKeys(without), MAIN_KEYS);
   // A mark never moves the lane lines: the graph is the same with and without marks.
   assert.deepEqual(byAttr(without, 'data-graph', 'true')[0], byAttr(withMarks, 'data-graph', 'true')[0]);
-  // No live chat after the failure: the 3 s read stopped (the 15 s refresh is the one timer left).
+  // No live chat after the second failure: the 3 s read stopped (the 15 s refresh is the one timer left).
   assert.equal(ctx.clock.pending(), 1);
-  // An unknown method (an older Hermes) and a reply with no sessions list: no marks either.
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.equal(statusReads(host), r0 + 2);
+  // An unknown method (an older Hermes) and a reply with no sessions list are failed reads too.
   for (const reply of [undefined, { sessions: 'nope' }]) {
     host.activeList = activeReply({ root: 'working' });
     await refresh(ctx);
     assert.deepEqual(marksOf(ctx.pane.render()), { 'root:2': 'working' });
     host.activeList = reply;
+    await refresh(ctx);
+    assert.deepEqual(marksOf(ctx.pane.render()), { 'root:2': 'working' });
     await refresh(ctx);
     assert.deepEqual(marksOf(ctx.pane.render()), {});
     assert.equal(ctx.tree.$status.get().error, null);
@@ -4013,8 +4047,10 @@ test('chat status marks keep the hook order (React error 300)', async () => {
   states.push(order()); // the branches view with words
   host.activeList = new Error('x');
   await ctx.clock.tick(mod.STATUS_POLL_MS);
+  states.push(order()); // one failed read: the last good marks
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
   assert.deepEqual(marksOf(ctx.pane.render()), {});
-  states.push(order()); // a failed read
+  states.push(order()); // two failed reads: no marks
   for (const s of states) {
     assert.equal(s.length, 8);
     assert.deepEqual(s, states[0]);

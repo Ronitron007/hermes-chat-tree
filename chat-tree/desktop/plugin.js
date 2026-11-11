@@ -169,6 +169,8 @@ const ACTIVE_LIST_METHOD = 'session.active_list';
 // change reads it at most once per STATUS_BUSY_MS.
 const STATUS_POLL_MS = 3_000;
 const STATUS_BUSY_MS = 1_000;
+// A failed status read keeps the last good marks; this many failed reads in a row clear them.
+const STATUS_FAILS_TO_CLEAR = 2;
 const DONE_STATUS = 'done';
 // Each status: its rank (one chat with several rows takes the most urgent), its text for screen
 // readers and the tooltip, and its word in the branches view.
@@ -1603,8 +1605,9 @@ function createChatTree(deps) {
   let cancelSoon = null;
   // Chat status: a newer read wins (statusGeneration). cancelStatusPoll: the STATUS_POLL_MS read
   // while a chat is live. busyWait: the STATUS_BUSY_MS window after a busyBySession read; busyAgain:
-  // a change came inside it.
+  // a change came inside it. statusFailures: failed status reads in a row.
   let statusGeneration = 0;
+  let statusFailures = 0;
   let cancelStatusPoll = null;
   let busyWait = null;
   let busyAgain = false;
@@ -1862,22 +1865,28 @@ function createChatTree(deps) {
 
   // ── Chat status (unit.chat_status): read into $data.live; render maps it to the lanes ──────
 
-  // One session.active_list read. live is null when the RPC fails or is missing, and when the chat's
-  // owner is not the active gateway (host.request reaches only that one): no marks then, and no
-  // error. A newer read wins. A status read never reloads the tree or a history.
+  // One session.active_list read. A failed read (the RPC fails or is missing, or the reply has no
+  // sessions list) keeps the last good live map, so the marks and the STATUS_POLL_MS read stay for
+  // one more read: one dropped reply does not hide a live chat. STATUS_FAILS_TO_CLEAR failed reads
+  // in a row set live to null: no marks, and the poll stops. live is null at once when the chat's
+  // owner is not the active gateway (host.request reaches only that one). Never an error. A newer
+  // read wins. A status read never reloads the tree or a history.
   async function loadStatus() {
     if (disposed) return;
     const mine = ++statusGeneration;
     let live = null;
+    let failed = false;
     if (ownerIsActive(atomOf('focusedSessionOwner').get())) {
       try {
         live = parseActiveList(await host.request(ACTIVE_LIST_METHOD, {}));
       } catch {
-        // A failed or unknown RPC: the tree works as before, with no marks.
+        // A failed or unknown RPC: counted below. The tree works as before.
       }
+      failed = live === null;
     }
     if (disposed || mine !== statusGeneration) return;
-    $data.set({ ...$data.get(), live });
+    statusFailures = failed ? statusFailures + 1 : 0;
+    if (!failed || statusFailures >= STATUS_FAILS_TO_CLEAR) $data.set({ ...$data.get(), live });
     syncStatusPoll();
   }
 
@@ -3856,6 +3865,7 @@ function createChatTree(deps) {
     historyCache = new Map();
     named = new Set();
     cancelSoon = null;
+    statusFailures = 0;
     cancelStatusPoll = null;
     busyWait = null;
     busyAgain = false;
