@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as sideChat from '../src/side-chat.js';
 import {
   createSideChat,
   BUSY_TEXT,
@@ -11,6 +12,14 @@ import {
   MODEL_KEY,
   listKey,
   branchName,
+  rowsAfterFence,
+  digestFromRows,
+  rowText,
+  rememberSideBranch,
+  isKnownSideBranch,
+  MERGE_STAGED_TEXT,
+  MERGE_HIDDEN_TEXT,
+  MERGE_NO_COMPOSER_TEXT,
 } from '../src/side-chat.js';
 
 const el = (type, props, key) => ({ type, props, key });
@@ -134,6 +143,17 @@ function fakeHost({
         const offset = params.cursor ? Number(params.cursor) : 0;
         const rows = b.rows.slice(offset, offset + params.limit);
         return { session_id: params.session_id, rows, next_cursor: String(offset + rows.length), reset: false };
+      }
+      // Generous parent window so merge tests still reach setDraft unless they override the host.
+      if (method === 'session.usage' || method === 'session.stats' || method === 'session.context_breakdown') {
+        return {
+          calls: 1,
+          input: 100,
+          output: 50,
+          total: 150,
+          context_used: 1000,
+          context_max: 128000,
+        };
       }
       throw new Error(`unexpected ${method}`);
     },
@@ -733,4 +753,680 @@ test('an answer renders through MessageTextContent when the SDK has it, else as 
   const tree = expand(plain.pane.render());
   assert.equal(findAll(tree, (n) => n.type === MessageTextContent).length, 0);
   assert.ok(findAll(tree, (n) => n.type === 'pre' && n.props.children === '**bold**').length === 1);
+});
+
+test('after dispose and a second register (disable, then enable), a question still gets its answer', async () => {
+  const ctx = setup();
+  ctx.unload();
+  ctx.chat.register({
+    register: () => {},
+    storage: ctx.storage,
+    setTimeout: ctx.clock.setTimeout,
+    onDispose: () => {},
+  });
+  await ask(ctx, 'still alive?');
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+});
+
+const DIGEST = (question, answer) => `From side question:\n\nQuestion: ${question}\n\nAnswer:\n${answer}`;
+
+const VERBATIM = (title, turns) => {
+  const blocks = turns.map(([question, answer]) => `You:\n${question}\n\nAssistant:\n${answer}`).join('\n\n');
+  return `From side chat: ${title}\n\n${blocks}`;
+};
+
+const roughTokens = (text) => (text ? Math.floor((text.length + 3) / 4) : 0);
+const commas = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
+test('rows after the fence are kept and copied history rows are not', () => {
+  const rows = [
+    { role: 'user', text: 'main question', row_id: 1 },
+    { role: 'assistant', text: 'main answer', row_id: 2 },
+    { role: 'user', text: 'side q', row_id: 3 },
+    { role: 'tool', text: 'search hit', row_id: 4 },
+    { role: 'assistant', text: 'side a', row_id: 5 },
+    { role: 'assistant', text: '   ', row_id: 6 },
+  ];
+  assert.deepEqual(
+    rowsAfterFence(rows, 2).map((row) => row.row_id),
+    [3, 4, 5, 6],
+  );
+  assert.equal(digestFromRows(rows, 2, { question: 'ignored', answer: 'ignored' }), DIGEST('side q', 'side a'));
+  // A copied row with no row id is still new to a fence, matching the poll. A missing fence keeps nothing.
+  assert.deepEqual(rowsAfterFence([{ role: 'user', text: 'loose', row_id: Number.NaN }], 2), [
+    { role: 'user', text: 'loose', row_id: Number.NaN },
+  ]);
+  assert.deepEqual(rowsAfterFence(rows, null), []);
+});
+
+test('digest falls back to the stored question and answer', () => {
+  const copied = [
+    { role: 'user', text: 'main question', row_id: 1 },
+    { role: 'assistant', text: 'main answer', row_id: 2 },
+  ];
+  assert.equal(digestFromRows(copied, 2, { question: 'stored q', answer: 'stored a' }), DIGEST('stored q', 'stored a'));
+  assert.equal(digestFromRows(null, 2, { question: 'stored q', answer: 'stored a' }), DIGEST('stored q', 'stored a'));
+  assert.equal(digestFromRows([], null, { question: 'stored q', answer: '  stored a  ' }), DIGEST('stored q', 'stored a'));
+});
+
+function stageButton(ctx) {
+  return findAll(expand(ctx.pane.render()), (n) => n.type === 'Button' && n.props.children === 'Merge into parent')[0];
+}
+
+function withComposer(ctx, setDraft, submit = () => {}) {
+  const order = [];
+  const opened = ctx.host.opened;
+  ctx.host.openSession = async (id, opts) => {
+    order.push(['open', id, opts]);
+    opened.push([id, opts]);
+  };
+  ctx.host.composer = {
+    setDraft: async (id, text) => {
+      order.push(['draft', id, text]);
+      return setDraft(id, text);
+    },
+    submit: (...args) => {
+      order.push(['submit', ...args]);
+      return submit(...args);
+    },
+  };
+  return order;
+}
+
+test('Merge into parent opens the parent in place and stages the side exchange verbatim without sending', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  await ask(ctx, 'what is a monad?');
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+  const button = stageButton(ctx);
+  assert.equal(button.props.disabled, false);
+  // The merge read sees copied history plus a newer turn than the one the poll stored.
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.transcript') {
+      ctx.host.calls.push([method, params]);
+      return {
+        rows: [
+          { role: 'user', text: 'main question', row_id: 101 },
+          { role: 'assistant', text: 'main answer', row_id: 102 },
+          { role: 'user', text: 'what is a monad?', row_id: 210 },
+          { role: 'assistant', text: 'fresh side answer', row_id: 211 },
+        ],
+        next_cursor: null,
+        reset: false,
+      };
+    }
+    return base(method, params);
+  };
+  await button.props.onClick();
+  const draft = VERBATIM('what is a monad?', [['what is a monad?', 'fresh side answer']]);
+  assert.deepEqual(order.map((step) => step[0]), ['open', 'draft']);
+  assert.deepEqual(order[0], ['open', 'st-main', { intent: 'in-place' }]);
+  assert.equal(order[1][1], 'st-main');
+  assert.equal(order[1][2], draft);
+  assert.equal(order[1][2].includes('From side question:'), false);
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  const notice = findAll(expand(ctx.pane.render()), (n) => n.props?.children === MERGE_STAGED_TEXT)[0];
+  assert.equal(notice.props.style.userSelect, 'text');
+  assert.equal(notice.props['data-selectable-text'], 'true');
+  ctx.unload();
+});
+
+test('a false setDraft shows a notice and does not throw', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => false);
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 3);
+  await assert.doesNotReject(() => stageButton(ctx).props.onClick());
+  assert.deepEqual(
+    order.map((step) => step[0]),
+    ['open', 'draft', 'draft'],
+  );
+  assert.deepEqual(order[1].slice(0, 2), ['draft', 'st-main']);
+  assert.deepEqual(order[2].slice(0, 2), ['draft', 'rt-main']);
+  assert.match(order[1][2], /You:\nq/);
+  assert.match(order[1][2], /Assistant:\nside answer/);
+  assert.equal(order[1][2].includes('From side question:'), false);
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_HIDDEN_TEXT);
+  ctx.unload();
+});
+
+test('a thrown setDraft shows the same notice and does not throw', async () => {
+  const ctx = setup();
+  withComposer(ctx, () => {
+    throw new Error('composer gone');
+  });
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 3);
+  await assert.doesNotReject(() => stageButton(ctx).props.onClick());
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_HIDDEN_TEXT);
+  ctx.unload();
+});
+
+test('when session.transcript fails, Stage merge still uses the stored question and answer', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  await ask(ctx, 'stored question');
+  await ctx.clock.tick(POLL_MS * 3);
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.transcript') throw new Error('transcript down');
+    return base(method, params);
+  };
+  await stageButton(ctx).props.onClick();
+  assert.equal(order[1][2], VERBATIM('stored question', [['stored question', 'side answer']]));
+  assert.equal(order[1][2].includes('From side question:'), false);
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  ctx.unload();
+});
+
+test('Merge into parent is disabled when there is no answer', async () => {
+  const asking = setup({ host: fakeHost({ script: () => {} }) });
+  await ask(asking, 'q');
+  assert.equal(stageButton(asking), undefined);
+  asking.unload();
+
+  const stored = [{ id: 'b9', question: 'q', session_id: 'b9', stored_session_id: 's9', status: 'answered', answer: '   ', at: 5 }];
+  const empty = setup({ storage: asyncStorage({ [listKey('st-main')]: stored }) });
+  await flush();
+  assert.equal(stageButton(empty).props.disabled, true);
+  empty.unload();
+});
+
+test('a missing composer draft API shows a notice and writes nothing', async () => {
+  const ctx = setup();
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 3);
+  const opened = ctx.host.opened.length;
+  await assert.doesNotReject(() => stageButton(ctx).props.onClick());
+  assert.equal(ctx.host.opened.length, opened);
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_NO_COMPOSER_TEXT);
+  ctx.unload();
+});
+
+test('estimateTokens matches the ASCII (len+3)//4 count and is 0 for empty text', () => {
+  assert.equal(typeof sideChat.estimateTokens, 'function');
+  assert.equal(sideChat.estimateTokens(''), 0);
+  assert.equal(sideChat.estimateTokens(undefined), 0);
+  assert.equal(sideChat.estimateTokens('abcd'), 1);
+  assert.equal(sideChat.estimateTokens('abc'), 1);
+  assert.equal(sideChat.estimateTokens('abcde'), 2);
+});
+
+test('parseContextHeadroom reads TUI usage, nested usage, and canonical stats', () => {
+  assert.equal(typeof sideChat.parseContextHeadroom, 'function');
+  assert.deepEqual(sideChat.parseContextHeadroom({
+    calls: 1,
+    input: 100,
+    output: 50,
+    total: 150,
+    context_used: 1000,
+    context_max: 128000,
+  }), { used: 1000, max: 128000, available: 127000, estimated: false });
+  assert.deepEqual(sideChat.parseContextHeadroom({
+    usage: { context_used: 80, context_max: 1000, context_estimated: true },
+  }), { used: 80, max: 1000, available: 920, estimated: true });
+  assert.deepEqual(sideChat.parseContextHeadroom({
+    last_prompt_tokens: 50,
+    context_length: 200,
+    context_tokens: 40,
+  }), { used: 50, max: 200, available: 150, estimated: false });
+  assert.equal(sideChat.parseContextHeadroom({ calls: 0, input: 0, output: 0, total: 0 }), null);
+  assert.deepEqual(sideChat.parseContextHeadroom({
+    context_length: 0,
+    usage: { context_used: 5, context_max: 10 },
+  }), { used: 5, max: 10, available: 5, estimated: false });
+  assert.deepEqual(sideChat.parseContextHeadroom({
+    context_tokens: 7,
+    context_length: 11,
+  }), { used: 7, max: 11, available: 4, estimated: false });
+});
+
+test('formatSideVerbatim and turnsFromRows keep every side pair and skip tool and system rows', () => {
+  assert.equal(typeof sideChat.turnsFromRows, 'function');
+  assert.equal(typeof sideChat.formatSideVerbatim, 'function');
+  const turns = sideChat.turnsFromRows([
+    { role: 'assistant', text: 'before any question' },
+    { role: 'user', text: 'q1' },
+    { role: 'tool', text: 'search hit' },
+    { role: 'assistant', text: 'a1a' },
+    { role: 'assistant', text: '   ' },
+    { role: 'assistant', text: 'a1b' },
+    { role: 'system', text: 'note' },
+    { role: 'user', text: 'q2' },
+    { role: 'assistant', content: [{ text: 'a2' }] },
+  ]);
+  assert.deepEqual(turns, [
+    { question: 'q1', answer: 'a1a\na1b' },
+    { question: 'q2', answer: 'a2' },
+  ]);
+  assert.equal(
+    sideChat.formatSideVerbatim('  Title  ', turns),
+    VERBATIM('Title', [['q1', 'a1a\na1b'], ['q2', 'a2']]),
+  );
+  assert.equal(sideChat.formatSideVerbatim('   ', [{ question: 'q', answer: 'a' }]), VERBATIM('Side chat', [['q', 'a']]));
+});
+
+test('formatNoFitNotice names side tokens, available headroom, and estimated figures', () => {
+  assert.equal(typeof sideChat.formatNoFitNotice, 'function');
+  assert.equal(
+    sideChat.formatNoFitNotice({ sideTokens: 12400, available: 3200, used: 124800, max: 128000 }),
+    "Doesn't fit: side chat is 12,400 tokens, parent has 3,200 available (124,800 used of 128,000).",
+  );
+  assert.equal(
+    sideChat.formatNoFitNotice({
+      sideTokens: 12400,
+      available: 3200,
+      used: 124800,
+      max: 128000,
+      sideEstimated: true,
+    }),
+    "Doesn't fit: side chat is 12,400 tokens (estimated), parent has 3,200 available (124,800 used of 128,000).",
+  );
+  assert.match(
+    sideChat.formatNoFitNotice({
+      sideTokens: 12,
+      available: 3,
+      used: 5,
+      max: 8,
+      sideEstimated: true,
+      windowEstimated: true,
+    }),
+    /estimated/,
+  );
+});
+
+test('a side exchange that fits the parent window is staged verbatim and not submitted', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  await ask(ctx, 'what is a monad?');
+  await ctx.clock.tick(POLL_MS * 3);
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.usage') {
+      ctx.host.calls.push([method, params]);
+      return { context_used: 1000, context_max: 128000 };
+    }
+    if (method === 'session.transcript') {
+      ctx.host.calls.push([method, params]);
+      return {
+        rows: [
+          { role: 'user', text: 'main question', row_id: 1 },
+          { role: 'assistant', text: 'main answer', row_id: 2 },
+          { role: 'user', text: 'what is a monad?', row_id: 210 },
+          { role: 'assistant', text: 'fresh side answer', row_id: 211 },
+        ],
+        next_cursor: null,
+      };
+    }
+    return base(method, params);
+  };
+  await stageButton(ctx).props.onClick();
+  const usage = ctx.host.calls.filter(([method]) => method === 'session.usage');
+  assert.equal(usage[0][1].session_id, 'st-main');
+  assert.equal(usage.some(([, params]) => params.session_id === 'branch-1'), false);
+  assert.deepEqual(order.map((step) => step[0]), ['open', 'draft']);
+  assert.deepEqual(order[0], ['open', 'st-main', { intent: 'in-place' }]);
+  assert.equal(order[1][2], VERBATIM('what is a monad?', [['what is a monad?', 'fresh side answer']]));
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_STAGED_TEXT);
+  ctx.unload();
+});
+
+test('a side exchange that does not fit is not opened, drafted, or submitted', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 3);
+  const opened = ctx.host.opened.length;
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.usage') return { context_used: 127990, context_max: 128000 };
+    return base(method, params);
+  };
+  await assert.doesNotReject(() => stageButton(ctx).props.onClick());
+  assert.deepEqual(order, []);
+  assert.equal(ctx.host.opened.length, opened);
+  const notice = ctx.chat.$status.get()['st-main'].notice;
+  const verbatim = VERBATIM('q', [['q', 'side answer']]);
+  assert.match(notice, /Doesn't fit/);
+  assert.match(notice, new RegExp(commas(roughTokens(verbatim))));
+  assert.match(notice, /10 available/);
+  assert.match(notice, /127,990 used of 128,000/);
+  assert.match(notice, /estimated/);
+  const shown = findAll(expand(ctx.pane.render()), (n) => n.props?.children === notice)[0];
+  assert.equal(shown.props.style.userSelect, 'text');
+  assert.equal(shown.props['data-selectable-text'], 'true');
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  ctx.unload();
+});
+
+test('merge stages every side pair after the fence, not a first-pair digest', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  await ask(ctx, 'seed question');
+  await ctx.clock.tick(POLL_MS * 3);
+  const fence = entryOf(ctx).maxRowId;
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.transcript') {
+      ctx.host.calls.push([method, params]);
+      return {
+        rows: [
+          { role: 'user', text: 'main question', row_id: fence - 1 },
+          { role: 'assistant', text: 'main answer', row_id: fence },
+          { role: 'user', text: 'first side q', row_id: fence + 1 },
+          { role: 'tool', text: 'search hit', row_id: fence + 2 },
+          { role: 'assistant', text: 'first side a', row_id: fence + 3 },
+          { role: 'system', text: 'note', row_id: fence + 4 },
+          { role: 'user', text: 'second side q', row_id: fence + 5 },
+          { role: 'assistant', text: 'second side a', row_id: fence + 6 },
+        ],
+        next_cursor: null,
+      };
+    }
+    return base(method, params);
+  };
+  await stageButton(ctx).props.onClick();
+  const draft = order[1][2];
+  assert.equal(draft, VERBATIM('seed question', [['first side q', 'first side a'], ['second side q', 'second side a']]));
+  assert.equal(draft.includes('From side question:'), false);
+  assert.equal(draft.includes('main question'), false);
+  assert.equal(draft.includes('search hit'), false);
+  assert.equal(draft.includes(DIGEST('first side q', 'first side a')), false);
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  ctx.unload();
+});
+
+test('when the host token APIs throw, merge still stages verbatim and says the window was not reported', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 3);
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.usage' || method === 'session.stats' || method === 'session.context_breakdown') {
+      ctx.host.calls.push([method, params]);
+      throw new Error(`no ${method}`);
+    }
+    return base(method, params);
+  };
+  await assert.doesNotReject(() => stageButton(ctx).props.onClick());
+  assert.deepEqual(order.map((step) => step[0]), ['open', 'draft']);
+  assert.equal(order[1][2], VERBATIM('q', [['q', 'side answer']]));
+  assert.equal(order.some((step) => step[0] === 'submit'), false);
+  const tried = ctx.host.calls.filter(([method]) => (
+    method === 'session.usage' || method === 'session.stats' || method === 'session.context_breakdown'
+  )).map(([method]) => method);
+  assert.ok(tried.includes('session.usage'));
+  assert.ok(tried.includes('session.stats'));
+  assert.ok(tried.includes('session.context_breakdown'));
+  const notice = ctx.chat.$status.get()['st-main'].notice;
+  assert.match(notice, /estimated/);
+  assert.match(notice, /window was not reported/);
+  assert.match(notice, new RegExp(commas(roughTokens(VERBATIM('q', [['q', 'side answer']])))));
+  ctx.unload();
+});
+
+test('session.stats supplies the window when session.usage has no context max', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 3);
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.usage') return { calls: 0, input: 0, output: 0, total: 0 };
+    if (method === 'session.stats') return { last_prompt_tokens: 127990, context_length: 128000, context_tokens: 127990 };
+    if (method === 'session.context_breakdown') throw new Error('breakdown down');
+    return base(method, params);
+  };
+  await assert.doesNotReject(() => stageButton(ctx).props.onClick());
+  assert.deepEqual(order, []);
+  assert.match(ctx.chat.$status.get()['st-main'].notice, /127,990 used of 128,000/);
+  ctx.unload();
+});
+
+test('a parent window on the focused runtime id is used when the stored id has none', async () => {
+  const ctx = setup();
+  const order = withComposer(ctx, () => true);
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 3);
+  const seen = [];
+  const base = ctx.host.request.bind(ctx.host);
+  ctx.host.request = async (method, params) => {
+    if (method === 'session.usage' || method === 'session.stats' || method === 'session.context_breakdown') {
+      seen.push([method, params.session_id]);
+      if (params.session_id === 'st-main') throw new Error('no window on stored id');
+      if (method === 'session.usage') return { context_used: 1000, context_max: 128000 };
+      throw new Error('runtime usage should have answered');
+    }
+    return base(method, params);
+  };
+  await stageButton(ctx).props.onClick();
+  assert.deepEqual(seen[0], ['session.usage', 'st-main']);
+  assert.ok(seen.some(([method, id]) => method === 'session.usage' && id === 'rt-main'));
+  assert.deepEqual(order.map((step) => step[0]), ['open', 'draft']);
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, MERGE_STAGED_TEXT);
+  ctx.unload();
+});
+
+test('rowText uses trimmed text, then string content, then joined part text', () => {
+  assert.equal(rowText({ text: '  hello  ' }), 'hello');
+  assert.equal(rowText({ text: '   ', content: ' from content ' }), 'from content');
+  assert.equal(rowText({ content: 'plain' }), 'plain');
+  assert.equal(rowText({ content: [{ text: 'What is ' }, { type: 'image' }, { text: 'a virtualenv?' }] }), 'What is a virtualenv?');
+  assert.equal(rowText({ role: 'assistant' }), '');
+  assert.equal(rowText(null), '');
+});
+
+// v0.23.0 has session.history and no session.transcript. History is one complete snapshot.
+function withHistoryFallback(host, { contentOnly = false } = {}) {
+  const base = host.request.bind(host);
+  host.request = async (method, params) => {
+    if (method === 'session.transcript') {
+      host.calls.push([method, params]);
+      throw new Error('unknown method: session.transcript');
+    }
+    if (method === 'session.history') {
+      host.calls.push([method, params]);
+      const b = host.branches.get(params.session_id);
+      const project = (row) => (
+        contentOnly
+          ? { role: row.role, content: row.text, row_id: row.row_id }
+          : { role: row.role, text: row.text, row_id: row.row_id }
+      );
+      const messages = b.rows.map(project);
+      if (b.submitted) {
+        b.reads += 1;
+        const user = contentOnly
+          ? { role: 'user', content: b.question, row_id: 900 }
+          : { role: 'user', text: b.question, row_id: 900 };
+        const assistant = contentOnly
+          ? { role: 'assistant', content: 'history answer', row_id: 901 }
+          : { role: 'assistant', text: 'history answer', row_id: 901 };
+        if (b.reads >= 1) messages.push(user);
+        if (b.reads >= 2) messages.push(assistant);
+      }
+      return { count: messages.length, messages };
+    }
+    return base(method, params);
+  };
+  return host;
+}
+
+const historyCalls = (host) => host.calls.filter(([method]) => method === 'session.history').length;
+
+test('session.history answers when session.transcript is unknown', async () => {
+  const host = withHistoryFallback(fakeHost());
+  const ctx = setup({ host });
+  await ask(ctx, 'What is a virtualenv?');
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+  assert.equal(entryOf(ctx).answer, 'history answer');
+  assert.ok(historyCalls(host) < 30, `history called ${historyCalls(host)} times`);
+  ctx.unload();
+});
+
+test('session.history answers from content-only rows', async () => {
+  const host = withHistoryFallback(fakeHost(), { contentOnly: true });
+  const ctx = setup({ host });
+  await ask(ctx, 'What is a virtualenv?');
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+  assert.equal(entryOf(ctx).answer, 'history answer');
+  assert.ok(historyCalls(host) < 30, `history called ${historyCalls(host)} times`);
+  ctx.unload();
+});
+
+test('after a numeric fence, a new user row starts the turn even when its text differs', async () => {
+  const script = (n, b, { add }) => {
+    if (n === 1) add({ role: 'user', text: 'Explain virtualenv' });
+    if (n === 2) add({ role: 'assistant', text: 'renamed-user answer' });
+  };
+  const ctx = setup({ host: fakeHost({ script }) });
+  await ask(ctx, 'What is a virtualenv?');
+  assert.equal(Number.isFinite(entryOf(ctx).maxRowId), true);
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+  assert.equal(entryOf(ctx).answer, 'renamed-user answer');
+  ctx.unload();
+});
+
+test('digest keeps the first side pair when a follow-up turn is already stored', () => {
+  const rows = [
+    { role: 'user', text: 'Publish Python package to PyPI', row_id: 43 },
+    { role: 'assistant', text: 'parent answer', row_id: 44 },
+    { role: 'user', text: 'What is a virtualenv?', row_id: 45 },
+    { role: 'assistant', text: 'a virtualenv is an isolated environment', row_id: 46 },
+    { role: 'user', text: 'How do I make one?', row_id: 47 },
+    { role: 'assistant', text: 'follow-up answer', row_id: 48 },
+  ];
+  assert.equal(
+    digestFromRows(rows, 44, { question: 'What is a virtualenv?', answer: 'stored' }),
+    DIGEST('What is a virtualenv?', 'a virtualenv is an isolated environment'),
+  );
+});
+
+test('with no fence, the digest is the side pair that matches the stored question', () => {
+  const rows = [
+    { role: 'user', text: 'Publish Python package to PyPI', row_id: 43 },
+    { role: 'assistant', text: 'parent answer', row_id: 44 },
+    { role: 'user', text: 'What is a virtualenv?', row_id: 45 },
+    { role: 'assistant', text: 'a virtualenv is an isolated environment', row_id: 46 },
+  ];
+  assert.equal(rowsAfterFence(rows, null).length, 0);
+  assert.equal(
+    digestFromRows(rows, null, { question: 'What is a virtualenv?' }),
+    DIGEST('What is a virtualenv?', 'a virtualenv is an isolated environment'),
+  );
+  assert.equal(digestFromRows([], null, { question: 'stored q', answer: '  stored a  ' }), DIGEST('stored q', 'stored a'));
+});
+
+function paneInputs(ctx) {
+  return findAll(expand(ctx.pane.render()), (n) => n.type === 'Input');
+}
+
+test('typing in the side form does not propagate to the parent composer', () => {
+  const ctx = setup();
+  const tree = expand(ctx.pane.render());
+  const inputs = findAll(tree, (n) => n.type === 'Input');
+  assert.equal(inputs.length, 3);
+  for (const input of inputs) {
+    assert.equal(typeof input.props.onKeyDown, 'function');
+    assert.equal(typeof input.props.onKeyUp, 'function');
+    assert.equal(typeof input.props.onPointerDown, 'function');
+    let stopped = 0;
+    const event = { key: 'a', stopPropagation: () => { stopped += 1; }, stopImmediatePropagation: () => { stopped += 1; } };
+    input.props.onKeyDown(event);
+    assert.equal(stopped, 2);
+    input.props.onKeyUp(event);
+    input.props.onPointerDown(event);
+    assert.equal(stopped, 6);
+  }
+  const wrappers = findAll(tree, (n) => (
+    n.type !== 'Input'
+    && typeof n.props?.onKeyDown === 'function'
+    && typeof n.props?.onKeyUp === 'function'
+    && typeof n.props?.onPointerDown === 'function'
+  ));
+  assert.ok(wrappers.length >= 1);
+  let wrapped = 0;
+  wrappers[0].props.onKeyDown({ key: 'a', stopPropagation: () => { wrapped += 1; } });
+  assert.equal(wrapped, 1);
+  assert.equal(methods(ctx.host).includes('session.branch_whole'), false);
+});
+
+test('Enter in the question field asks and stops the key', async () => {
+  const ctx = setup();
+  ctx.chat.$form.set({ question: 'What is a virtualenv?', model: '', provider: '' });
+  const [question] = paneInputs(ctx);
+  assert.equal(question.props.placeholder, 'Side question');
+  let prevented = 0;
+  let stopped = 0;
+  question.props.onKeyDown({
+    key: 'Enter',
+    shiftKey: false,
+    preventDefault: () => { prevented += 1; },
+    stopPropagation: () => { stopped += 1; },
+    stopImmediatePropagation: () => { stopped += 1; },
+  });
+  await flush();
+  assert.equal(prevented, 1);
+  assert.equal(stopped, 2);
+  assert.equal(entryOf(ctx).question, 'What is a virtualenv?');
+  ctx.unload();
+});
+
+test('asking a side question registers the branch session ids', async () => {
+  const host = fakeHost();
+  const base = host.request.bind(host);
+  host.request = async (method, params) => {
+    const result = await base(method, params);
+    if (method === 'session.branch_whole') return { ...result, stored_session_id: 'stored-branch-1' };
+    return result;
+  };
+  const ctx = setup({ host });
+  await ask(ctx, 'What is a virtualenv?');
+  const entry = entryOf(ctx);
+  assert.equal(isKnownSideBranch(entry.session_id), true);
+  assert.equal(isKnownSideBranch(entry.stored_session_id), true);
+  assert.equal(entry.stored_session_id, 'stored-branch-1');
+  ctx.unload();
+});
+
+test('restoring a stored list registers the branch session ids', () => {
+  const storage = syncStorage({
+    [listKey('st-main')]: [{
+      id: 'b9',
+      question: 'q',
+      session_id: 'sess-b9',
+      stored_session_id: 'stored-b9',
+      status: 'answered',
+      answer: 'a',
+      at: 5,
+    }],
+  });
+  setup({ storage });
+  assert.equal(isKnownSideBranch('sess-b9'), true);
+  assert.equal(isKnownSideBranch('stored-b9'), true);
+  assert.equal(rememberSideBranch('sess-b9'), undefined);
+});
+
+test('side cards follow the focused chat and come back with it', async () => {
+  const ctx = setup();
+  await ask(ctx, 'only on main');
+  const shown = () => textOf(expand(ctx.pane.render()));
+  assert.match(shown(), /only on main/);
+  ctx.host.state.focusedStoredSessionId.set('st-other');
+  ctx.host.state.focusedSessionId.set('rt-other');
+  await flush();
+  assert.doesNotMatch(shown(), /only on main/);
+  ctx.host.state.focusedStoredSessionId.set('st-main');
+  ctx.host.state.focusedSessionId.set('rt-main');
+  await flush();
+  assert.match(shown(), /only on main/);
+  ctx.unload();
 });

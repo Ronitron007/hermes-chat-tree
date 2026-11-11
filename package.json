@@ -3,9 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test test/*.test.js side-chat/test/*.test.js",
+    "test": "node --test test/*.test.js side-chat/test/*.test.js chat-tree/test/*.test.js",
     "test:side-chat": "node --test side-chat/test/*.test.js",
+    "test:chat-tree": "node --test chat-tree/test/*.test.js",
     "assemble": "node scripts/assemble.mjs",
-    "assemble:side-chat": "node side-chat/scripts/assemble.mjs"
+    "assemble:side-chat": "node side-chat/scripts/assemble.mjs",
+    "assemble:chat-tree": "node chat-tree/scripts/assemble.mjs"
   }
 }
