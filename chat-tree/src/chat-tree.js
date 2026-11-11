@@ -1,16 +1,31 @@
-// Chat tree pane: the focused chat, its ancestors, all its branches, and its live subagents,
-// as an indented outline (default) or an outline beside a hand-drawn SVG lane graph. A click
-// opens a node's chat in a tab. Side chats show a [side] badge and a Merge as-is button that
-// stages the side exchange verbatim in the parent composer (never sends it).
+// Chat tree pane: a git graph of the focused chat's tree. A node is one exchange (one user
+// message and its replies). A lane is one chat. A child lane forks off its parent at the last
+// exchange they share. A parent exchange that starts with `From side chat: <side question>` is a
+// merge node, linked by a curve to the one child chat that starts with that question. Blue marks the path from the
+// first exchange of the root chat to the open node; everything else is grey. A click on a node
+// opens its chat in place. Side chats keep a Merge as-is button that stages the side exchange
+// verbatim in the parent composer (never sends it). Live subagents show below the graph.
 // Plain ESM with no imports: the SDK pieces and timers are injected so it runs under node --test.
-// Spec: docs/research/2026-11-11-chat-tree/spec-chat-tree.md, spec-merge-back.md
+// Spec: docs/specs/2026-11-12-competition-build/spec.md (unit.tree_view)
 
 export const PLUGIN_ID = 'chat-tree';
 export const PANE_ID = 'pane';
 export const REFRESH_MS = 15_000;
 export const LIST_LIMIT = 500;
+export const MAX_CHATS = 30;
 export const SIDE_PREFIX = 'Side: ';
-export const MINIMAP_MIN = 40;
+export const MERGE_HEADER = 'From side chat: ';
+export const LABEL_MAX = 60;
+// Graph geometry in px. A row is one exchange; lanes are columns inside the graph column.
+export const ROW_H = 26;
+export const GRAPH_W = 58;
+export const GRAPH_PAD = 8;
+export const LANE_GAP = 14;
+export const NODE_R = 4;
+export const CURVE_R = 5;
+// The only two graph colours: the path to the open node, and everything else.
+export const BLUE = '#3B82F6';
+export const GREY = '#6B7280';
 // Same wording as side-chat (side-chat/src/side-chat.js): the two panes show one merge flow.
 export const MERGE_STAGED_TEXT =
   'The draft is in the main chat composer. Edit it and send. After sending, session.undo on an idle parent can drop that turn.';
@@ -18,8 +33,8 @@ export const MERGE_HIDDEN_TEXT = "The main chat's composer is not visible. Open 
 export const MERGE_NO_COMPOSER_TEXT = 'The composer draft API is missing. Nothing was written.';
 
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text' };
-const INDENT_PX = 14;
-const DISCLOSURE_PX = 14;
+const HISTORY_CONCURRENCY = 4;
+const HISTORY_CACHE_MAX = 200;
 
 const str = (v) => (typeof v === 'string' ? v.trim() : '');
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
@@ -138,63 +153,34 @@ export function buildTree(input, focusedId) {
   return { root: visit(rootRow), focused: focusedRow, partial: Boolean(missing && !byId.has(missing)) };
 }
 
-// The rows from the tree root down to the focused chat, for the breadcrumb.
-export function pathToFocused(tree) {
+// The chats whose histories the graph reads: the root and its descendants, depth first with the
+// oldest child first, as [{ row, parentId }]. Past `max` chats, the path from the root to the
+// focused chat stays, then chats whose parent is kept, in that order.
+export function lineageChats(tree, max = MAX_CHATS) {
   if (!tree) return [];
-  const walk = (node, trail) => {
-    const next = [...trail, node.row];
-    if (node.row === tree.focused) return next;
-    for (const kid of node.children) {
-      const hit = walk(kid, next);
-      if (hit) return hit;
-    }
-    return null;
+  const order = [];
+  const walk = (node, parentId) => {
+    order.push({ row: node.row, parentId });
+    for (const kid of node.children) walk(kid, node.row.id);
   };
-  return walk(tree.root, []) ?? [];
-}
-
-// Depth-first, flat: [{ depth, kind: 'chat', row, focused, childCount, collapsed } |
-// { depth, kind: 'subagent', agent }]. Live subagents go first under the focused chat.
-// isCollapsed(row) hides a node's children (and its subagents) from the list.
-export function flattenTree(tree, subagents = [], isCollapsed = null) {
-  if (!tree) return [];
-  const out = [];
-  const walk = (node, depth) => {
-    const focused = node.row === tree.focused;
-    const childCount = node.children.length;
-    const collapsed = childCount > 0 && Boolean(isCollapsed?.(node.row));
-    out.push({ depth, kind: 'chat', row: node.row, focused, childCount, collapsed });
-    if (collapsed) return;
-    if (focused) for (const agent of subagents) out.push({ depth: depth + 1, kind: 'subagent', agent });
-    for (const child of node.children) walk(child, depth + 1);
-  };
-  walk(tree.root, 0);
-  return out;
-}
-
-// For the lane graph. Lane `a` is the vertical line under the node at depth `a`. For each row:
-// continues[a] says whether lane a keeps running past the row (its owner has a later child), and
-// hasKids says whether a child row follows. Scans from the end, so it is one pass.
-export function graphGuides(items) {
-  const later = []; // later[k]: a row of depth k follows in the same branch
-  const guides = new Array(items.length);
-  for (let i = items.length - 1; i >= 0; i--) {
-    const depth = items[i].depth;
-    guides[i] = {
-      continues: Array.from({ length: depth }, (_, lane) => later[lane + 1] === true),
-      hasKids: i + 1 < items.length && items[i + 1].depth > depth,
-    };
-    later.length = depth + 1; // deeper rows above belong to an earlier subtree
-    later[depth] = true;
+  walk(tree.root, null);
+  if (order.length <= max) return order;
+  const byId = new Map(order.map((chat) => [chat.row.id, chat]));
+  const keep = new Set();
+  for (let chat = byId.get(tree.focused.id); chat && !keep.has(chat.row.id); chat = chat.parentId ? byId.get(chat.parentId) : null) {
+    keep.add(chat.row.id);
   }
-  return guides;
+  for (const chat of order) {
+    if (keep.size >= max) break;
+    if (!keep.has(chat.row.id) && chat.parentId && keep.has(chat.parentId)) keep.add(chat.row.id);
+  }
+  return order.filter((chat) => keep.has(chat.row.id));
 }
 
 export const isSideTitle = (title) => typeof title === 'string' && title.startsWith(SIDE_PREFIX);
 
 // Shared with side-chat through globalThis: assembled plugins cannot import each other.
 const SIDE_BRANCH_IDS = '__hermesSideChatBranchIds';
-const MERGED_IDS = '__hermesSideChatMergedIds';
 
 function idSet(key) {
   if (!(globalThis[key] instanceof Set)) {
@@ -233,14 +219,6 @@ export function isKnownSideBranch(id) {
 
 export function isSideChat(row) {
   return isSideTitle(row?.title) || isKnownSideBranch(row?.id);
-}
-
-// A side chat whose exchange was staged in its parent composer. Takes a row or an id.
-export const rememberMergedBranch = (id) => rememberId(MERGED_IDS, id);
-
-export function isMergedChat(rowOrId) {
-  const id = typeof rowOrId === 'string' ? rowOrId : rowOrId?.id;
-  return typeof id === 'string' && id !== '' && idSet(MERGED_IDS).has(id);
 }
 
 // ── Merge-back helpers (copied from side-chat/src/side-chat.js; plugins cannot import each other) ──
@@ -336,7 +314,7 @@ export function formatSideVerbatim(title, turns) {
   const name = str(title) || 'Side chat';
   const list = Array.isArray(turns) ? turns : [];
   const blocks = list.map((turn) => `You:\n${turn.question}\n\nAssistant:\n${turn.answer}`);
-  return `From side chat: ${name}\n\n${blocks.join('\n\n')}`;
+  return `${MERGE_HEADER}${name}\n\n${blocks.join('\n\n')}`;
 }
 
 export function formatNoFitNotice(fields) {
@@ -360,10 +338,298 @@ function fitReadout(state) {
   return `? Window not reported: about ${side} tokens (estimated).`;
 }
 
-// Session times are Unix seconds (SessionInfo.last_active).
-export function timeText(seconds) {
-  const s = num(seconds);
-  return s ? new Date(s * 1000).toLocaleString() : '';
+// ── Exchanges: the nodes of the graph ──────────────────────────────────────────────────────
+
+// One line, at most `max` characters, with an ellipsis when cut.
+export function shortLabel(text, max = LABEL_MAX) {
+  const line = typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '';
+  if (!line) return '(no text)';
+  return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
+}
+
+// Runs of whitespace become one space; the ends are trimmed.
+export const normalizeText = (text) => (typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '');
+
+// The header text of a merge message: everything after `From side chat: ` up to the first blank
+// line (it may span lines). It carries the side question. null when the text is not a merge message.
+export function mergeHeader(text) {
+  if (typeof text !== 'string' || !text.startsWith(MERGE_HEADER)) return null;
+  return text.slice(MERGE_HEADER.length).split(/\n[ \t]*\r?\n/)[0].trim();
+}
+
+// One exchange per user message: { user, reply, label, merge }. The reply joins the non-empty
+// assistant texts until the next user message; tool and system rows are skipped. An unanswered
+// last message is still an exchange. merge is the normalized header text of a merge message, else null.
+export function exchangesFromRows(rows) {
+  const out = [];
+  let current = null;
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (row?.role === 'user') {
+      const user = rowText(row);
+      const header = mergeHeader(user);
+      const merge = header === null ? null : normalizeText(header);
+      current = { user, reply: '', label: shortLabel(merge === null ? user : `Merged: ${merge || 'side chat'}`), merge };
+      out.push(current);
+    } else if (row?.role === 'assistant' && current) {
+      const text = rowText(row);
+      if (text) current.reply = current.reply ? `${current.reply}\n${text}` : text;
+    }
+  }
+  return out;
+}
+
+// How many leading exchanges a child chat shares with its parent: its fork point.
+export function sharedExchangeCount(child, parent) {
+  const a = Array.isArray(child) ? child : [];
+  const b = Array.isArray(parent) ? parent : [];
+  let n = 0;
+  while (n < a.length && n < b.length && a[n].user === b[n].user && a[n].reply === b[n].reply) n += 1;
+  return n;
+}
+
+// A history is read again only when its chat's message count or last activity moved.
+// null (no metadata) means: always read.
+export function historyKey(row) {
+  const count = num(row?.message_count);
+  const active = num(row?.last_active);
+  return count || active ? `${count}:${active}` : null;
+}
+
+// One lane per chat: { id, row, title, model, side, parentId, exchanges, fork }. fork is the
+// number of exchanges shared with the parent lane (0 for the root).
+export function buildLanes(chats, exchangesById) {
+  const lanes = [];
+  const byId = new Map();
+  for (const { row, parentId } of Array.isArray(chats) ? chats : []) {
+    const exchanges = Array.isArray(exchangesById?.[row.id]) ? exchangesById[row.id] : [];
+    const parent = parentId ? byId.get(parentId) : null;
+    const lane = {
+      id: row.id,
+      row,
+      title: str(row.title) || 'Untitled',
+      model: str(row.model),
+      side: isSideChat(row),
+      parentId: parent ? parent.id : null,
+      exchanges,
+      fork: parent ? sharedExchangeCount(exchanges, parent.exchanges) : 0,
+    };
+    byId.set(lane.id, lane);
+    lanes.push(lane);
+  }
+  return lanes;
+}
+
+// ── Graph plan: row order, forks, merges, the blue path, collapse, and columns ──────────────
+
+// rows: [{ kind: 'node', key, lane, index, label, merge, mergeFrom, blue, open, first } |
+//        { kind: 'more', key, runKey, lane, index, count, blue }], oldest first, each with col.
+// lanes: [{ id, col, rows, firstRow, lastRow, anchorRow, anchorCol }] for lanes with rows.
+// merges: [{ from, fromRow, to, toRow }]: a curve from a side lane's last row to a merge node.
+// A node `lane:index` is drawn once, on the lane that owns it: the shared exchanges of a child
+// are its parent's. options: { focusedId, open: { chatId, index } | null, expanded: { [runKey]: true } }.
+export function planGraph(lanes, options = {}) {
+  const list = Array.isArray(lanes) ? lanes : [];
+  const byId = new Map(list.map((lane) => [lane.id, lane]));
+  const start = (lane) => (lane.parentId ? Math.min(lane.fork, lane.exchanges.length) : 0);
+  const nodeKey = (id, index) => `${id}:${index}`;
+
+  // The lane that draws exchange `index` of chat `id`: up the parents while it is shared.
+  const resolve = (id, index) => {
+    let lane = byId.get(id);
+    const seen = new Set();
+    while (lane && lane.parentId && index < lane.fork && !seen.has(lane.id)) {
+      seen.add(lane.id);
+      lane = byId.get(lane.parentId);
+    }
+    return lane ? { lane: lane.id, index } : null;
+  };
+
+  // Each child leaves its parent at the node of the last shared exchange. A child that shares
+  // nothing has no fork node: it starts its own lane after its parent's rows.
+  const anchorOf = new Map();
+  const anchored = new Map();
+  const loose = new Map();
+  for (const lane of list) {
+    if (!lane.parentId) continue;
+    const at = lane.fork > 0 ? resolve(lane.parentId, lane.fork - 1) : null;
+    if (at) {
+      anchorOf.set(lane.id, at);
+      const key = nodeKey(at.lane, at.index);
+      anchored.set(key, [...(anchored.get(key) ?? []), lane]);
+    } else {
+      loose.set(lane.parentId, [...(loose.get(lane.parentId) ?? []), lane]);
+    }
+  }
+
+  // The open node: the clicked node while its chat is focused, else the focused chat's last exchange.
+  const focused = byId.get(options.focusedId);
+  const open = options.open;
+  let target = null;
+  if (focused && open && open.chatId === focused.id && Number.isInteger(open.index) && open.index >= 0 && open.index < focused.exchanges.length) {
+    target = resolve(focused.id, open.index);
+  } else if (focused && focused.exchanges.length) {
+    target = resolve(focused.id, focused.exchanges.length - 1);
+  }
+  const openKey = target ? nodeKey(target.lane, target.index) : null;
+
+  // Blue: on each lane from the open node up through the fork nodes to the root's first exchange.
+  const blue = new Set();
+  for (let at = target, guard = new Set(); at && !guard.has(at.lane); at = anchorOf.get(at.lane) ?? null) {
+    guard.add(at.lane);
+    const lane = byId.get(at.lane);
+    for (let i = start(lane); i <= at.index; i++) blue.add(nodeKey(lane.id, i));
+  }
+
+  // Rows, depth first: a lane's own exchanges in order, each fork node followed by its children.
+  const expanded = options.expanded ?? {};
+  const rows = [];
+  const visited = new Set();
+  const pushNode = (lane, i) => {
+    const ex = lane.exchanges[i];
+    const key = nodeKey(lane.id, i);
+    rows.push({ kind: 'node', key, lane: lane.id, index: i, label: ex.label, merge: ex.merge, mergeFrom: null, blue: blue.has(key), open: key === openKey, first: false });
+  };
+  const emit = (lane) => {
+    if (visited.has(lane.id)) return;
+    visited.add(lane.id);
+    const n = lane.exchanges.length;
+    const s = start(lane);
+    const keep = new Set([s, n - 1]);
+    for (let i = s; i < n; i++) {
+      const key = nodeKey(lane.id, i);
+      if (anchored.has(key) || lane.exchanges[i].merge !== null || key === openKey) keep.add(i);
+    }
+    for (let i = s; i < n; ) {
+      if (keep.has(i)) {
+        pushNode(lane, i);
+        for (const kid of anchored.get(nodeKey(lane.id, i)) ?? []) emit(kid);
+        i += 1;
+        continue;
+      }
+      let j = i;
+      while (j < n && !keep.has(j)) j += 1;
+      const runKey = nodeKey(lane.id, i);
+      if (j - i >= 3 && !expanded[runKey]) {
+        rows.push({ kind: 'more', key: `more:${runKey}`, runKey, lane: lane.id, index: i, count: j - i, blue: blue.has(runKey) });
+      } else {
+        for (let k = i; k < j; k++) pushNode(lane, k);
+      }
+      i = j;
+    }
+    for (const kid of loose.get(lane.id) ?? []) emit(kid);
+  };
+  for (const lane of list) if (!lane.parentId) emit(lane);
+  for (const lane of list) emit(lane); // a lane whose parent is not in the list
+
+  const rowOf = new Map(rows.map((row, index) => [row.key, index]));
+  const info = new Map();
+  rows.forEach((row, index) => {
+    const entry = info.get(row.lane) ?? { id: row.lane, rows: [], firstRow: index, lastRow: index, anchorRow: -1, anchorCol: -1, col: 0, end: index };
+    entry.rows.push(index);
+    entry.lastRow = index;
+    entry.end = index;
+    info.set(row.lane, entry);
+  });
+  for (const entry of info.values()) rows[entry.firstRow].first = true;
+
+  // Merge links: the header text carries the side question. Link only when exactly one chat
+  // below the merge node's chat has a first own exchange with that text. Titles never count:
+  // Hermes cuts and renames them. Zero or several matches, or a match not above the node: no curve.
+  const below = (id, ancestorId) => {
+    const seen = new Set();
+    for (let lane = byId.get(id); lane && lane.parentId && !seen.has(lane.id); lane = byId.get(lane.parentId)) {
+      seen.add(lane.id);
+      if (lane.parentId === ancestorId) return true;
+    }
+    return false;
+  };
+  const merges = [];
+  rows.forEach((row, index) => {
+    if (row.kind !== 'node' || !row.merge) return;
+    const matches = list.filter((lane) => {
+      const first = lane.exchanges[start(lane)];
+      return lane.parentId && first && normalizeText(first.user) === row.merge && below(lane.id, row.lane);
+    });
+    const pick = matches.length === 1 ? matches[0] : null;
+    const entry = pick ? info.get(pick.id) : null;
+    if (!entry || entry.lastRow >= index) return;
+    row.mergeFrom = pick.id;
+    entry.end = Math.max(entry.end, index);
+    merges.push({ from: pick.id, fromRow: entry.lastRow, to: row.lane, toRow: index });
+  });
+
+  // Columns: a lane holds its column from its fork node to its last row (or its last merge).
+  // A child sits right of the lane it forks from; the lowest free column wins.
+  for (const [id, entry] of info) {
+    const at = anchorOf.get(id);
+    if (at) entry.anchorRow = rowOf.get(nodeKey(at.lane, at.index)) ?? -1;
+  }
+  const order = [...info.values()].sort((a, b) => (a.anchorRow >= 0 ? a.anchorRow : a.firstRow) - (b.anchorRow >= 0 ? b.anchorRow : b.firstRow) || a.firstRow - b.firstRow);
+  const placed = [];
+  for (const entry of order) {
+    const lane = byId.get(entry.id);
+    const from = entry.anchorRow >= 0 ? info.get(anchorOf.get(entry.id).lane) : lane.parentId ? info.get(lane.parentId) : null;
+    const begin = entry.anchorRow >= 0 ? entry.anchorRow : entry.firstRow;
+    let col = from ? from.col + 1 : 0;
+    while (placed.some((p) => p.col === col && p.begin <= entry.end && begin <= p.end)) col += 1;
+    entry.col = col;
+    if (entry.anchorRow >= 0) entry.anchorCol = from.col;
+    placed.push({ col, begin, end: entry.end });
+  }
+  for (const row of rows) row.col = info.get(row.lane).col;
+
+  const laneList = [...info.values()].map(({ end, ...entry }) => entry);
+  return { rows, lanes: laneList, merges, openKey };
+}
+
+// ── Graph geometry: a pure function of the plan, in px ──────────────────────────────────────
+
+const laneX = (col) => GRAPH_PAD + col * LANE_GAP;
+const rowY = (row) => row * ROW_H + ROW_H / 2;
+
+// { width, height, circles: [{ key, cx, cy, r, color, filled }], paths: [{ key, d, color }] }.
+// Lane lines stop at circle edges. A fork leaves its node sideways, turns down with a rounded
+// corner, and runs to the child's first node. A merge runs down from the side lane's last node
+// and turns into the merge node. Merge curves are always grey: a merged chat is not on the path.
+export function graphGeometry(plan) {
+  const rows = Array.isArray(plan?.rows) ? plan.rows : [];
+  const lanes = Array.isArray(plan?.lanes) ? plan.lanes : [];
+  const maxCol = rows.reduce((m, row) => Math.max(m, num(row.col)), 0);
+  const width = Math.max(GRAPH_W, GRAPH_PAD * 2 + maxCol * LANE_GAP);
+  const height = rows.length * ROW_H;
+  const colour = (on) => (on ? BLUE : GREY);
+  const edge = (index) => (rows[index].kind === 'node' ? NODE_R : 0);
+  const paths = [];
+  for (const lane of lanes) {
+    const x = laneX(lane.col);
+    for (let k = 1; k < lane.rows.length; k++) {
+      const a = lane.rows[k - 1];
+      const b = lane.rows[k];
+      paths.push({ key: `lane:${lane.id}:${a}`, d: `M ${x} ${rowY(a) + edge(a)} V ${rowY(b) - edge(b)}`, color: colour(rows[b].blue) });
+    }
+    if (lane.anchorRow >= 0) {
+      const xa = laneX(lane.anchorCol);
+      const ya = rowY(lane.anchorRow);
+      const d = `M ${xa + NODE_R} ${ya} H ${x - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 1 ${x} ${ya + CURVE_R} V ${rowY(lane.firstRow) - NODE_R}`;
+      paths.push({ key: `fork:${lane.id}`, d, color: colour(rows[lane.firstRow].blue) });
+    }
+  }
+  for (const merge of Array.isArray(plan?.merges) ? plan.merges : []) {
+    const xs = laneX(rows[merge.fromRow].col);
+    const xt = laneX(rows[merge.toRow].col);
+    const y0 = rowY(merge.fromRow) + NODE_R;
+    const y1 = rowY(merge.toRow);
+    let d = `M ${xs} ${y0} V ${y1 - NODE_R}`;
+    if (xs > xt) d = `M ${xs} ${y0} V ${y1 - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 1 ${xs - CURVE_R} ${y1} H ${xt + NODE_R}`;
+    else if (xs < xt) d = `M ${xs} ${y0} V ${y1 - CURVE_R} A ${CURVE_R} ${CURVE_R} 0 0 0 ${xs + CURVE_R} ${y1} H ${xt - NODE_R}`;
+    paths.push({ key: `merge:${merge.from}:${merge.toRow}`, d, color: GREY });
+  }
+  const circles = [];
+  rows.forEach((row, index) => {
+    if (row.kind !== 'node') return;
+    circles.push({ key: row.key, cx: laneX(row.col), cy: rowY(index), r: NODE_R, color: colour(row.blue), filled: row.open === true });
+  });
+  return { width, height, circles, paths };
 }
 
 // subagent.list rows are untrusted: keep only well-typed fields.
@@ -391,44 +657,71 @@ export function routeFor(owner) {
 
 // openSession options for the owner (sdk/index.ts:836-850, 922-934): an explicit route dials the
 // registry path, so a local owner passes only its profile, as the SDK's own local bot open does.
-export function openOptions(owner) {
+export function openOptions(owner, intent = 'tab') {
   const route = routeFor(owner);
-  if (route && route.mode === 'remote') return { intent: 'tab', route };
+  if (route && route.mode === 'remote') return { intent, route };
   const profile = str(owner?.profile);
-  return profile ? { intent: 'tab', profile } : { intent: 'tab' };
+  return profile ? { intent, profile } : { intent };
 }
 
 const profileKey = (v) => str(v) || 'default'; // store/profile.ts normalizeProfileKey
 
-// ── Lane graph (decorative SVG, drawn by hand) ──────────────────────────────────────────────
+// The model id without its provider path: `anthropic/claude-x` reads `claude-x`.
+const modelName = (model) => str(model).split('/').pop();
 
-const LANE_W = 12;
-const GRAPH_PAD = 8;
-const MAX_LANES = 8;
-const NODE_Y = 12; // centre of the first text line of a row
-const LANE_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899'];
-const MERGED_GREY = '#9ca3af';
-const laneX = (lane) => GRAPH_PAD + Math.min(lane, MAX_LANES - 1) * LANE_W;
-const laneColor = (lane) => LANE_COLORS[lane % LANE_COLORS.length];
+// Runs fn over items, at most `limit` at a time. fn must not throw.
+async function eachLimited(items, limit, fn) {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const item = items[next];
+      next += 1;
+      await fn(item);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
 
 // Inline styles, not host classes: the plugin cannot rely on the host's CSS having them.
-const BADGE_BASE = { ...SELECTABLE, borderRadius: 4, padding: '0 4px', fontSize: 10, lineHeight: '14px', fontWeight: 600 };
-const SIDE_BADGE = { ...BADGE_BASE, border: '1px solid #f59e0b', background: 'rgba(245,158,11,0.18)' };
-const MERGED_BADGE = { ...BADGE_BASE, border: `1px solid ${MERGED_GREY}`, background: 'rgba(128,128,128,0.25)' };
-const FORK_LABEL = { ...SELECTABLE, border: '1px dashed currentColor', borderRadius: 4, padding: '0 4px', fontSize: 10, lineHeight: '14px', opacity: 0.75 };
-const PLAIN_BUTTON = { ...SELECTABLE, background: 'none', border: 0, padding: 0, color: 'inherit', font: 'inherit', cursor: 'pointer' };
-const TICK_COLORS = { focused: '#3b82f6', side: '#f59e0b', merged: MERGED_GREY, other: 'rgba(128,128,128,0.45)' };
+const ROW_STYLE = {
+  ...SELECTABLE,
+  height: ROW_H,
+  boxSizing: 'border-box',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 4,
+  paddingRight: 4,
+  overflow: 'hidden',
+  whiteSpace: 'nowrap',
+  cursor: 'pointer',
+};
+const OPEN_ROW = { background: 'rgba(59,130,246,0.14)', boxShadow: `inset 2px 0 0 ${BLUE}` };
+const LABEL_STYLE = { ...SELECTABLE, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+const PILL = {
+  ...SELECTABLE,
+  flex: '0 0 auto',
+  maxWidth: 84,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+  border: `1px solid ${GREY}`,
+  borderRadius: 4,
+  padding: '0 4px',
+  fontSize: 10,
+  lineHeight: '14px',
+};
 
 export function createChatTree(deps) {
   const { host, jsx, jsxs, atom, useValue, Button, ScrollArea } = deps;
 
   // rows: last good session rows. agents: last good subagents, for agentsFor (a runtime id).
-  const $data = atom({ rows: [], agents: [], agentsFor: null });
+  // exchanges: { [chat id]: exchanges } for the chats of the focused tree.
+  const $data = atom({ rows: [], agents: [], agentsFor: null, exchanges: {} });
   // note: why live subagents are not shown (not an error).
   const $status = atom({ loading: false, error: null, note: null });
-  // In memory only, never stored: view ('outline' | 'graph'); open: { [chat id]: boolean } explicit
-  // expand/collapse choices; merge: { [side chat id]: { busy, notice, fit, sideTokens, available } }.
-  const freshUi = () => ({ view: 'outline', open: {}, merge: {} });
+  // In memory only, never stored: open: { chatId, index } the clicked node; expanded: { [run key]:
+  // true } the +N runs the user opened; merge: { [side chat id]: { busy, notice, fit, sideTokens, available } }.
+  const freshUi = () => ({ open: null, expanded: {}, merge: {} });
   const $ui = atom(freshUi());
   // Stand-in so the pane calls useValue the same number of times when host.state lacks an atom.
   const $none = atom(null);
@@ -442,6 +735,8 @@ export function createChatTree(deps) {
   let cancelTimer = null;
   let lastKey = null;
   let scopedTimeout = null;
+  // chat id -> { key, exchanges }: a history is read again only when historyKey(row) moves.
+  let historyCache = new Map();
   const unsubscribers = [];
 
   const atomOf = (name) => host?.state?.[name] ?? $none;
@@ -476,6 +771,35 @@ export function createChatTree(deps) {
     }
   }
 
+  // Exchanges of every chat in the focused tree. A cached history is used while its chat's
+  // message count and last activity hold; a failed read keeps the last good one.
+  async function loadExchanges(rows, focusedId) {
+    const chats = lineageChats(buildTree(rows, focusedId));
+    const exchanges = {};
+    const errors = [];
+    const stale = [];
+    for (const { row } of chats) {
+      const key = historyKey(row);
+      const hit = historyCache.get(row.id);
+      if (hit && key !== null && hit.key === key) exchanges[row.id] = hit.exchanges;
+      else stale.push(row);
+    }
+    await eachLimited(stale, HISTORY_CONCURRENCY, async (row) => {
+      try {
+        const list = exchangesFromRows(await readRows(row.id));
+        historyCache.delete(row.id);
+        historyCache.set(row.id, { key: historyKey(row), exchanges: list });
+        exchanges[row.id] = list;
+      } catch (error) {
+        const old = historyCache.get(row.id);
+        if (old) exchanges[row.id] = old.exchanges;
+        errors.push(`History of ${str(row.title) || 'Untitled'}: ${errorText(error)}`);
+      }
+    });
+    while (historyCache.size > HISTORY_CACHE_MAX) historyCache.delete(historyCache.keys().next().value);
+    return { exchanges, errors };
+  }
+
   async function loadOnce(mine) {
     const stored = atomOf('focusedStoredSessionId').get();
     const runtime = runtimeId();
@@ -507,11 +831,18 @@ export function createChatTree(deps) {
       next.agents = live.value;
       next.agentsFor = runtime;
     } else errors.push(`Subagents: ${errorText(live.reason)}`);
+    // Histories only from the active backend: host.request cannot reach another owner.
+    if (agentsOk) {
+      const histories = await loadExchanges(next.rows, stored ?? runtime);
+      if (disposed || mine !== generation) return;
+      next.exchanges = histories.exchanges;
+      errors.push(...histories.errors);
+    }
     $data.set(next);
     $status.set({
       loading: false,
       error: errors.length ? errors.join('\n') : null,
-      note: agentsOk ? null : 'Subagents unavailable for this chat.',
+      note: agentsOk ? null : 'Messages and subagents are unavailable for a chat of another profile or connection.',
     });
   }
 
@@ -546,15 +877,16 @@ export function createChatTree(deps) {
     reload();
   }
 
-  function openChat(id) {
+  // Opens a chat for the focused chat's owner: in place for a tree node, in a tab for a subagent.
+  function openChat(id, intent = 'tab') {
     if (!id || typeof host?.openSession !== 'function') return;
-    const options = openOptions(atomOf('focusedSessionOwner').get());
+    const options = openOptions(atomOf('focusedSessionOwner').get(), intent);
     Promise.resolve()
       .then(() => host.openSession(id, options))
       .then(null, () => {});
   }
 
-  // A drag that selects text also fires click; do not open a tab then.
+  // A drag that selects text also fires click; do not open a chat then.
   const selecting = () => {
     try {
       return Boolean(str(globalThis.getSelection?.()?.toString?.()));
@@ -572,12 +904,20 @@ export function createChatTree(deps) {
   // ── UI state (all in $ui; render only reads it) ───────────────────────────────────────────
 
   const setUi = (patch) => $ui.set({ ...$ui.get(), ...patch });
-  const setView = (view) => setUi({ view });
-  const setOpen = (id, open) => setUi({ open: { ...$ui.get().open, [id]: open } });
   const setMerge = (id, state) => setUi({ merge: { ...$ui.get().merge, [id]: state } });
 
-  // Expanded unless the user chose otherwise. A merged side branch starts collapsed.
-  const isOpen = (ui, row) => (typeof ui.open[row.id] === 'boolean' ? ui.open[row.id] : !(isSideChat(row) && isMergedChat(row)));
+  // A click on a node makes it the open node and opens its chat in place.
+  function selectNode(chatId, index) {
+    setUi({ open: { chatId, index } });
+    openChat(chatId, 'in-place');
+  }
+  const expandRun = (runKey) => setUi({ expanded: { ...$ui.get().expanded, [runKey]: true } });
+  // Enter or Space on a focused row acts like a click.
+  const onKey = (fn) => (event) => {
+    if (event?.key !== 'Enter' && event?.key !== ' ') return;
+    event.preventDefault?.();
+    fn();
+  };
 
   // ── Merge as-is: stage a side chat verbatim in its parent's composer. Never sends. ───────────
 
@@ -713,109 +1053,118 @@ export function createChatTree(deps) {
       const fit = headroom ? 'yes' : 'unknown';
       const base = { fit, sideTokens, available: headroom?.available };
       if (!ok) return show({ ...base, notice: MERGE_HIDDEN_TEXT });
-      // Staged: the row turns into a grey merged row, and a branch with children folds away.
-      rememberMergedBranch(sideId);
-      if (!alive()) return;
-      const ui = $ui.get();
-      const open = { ...ui.open };
-      delete open[sideId];
-      $ui.set({
-        ...ui,
-        open,
-        merge: { ...ui.merge, [sideId]: { ...base, notice: headroom ? MERGE_STAGED_TEXT : formatMissingWindowNotice(sideTokens) } },
-      });
+      // Staged. Once the user sends it, the parent's next history read shows the merge node.
+      show({ ...base, notice: headroom ? MERGE_STAGED_TEXT : formatMissingWindowNotice(sideTokens) });
     } catch (error) {
       show({ notice: `Merge failed: ${errorText(error)}` });
     }
   }
 
-  // ── Rows ──────────────────────────────────────────────────────────────────────────────────
+  // ── Graph rows ─────────────────────────────────────────────────────────────────────────────
 
-  function disclosure(row, open) {
-    const label = str(row.title) || 'Untitled';
-    const set = (value) => setOpen(row.id, value);
-    return jsx('button', {
-      key: 'disclosure',
-      type: 'button',
-      'aria-expanded': open,
-      'aria-label': `${open ? 'Collapse' : 'Expand'} branches of ${label}`,
-      'data-disclosure': 'true',
-      style: { ...PLAIN_BUTTON, width: DISCLOSURE_PX, lineHeight: 1 },
-      onClick: (event) => {
-        stop(event);
-        set(!isOpen($ui.get(), row));
-      },
-      onKeyDown: (event) => {
-        if (event?.key === 'ArrowLeft') {
-          stop(event);
-          event.preventDefault?.();
-          set(false);
-        } else if (event?.key === 'ArrowRight') {
-          stop(event);
-          event.preventDefault?.();
-          set(true);
-        }
-      },
-      children: open ? '▾' : '▸',
-    });
+  // `title · model`, and `side chat of X` for a side chat. A native tooltip: rows never grow.
+  function tooltip(lane, lanesById) {
+    const head = [lane.title, lane.model].filter(Boolean).join(' · ');
+    if (!lane.side) return head;
+    const parent = lane.parentId ? lanesById.get(lane.parentId) : null;
+    return `${head}\nside chat of ${parent ? parent.title : 'a chat that is not loaded'}`;
   }
 
-  // Outline rows indent by depth. Graph rows let the lanes show depth, and move their vertical
-  // padding inside the body so the graph cell fills the whole row and the lane lines join.
-  const rowPad = (item, graph) =>
-    graph ? { paddingLeft: '4px', paddingTop: 0, paddingBottom: 0 } : { paddingLeft: `${4 + item.depth * INDENT_PX}px` };
-  const bodyPad = (graph) => (graph ? { padding: '2px 0' } : {});
+  function nodeLine(row, lane, lanesById, indent) {
+    const children = [
+      jsx(
+        'span',
+        { style: { ...LABEL_STYLE, ...(row.blue ? {} : { opacity: 0.72 }), ...(row.open ? { fontWeight: 600 } : {}) }, children: row.label },
+        'label',
+      ),
+    ];
+    if (row.first && lane.model) children.push(jsx('span', { style: PILL, 'data-pill': 'model', children: modelName(lane.model) }, 'model'));
+    if (row.first && lane.side) children.push(jsx('span', { style: PILL, 'data-pill': 'side', children: 'side' }, 'side'));
+    const select = () => selectNode(row.lane, row.index);
+    return jsxs(
+      'div',
+      {
+        role: 'button',
+        tabIndex: 0,
+        title: tooltip(lane, lanesById),
+        className: row.open ? '' : 'hover:bg-muted',
+        style: { ...ROW_STYLE, paddingLeft: indent, ...(row.open ? OPEN_ROW : {}) },
+        'data-selectable-text': 'true',
+        'data-node': row.key,
+        'data-chat-id': row.lane,
+        'data-exchange': row.index,
+        ...(row.blue ? { 'data-blue': 'true' } : {}),
+        ...(row.open ? { 'data-open': 'true', 'aria-current': 'true' } : {}),
+        ...(row.merge !== null ? { 'data-merge-node': row.mergeFrom ?? '' } : {}),
+        onClick: () => {
+          if (!selecting()) select();
+        },
+        onKeyDown: onKey(select),
+        children,
+      },
+      row.key,
+    );
+  }
 
-  // One cell of the lane graph, drawn at the left of its row. Lines run to the bottom of the row
-  // (y2 = 100%), so tall rows (notices) keep the lanes joined. No hit area: it is decoration.
-  function graphCell(item, guide, lanes, flags) {
-    const { depth } = item;
-    const width = GRAPH_PAD * 2 + Math.min(lanes, MAX_LANES) * LANE_W;
-    const outer = flags.merged ? 6.5 : 4.5; // outer radius: lines stop at the ring, not at its centre
-    const shapes = [];
-    guide.continues.forEach((on, lane) => {
-      if (on) shapes.push(jsx('line', { key: `lane${lane}`, x1: laneX(lane), y1: 0, x2: laneX(lane), y2: '100%', stroke: laneColor(lane), strokeWidth: 1.5 }));
-    });
-    if (depth > 0) {
-      // The fork: a curve from the parent's lane into the left edge of this node.
-      const from = laneX(depth - 1);
-      const to = laneX(depth);
-      const stroke = laneColor(depth);
-      shapes.push(
-        to === from
-          ? jsx('line', { key: 'fork', x1: from, y1: 0, x2: from, y2: NODE_Y - outer, stroke, strokeWidth: 1.5 })
-          : jsx('path', {
-              key: 'fork',
-              d: `M ${from} 0 C ${from} ${NODE_Y * 0.8}, ${from + 2} ${NODE_Y}, ${to - outer} ${NODE_Y}`,
-              fill: 'none',
-              stroke,
-              strokeWidth: 1.5,
-            }),
-      );
-    }
-    if (guide.hasKids) {
-      shapes.push(jsx('line', { key: 'own', x1: laneX(depth), y1: NODE_Y + outer, x2: laneX(depth), y2: '100%', stroke: laneColor(depth), strokeWidth: 1.5 }));
-    }
-    const x = laneX(depth);
-    const color = flags.merged ? MERGED_GREY : laneColor(depth);
-    const dash = flags.merged ? undefined : flags.side || flags.agent ? '3 2' : undefined;
-    const strokeWidth = flags.focused ? 3 : 1.5;
-    // Hollow nodes; a merged node gets a double ring.
-    if (flags.merged) shapes.push(jsx('circle', { key: 'ring', cx: x, cy: NODE_Y, r: outer, fill: 'none', stroke: color, strokeWidth: 1.5 }));
-    shapes.push(jsx('circle', { key: 'node', cx: x, cy: NODE_Y, r: flags.merged ? 3.5 : outer, fill: 'none', stroke: color, strokeWidth, strokeDasharray: dash }));
-    return jsx('div', {
-      key: 'graph',
-      'aria-hidden': 'true',
-      style: { position: 'relative', flexShrink: 0, alignSelf: 'stretch', width },
-      children: jsxs('svg', {
-        'aria-hidden': 'true',
-        'data-graph': 'true',
-        width,
-        height: '100%',
-        style: { position: 'absolute', top: 0, left: 0, overflow: 'visible' },
-        children: shapes,
-      }),
-    });
+  function moreLine(row, indent) {
+    const expand = () => expandRun(row.runKey);
+    return jsx(
+      'div',
+      {
+        role: 'button',
+        tabIndex: 0,
+        'aria-expanded': false,
+        title: `Show ${row.count} more exchanges`,
+        className: 'hover:bg-muted',
+        style: { ...ROW_STYLE, paddingLeft: indent },
+        'data-selectable-text': 'true',
+        'data-more': row.runKey,
+        'data-count': row.count,
+        onClick: expand,
+        onKeyDown: onKey(expand),
+        children: jsx('span', { style: { ...LABEL_STYLE, opacity: 0.72 }, children: `+${row.count}` }),
+      },
+      row.key,
+    );
+  }
+
+  // The rows, with one decorative SVG over them. The SVG takes no clicks; the graph column is
+  // the rows' left padding, so no line runs over text.
+  function graphView(plan, lanes) {
+    const geo = graphGeometry(plan);
+    const lanesById = new Map(lanes.map((lane) => [lane.id, lane]));
+    const indent = geo.width + 2;
+    const shapes = [
+      ...geo.paths.map((p) =>
+        jsx('path', { d: p.d, fill: 'none', stroke: p.color, strokeWidth: p.color === BLUE ? 2 : 1.5, strokeLinecap: 'round' }, p.key),
+      ),
+      ...geo.circles.map((c) => jsx('circle', { cx: c.cx, cy: c.cy, r: c.r, fill: c.filled ? c.color : 'none', stroke: c.color, strokeWidth: 1.5 }, `c:${c.key}`)),
+    ];
+    return jsxs(
+      'div',
+      {
+        style: { ...SELECTABLE, position: 'relative', minWidth: 0 },
+        'data-selectable-text': 'true',
+        'data-tree-graph': 'true',
+        children: [
+          ...plan.rows.map((row) => (row.kind === 'more' ? moreLine(row, indent) : nodeLine(row, lanesById.get(row.lane), lanesById, indent))),
+          jsxs(
+            'svg',
+            {
+              'aria-hidden': 'true',
+              'data-graph': 'true',
+              width: geo.width,
+              height: geo.height,
+              viewBox: `0 0 ${geo.width} ${geo.height}`,
+              style: { position: 'absolute', top: 0, left: 0, pointerEvents: 'none', overflow: 'visible' },
+              children: shapes,
+            },
+            'svg',
+          ),
+        ],
+      },
+      'graph',
+    );
   }
 
   function mergeResult(state) {
@@ -838,7 +1187,7 @@ export function createChatTree(deps) {
     });
   }
 
-  // Merge controls of a side-chat row. A click here must not open the chat behind it.
+  // Merge controls of a side chat. A click here must not open the chat behind it.
   function mergeControls(row, state) {
     const busy = state?.busy === true;
     return jsxs('div', {
@@ -877,175 +1226,57 @@ export function createChatTree(deps) {
     });
   }
 
-  function chatLine(item, view, guide, lanes, ui, hiddenAgents) {
-    const { row } = item;
-    const side = isSideChat(row);
-    const merged = isMergedChat(row);
-    const graph = view === 'graph';
-    const parts = [str(row.model), `${num(row.message_count)} msgs`, timeText(row.last_active)].filter(Boolean);
-    const forks = item.childCount;
-    const titleLine = [
-      forks > 0
-        ? disclosure(row, !item.collapsed)
-        : jsx('span', { key: 'spacer', 'aria-hidden': 'true', style: { ...SELECTABLE, display: 'inline-block', width: DISCLOSURE_PX } }),
-      jsxs('span', {
-        key: 'title',
-        className: `text-sm${item.focused ? ' font-semibold' : ''}`,
-        style: SELECTABLE,
-        children: [item.focused ? '● ' : '', str(row.title) || 'Untitled'].filter(Boolean),
-      }),
-      side ? jsx('span', { key: 'side', className: 'text-xs', style: SIDE_BADGE, 'data-kind': 'side', children: '[side]' }) : null,
-      merged ? jsx('span', { key: 'merged', className: 'text-xs', style: MERGED_BADGE, 'data-kind': 'merged', children: '[merged]' }) : null,
-      forks > 0
-        ? jsx('span', { key: 'forks', className: 'text-xs', style: FORK_LABEL, 'data-fork-count': forks, children: `${forks} fork${forks === 1 ? '' : 's'}` })
-        : null,
-      hiddenAgents > 0
-        ? jsx('span', { key: 'live', className: 'text-xs opacity-70', style: SELECTABLE, 'data-live-count': hiddenAgents, children: `${hiddenAgents} live` })
-        : null,
-    ].filter(Boolean);
-    return jsxs('div', {
-      key: `chat:${row.id}`,
-      role: 'button',
-      className: `flex gap-1 rounded px-1 py-0.5 cursor-pointer hover:bg-muted${item.focused ? ' bg-muted' : ''}`,
-      style: { ...SELECTABLE, ...rowPad(item, graph), ...(merged ? { opacity: 0.6 } : {}) },
-      'data-selectable-text': 'true',
-      'data-session-id': row.id,
-      ...(side ? { 'data-side': 'true' } : {}),
-      ...(merged ? { 'data-merged': 'true' } : {}),
-      onClick: onClickOpen(row.id),
-      children: [
-        graph ? graphCell(item, guide, lanes, { merged, side, focused: item.focused }) : null,
-        jsxs('div', {
-          key: 'body',
-          className: 'flex min-w-0 flex-1 flex-col',
-          style: { ...SELECTABLE, ...bodyPad(graph) },
-          children: [
-            jsx('div', { className: 'flex flex-wrap items-baseline gap-x-1', style: SELECTABLE, children: titleLine }),
-            jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: parts.join(' · ') }),
-            side ? mergeControls(row, ui.merge[row.id]) : null,
-          ].filter(Boolean),
-        }),
-      ].filter(Boolean),
-    });
+  // One entry per side chat of the tree, below the graph, so a notice never moves the rows.
+  function sideEntries(lanes, ui) {
+    const sides = lanes.filter((lane) => lane.side);
+    if (!sides.length) return null;
+    return jsxs(
+      'div',
+      {
+        className: 'flex flex-col gap-2',
+        style: { ...SELECTABLE, marginTop: 8 },
+        'data-selectable-text': 'true',
+        'data-side-chats': 'true',
+        children: sides.map((lane) =>
+          jsxs(
+            'div',
+            {
+              className: 'flex flex-col',
+              style: SELECTABLE,
+              'data-selectable-text': 'true',
+              'data-side-entry': lane.id,
+              children: [
+                jsx('span', { className: 'text-xs', title: lane.title, style: { ...LABEL_STYLE, opacity: 0.85 }, children: lane.title }),
+                mergeControls(lane.row, ui.merge[lane.id]),
+              ],
+            },
+            `side:${lane.id}`,
+          ),
+        ),
+      },
+      'sides',
+    );
   }
 
-  function agentLine(item, view, guide, lanes) {
-    const { agent } = item;
-    const graph = view === 'graph';
+  function agentLine(agent) {
     const parts = [agent.status, agent.model].filter(Boolean);
     const id = agent.child_session_id;
-    return jsxs('div', {
-      key: `agent:${agent.subagent_id}`,
-      className: `flex gap-1 rounded px-1 py-0.5${id ? ' cursor-pointer hover:bg-muted' : ''}`,
-      style: { ...SELECTABLE, ...rowPad(item, graph) },
-      'data-selectable-text': 'true',
-      'data-subagent-id': agent.subagent_id,
-      ...(id ? { role: 'button', onClick: onClickOpen(id) } : {}),
-      children: [
-        graph ? graphCell(item, guide, lanes, { agent: true }) : null,
-        jsxs('div', {
-          key: 'body',
-          className: 'flex min-w-0 flex-1 flex-col',
-          style: { ...SELECTABLE, ...bodyPad(graph) },
-          children: [
-            jsx('span', { className: 'text-sm', style: SELECTABLE, children: `↳ subagent: ${agent.goal ?? '(no goal)'}` }),
-            jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: parts.join(' · ') }),
-          ],
-        }),
-      ].filter(Boolean),
-    });
+    return jsxs(
+      'div',
+      {
+        className: `flex min-w-0 flex-col rounded px-1 py-0.5${id ? ' cursor-pointer hover:bg-muted' : ''}`,
+        style: SELECTABLE,
+        'data-selectable-text': 'true',
+        'data-subagent-id': agent.subagent_id,
+        ...(id ? { role: 'button', onClick: onClickOpen(id) } : {}),
+        children: [
+          jsx('span', { className: 'text-sm', style: { ...LABEL_STYLE, flex: 'none' }, children: `↳ subagent: ${agent.goal ?? '(no goal)'}` }),
+          jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: parts.join(' · ') }),
+        ],
+      },
+      `agent:${agent.subagent_id}`,
+    );
   }
-
-  // root · … · focused. Each crumb opens its chat the way a row click does.
-  function breadcrumb(tree) {
-    const path = pathToFocused(tree);
-    if (!path.length) return null;
-    const children = [];
-    path.forEach((row, index) => {
-      if (index > 0) children.push(jsx('span', { key: `sep${index}`, style: SELECTABLE, children: ' · ' }));
-      const title = str(row.title) || 'Untitled';
-      children.push(
-        jsx(Button, {
-          key: `crumb:${row.id}`,
-          type: 'button',
-          'data-crumb': row.id,
-          title,
-          ...(row === tree.focused ? { 'aria-current': 'page' } : {}),
-          style: {
-            ...PLAIN_BUTTON,
-            height: 'auto',
-            minHeight: 0,
-            boxShadow: 'none',
-            maxWidth: 140,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-            textDecoration: 'underline',
-            fontWeight: row === tree.focused ? 600 : 400,
-          },
-          onClick: onClickOpen(row.id),
-          children: title,
-        }),
-      );
-    });
-    return jsxs('nav', {
-      key: 'breadcrumb',
-      'aria-label': 'Chat path',
-      className: 'flex flex-wrap items-center text-xs',
-      style: SELECTABLE,
-      'data-selectable-text': 'true',
-      'data-breadcrumb': 'true',
-      children,
-    });
-  }
-
-  // Scrolls a row of this pane into view. Looks only inside this pane's own root.
-  function scrollToRow(event, id) {
-    try {
-      const root = event?.currentTarget?.closest?.('[data-chat-tree-root="true"]');
-      const target = root?.querySelector?.(`[data-session-id="${String(id).replace(/["\\]/g, '\\$&')}"]`);
-      target?.scrollIntoView?.({ block: 'nearest' });
-    } catch {
-      // Scrolling is a convenience.
-    }
-  }
-
-  // One tick per chat row, for long trees.
-  function minimap(items) {
-    const ticks = items
-      .filter((item) => item.kind === 'chat')
-      .map((item) => {
-        const kind = item.focused ? 'focused' : isMergedChat(item.row) ? 'merged' : isSideChat(item.row) ? 'side' : 'other';
-        return jsx('div', {
-          key: `tick:${item.row.id}`,
-          'data-tick': kind,
-          title: str(item.row.title) || 'Untitled',
-          style: { flex: '1 1 0', minHeight: 1, maxHeight: 6, background: TICK_COLORS[kind], cursor: 'pointer' },
-          onClick: (event) => {
-            stop(event);
-            scrollToRow(event, item.row.id);
-          },
-        });
-      });
-    return jsxs('div', {
-      key: 'minimap',
-      'aria-hidden': 'true',
-      'data-minimap': 'true',
-      style: { display: 'flex', flexDirection: 'column', gap: 1, flexShrink: 0, width: 8, height: '60vh', position: 'sticky', top: 0, alignSelf: 'flex-start' },
-      children: ticks,
-    });
-  }
-
-  const viewToggle = (view, current, label) =>
-    jsx(Button, {
-      key: view,
-      type: 'button',
-      'data-view-toggle': view,
-      'aria-pressed': current === view,
-      style: current === view ? { fontWeight: 600, textDecoration: 'underline' } : { opacity: 0.7 },
-      onClick: () => setView(view),
-      children: label,
-    });
 
   // Hook order is fixed: six useValue calls, every render, before any branch (React error 300).
   // The sixth is the in-memory UI atom. Render only reads state; loading happens on focus change
@@ -1060,11 +1291,10 @@ export function createChatTree(deps) {
 
     const runtime = focused ?? active ?? null;
     const tree = buildTree(data.rows, stored ?? runtime);
+    const chats = lineageChats(tree);
+    const lanes = buildLanes(chats, data.exchanges);
+    const plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded });
     const agents = runtime && data.agentsFor === runtime ? data.agents : [];
-    const items = flattenTree(tree, agents, (row) => !isOpen(ui, row));
-    const view = ui.view === 'graph' ? 'graph' : 'outline';
-    const guides = view === 'graph' ? graphGuides(items) : [];
-    const lanes = view === 'graph' ? Math.max(1, ...items.map((item) => item.depth + 1)) : 0;
 
     let notice = null;
     if (!stored && !runtime) notice = 'Open a chat to see its tree.';
@@ -1076,21 +1306,11 @@ export function createChatTree(deps) {
           : 'This chat is not in the session list yet.';
     } else if (tree?.partial) {
       notice = `Partial tree: the parent of the top chat is not loaded (older than the newest ${LIST_LIMIT} chats, archived, or hidden).`;
+    } else if (tree && !plan.rows.length && !status.loading) {
+      notice = 'No messages in this chat tree yet.';
     }
-
-    const list = items.length
-      ? jsx('div', {
-          key: 'list',
-          className: `flex flex-col${view === 'graph' ? '' : ' gap-1'}`,
-          style: { flex: '1 1 auto', minWidth: 0 },
-          'data-tree-list': 'true',
-          children: items.map((item, index) =>
-            item.kind === 'chat'
-              ? chatLine(item, view, guides[index], lanes, ui, item.focused && item.collapsed ? agents.length : 0)
-              : agentLine(item, view, guides[index], lanes),
-          ),
-        })
-      : null;
+    const total = lineageChats(tree, Infinity).length;
+    const capped = total > chats.length ? `Showing ${chats.length} of ${total} chats in this tree.` : null;
 
     return jsx(ScrollArea, {
       children: jsxs('div', {
@@ -1103,12 +1323,6 @@ export function createChatTree(deps) {
             className: 'flex flex-wrap items-center gap-2',
             children: [
               jsx(Button, { type: 'button', disabled: disposed, onClick: reload, children: 'Refresh' }),
-              jsxs('div', {
-                role: 'group',
-                'aria-label': 'View',
-                className: 'flex items-center gap-1',
-                children: [viewToggle('outline', view, 'Outline'), viewToggle('graph', view, 'Graph')],
-              }),
               status.loading ? jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: 'Loading...' }) : null,
             ].filter(Boolean),
           }),
@@ -1120,11 +1334,13 @@ export function createChatTree(deps) {
               })
             : null,
           notice ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: notice }) : null,
+          capped ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: capped }) : null,
           status.note ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: status.note }) : null,
-          tree ? breadcrumb(tree) : null,
-          list && items.length >= MINIMAP_MIN
-            ? jsxs('div', { key: 'body', className: 'flex items-start gap-2', children: [list, minimap(items)] })
-            : list,
+          plan.rows.length ? graphView(plan, lanes) : null,
+          agents.length
+            ? jsx('div', { className: 'flex flex-col', style: { ...SELECTABLE, marginTop: 4 }, 'data-subagents': 'true', children: agents.map(agentLine) }, 'agents')
+            : null,
+          sideEntries(lanes, ui),
         ].filter(Boolean),
       }),
     });
@@ -1154,6 +1370,7 @@ export function createChatTree(deps) {
     inFlight = 0;
     lastKey = null;
     scopedTimeout = null;
+    historyCache = new Map();
     $status.set({ loading: false, error: null, note: null });
     $ui.set(freshUi());
     // ctx.setTimeout: the host clears it on unload (apps/desktop/src/contrib/plugin.ts).
