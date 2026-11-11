@@ -128,7 +128,7 @@ The merge changes one decision. The tree pane shows branch sessions and delegate
 
 4. Add the judge on `post_llm_call`. Store marks in `ctx.state`, keyed by session id and row id.
 
-5. Ask upstream for a public "reveal message" SDK verb. Send it with the LSP `request()` API in one batch.
+5. Do not ask upstream (decision `D-no-upstream`). Concept links open the node in the tree. A scroll to a message waits for an in-framework way.
 
 ## Risks `chat_tree.risks`
 
