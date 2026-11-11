@@ -286,7 +286,7 @@ const PICKER = {
 };
 
 // events: false gives a ctx with no onEvent (an older host).
-function setup({ host = fakeHost(), clock = fakeClock(), useValue, storage = fakeStorage(), events = true, document, picker = true } = {}) {
+function setup({ host = fakeHost(), clock = fakeClock(), useValue, storage = fakeStorage(), events = true, document, picker = true, deps = {} } = {}) {
   const registered = [];
   const disposers = [];
   // ctx.onEvent as the desktop gives it: listeners by type, a disposer back.
@@ -308,6 +308,7 @@ function setup({ host = fakeHost(), clock = fakeClock(), useValue, storage = fak
     ScrollArea: 'ScrollArea',
     ...(picker ? PICKER : {}),
     ...(document ? { document } : {}),
+    ...deps,
   });
   tree.register({
     register: (c) => registered.push(c),
@@ -1142,7 +1143,7 @@ test('the pane loads again on focus change, every 15 s, and on Refresh', async (
   assert.equal(listCalls(ctx.host), 3);
   await ctx.clock.tick(REFRESH_MS * 2);
   assert.equal(listCalls(ctx.host), 5);
-  findAll(ctx.pane.render(), (n) => n.type === 'Button' && n.props.children === 'Refresh')[0].props.onClick();
+  byAttr(ctx.pane.render(), 'data-refresh')[0].props.onClick(fakeEvent());
   await flush();
   assert.equal(listCalls(ctx.host), 6);
   // The same tree: only the open chat (b1 since the focus change) was read again, once per load.
@@ -1341,7 +1342,7 @@ test('register after dispose (disable, then enable) works again with fresh UI st
   const disposers = [];
   ctx.tree.register({ register: () => {}, setTimeout: clock.setTimeout, onDispose: (fn) => disposers.push(fn) });
   await flush();
-  assert.deepEqual(ctx.tree.$ui.get(), { open: null, expanded: {}, merge: {}, held: null, target: null, branch: null, forkNotice: null });
+  assert.deepEqual(ctx.tree.$ui.get(), { open: null, expanded: {}, pick: null, result: null, branch: null, forkNotice: null });
   assert.deepEqual(nodeKeys(ctx.pane.render()), ['root:0', 'root:9']);
   const before = listCalls(host);
   host.state.focusedStoredSessionId.set('root2');
@@ -1560,44 +1561,107 @@ async function mergeCtx({ rows = MERGE_ROWS, stored = 'sd', runtime = 'rt-sd', p
   ctx.mark = host.calls.length;
   return ctx;
 }
-const section = (ctx) => byAttr(ctx.pane.render(), 'data-merge-section')[0];
-const mergeButton = (ctx, kind = 'asis') => byAttr(section(ctx), 'data-merge', kind)[0];
-const targetSelect = (ctx) => byAttr(section(ctx), 'data-merge-target-select')[0];
-const pickTarget = (ctx, id) => targetSelect(ctx).props.onChange({ target: { value: id } });
+// The Merge into icon on a row of the open chat's lane: hovers the lane's first row when no row shows it.
+function mergeIcon(ctx) {
+  const tree = ctx.pane.render();
+  const shown = byAttr(tree, 'data-merge-here')[0];
+  if (shown) return shown;
+  const slot = byAttr(tree, 'data-merge-slot')[0];
+  if (!slot) return null;
+  nodeOf(tree, slot.props['data-merge-slot']).props.onMouseEnter();
+  return byAttr(ctx.pane.render(), 'data-merge-here')[0];
+}
+const pickOf = (ctx) => byAttr(ctx.pane.render(), 'data-merge-pick')[0];
+// Opens the merge pick (no Popover in setup: the icon toggles the pick under the graph).
+function openPickOf(ctx, event = fakeEvent()) {
+  if (!pickOf(ctx)) mergeIcon(ctx).props.onClick(event);
+  return pickOf(ctx);
+}
+// Step 'where' picks ctx.target (else the parent); step 'how' is then measured.
+async function openHow(ctx, event) {
+  const where = openPickOf(ctx, event);
+  const items = byAttr(where, 'data-merge-target');
+  (items.find((i) => i.props['data-merge-target'] === ctx.target) ?? items[0]).props.onClick(fakeEvent());
+  await flush();
+  return pickOf(ctx);
+}
+// The old Merge as-is / Digest buttons, as the popover runs them: icon, target, mode.
+const mergeButton = (ctx, kind = 'asis') => ({
+  props: {
+    onClick: async (event = fakeEvent()) => {
+      const how = await openHow(ctx, event);
+      // Step 'how' measured the As-is merge; count the merge's own reads from here.
+      if (typeof ctx.mark === 'number') ctx.mark = ctx.host.calls.length;
+      byAttr(how, 'data-merge', kind)[0].props.onClick(fakeEvent());
+      await flush();
+    },
+  },
+});
+const pickTarget = (ctx, id) => {
+  ctx.target = id;
+};
+// The result line under the row: its readout lives in its tooltip (title).
 const fitOf = (ctx) => byAttr(ctx.pane.render(), 'data-token-fit')[0];
+const fitText = (ctx) => fitOf(ctx)?.props?.title ?? '';
 // session.* calls since the merge context was ready, so the tree's own history reads do not count.
 const sessionCalls = (ctx) => ctx.host.calls.slice(ctx.mark).filter(([m]) => m.startsWith('session.'));
-const exactText = (tree, text) => findAll(tree, (n) => n.props?.children === text)[0];
+// A line whose text is `text`, or the result line whose tooltip carries it.
+const exactText = (tree, text) =>
+  findAll(tree, (n) => n.props?.children === text || (typeof n.props?.title === 'string' && n.props.title.split('\n').includes(text)))[0];
 const OPEN_HERE = { intent: 'in-place', profile: 'default' };
 
 test('the draft in the tests has 20 estimated tokens', () => {
   assert.equal(mod.estimateTokens(DRAFT), 20);
 });
 
-test('one merge section for the open chat: two buttons, ancestor chips, the parent picked', async () => {
-  const ctx = setup(); // focus b2: parent b1, then root
+test('the merge popover: step Where lists the ancestors, the parent first and preselected; step How measures As-is', async () => {
+  const host = fakeHost(); // focus b2: parent b1, then root
+  host.usage = { context_used: 1000, context_max: 128000 };
+  const ctx = setup({ host });
   await flush();
   const tree = ctx.pane.render();
-  const sections = byAttr(tree, 'data-merge-section');
-  assert.equal(sections.length, 1);
-  assert.equal(sections[0].props['data-merge-section'], 'b2');
-  assert.deepEqual(byAttr(sections[0], 'data-merge').map((b) => b.props.children), ['Merge as-is', 'Digest']);
-  assert.ok(byAttr(sections[0], 'data-merge').every((b) => b.type === 'Button' && b.props.disabled === false));
-  assert.doesNotMatch(textOf(tree), /Merge record|Digest \(later\)/);
-  // into: <parent> <grandparent>, the parent pressed.
-  const options = byAttr(sections[0], 'data-merge-target');
-  assert.deepEqual(options.map((o) => [o.props['data-merge-target'], textOf(o)]), [
-    ['b1', 'Parent · b1'],
-    ['root', 'Root · root'],
+  const flat = (n) => textOf(n).replace(/\n/g, '');
+  // No merge section below the graph any more.
+  for (const attr of ['data-merge-section', 'data-merge-target-select', 'data-merge-targets']) assert.equal(byAttr(tree, attr).length, 0, attr);
+  const icon = mergeIcon(ctx);
+  assert.equal(icon.type, 'Button');
+  assert.equal(icon.props['aria-label'], 'Merge into');
+  assert.equal(icon.props.children.props.name ?? icon.props.children.type, 'svg'); // no Codicon in setup: the drawn icon
+  const event = fakeEvent();
+  icon.props.onClick(event);
+  assert.equal(event.stopped, 1); // the row does not select its node
+  const where = pickOf(ctx);
+  assert.match(flat(byAttr(where, 'data-pick-head')[0]), /Merge "b2"1\/2 Where/);
+  const items = byAttr(where, 'data-merge-target');
+  assert.deepEqual(items.map((i) => [i.props['data-merge-target'], flat(i)]), [
+    ['b1', 'b1default'],
+    ['root', 'rootRoot'],
   ]);
-  assert.equal(byAttr(sections[0], 'data-merge-target-select')[0].props.value, 'b1');
-  assert.match(textOf(byAttr(sections[0], 'data-merge-targets')[0]), /^into:/);
-  // The old per-side-chat rows are gone.
-  assert.equal(byAttr(tree, 'data-side-entry').length, 0);
-  assert.equal(byAttr(tree, 'data-side-chats').length, 0);
-  // A chip click picks that ancestor.
-  pickTarget(ctx, 'root');
-  assert.equal(targetSelect(ctx).props.value, 'root');
+  assert.equal(items[0].props.autoFocus, true); // Enter picks the parent
+  assert.equal(items[0].props['data-default'], 'true');
+  assert.match(flat(where), /Parent.*Older ancestors/);
+  // The parent's lane lights up while the pick is open; hovering another target moves it.
+  const roles = () => Object.fromEntries(findAll(byAttr(ctx.pane.render(), 'data-graph', 'true')[0], (n) => n.type === 'circle').map((c) => [c.key, c.props['data-role']]));
+  assert.equal(roles()['c:b1:2'], 'hover');
+  items[1].props.onMouseEnter();
+  assert.equal(roles()['c:root:2'], 'hover');
+  items[0].props.onClick(fakeEvent());
+  let how = pickOf(ctx);
+  assert.match(flat(byAttr(how, 'data-pick-head')[0]), /into "b1"2\/2 How/);
+  assert.match(flat(byAttr(how, 'data-merge', 'asis')[0]), /Measuring/);
+  await flush();
+  how = pickOf(ctx);
+  const asis = byAttr(how, 'data-merge', 'asis')[0];
+  assert.match(flat(asis), /^As-is1 exchange · about \d+ tokens · fits \(127,000 free\)$/);
+  assert.equal(asis.props.autoFocus, true);
+  assert.equal(asis.props['data-fit'], 'yes');
+  assert.match(flat(byAttr(how, 'data-merge', 'digest')[0]), /^Digesta summary by the digest model$/);
+  // Back returns to step Where; a second click on the icon closes the pick and its preview.
+  byAttr(how, 'data-pick-back')[0].props.onClick(fakeEvent());
+  assert.ok(byAttr(pickOf(ctx), 'data-merge-target').length);
+  mergeIcon(ctx).props.onClick(fakeEvent());
+  assert.equal(pickOf(ctx), undefined);
+  assert.ok(!Object.values(roles()).includes('hover') || roles()['c:b1:2'] !== 'hover');
   ctx.unload();
 });
 
@@ -1617,46 +1681,19 @@ test('mergeTargets lists the ancestors parent first; selectedTarget defaults to 
   assert.equal(mod.selectedTarget([], null, 'root'), null);
 });
 
-test('the merge target lights up in the hover colour only while the dropdown is in use', async () => {
-  // planGraph still marks a target lane when asked (the option stays for callers and tests).
+test('planGraph marks a merge target lane when asked', () => {
   const { plan } = planFor(ROWS, 'b2', HIST, { target: 'root' });
   assert.deepEqual(plan.lanes.filter((l) => l.target).map((l) => l.id), ['root']);
   assert.equal(planFor(ROWS, 'b2', HIST, { target: 'nope' }).plan.rows.some((r) => r.target), false);
-
-  // The pane: no standing highlight; focus or pointer on the dropdown draws the target's path in
-  // the hover colour, a pick moves it, and leaving the dropdown clears it.
-  const ctx = setup();
-  await flush();
-  const roles = () => {
-    const svg = byAttr(ctx.pane.render(), 'data-graph', 'true')[0];
-    return Object.fromEntries(findAll(svg, (n) => n.type === 'circle').map((c) => [c.key, c.props['data-role']]));
-  };
-  const lit = () => findAll(byAttr(ctx.pane.render(), 'data-graph', 'true')[0], (n) => n.props?.['data-target'] === 'true');
-  const idle = roles();
-  assert.equal(lit().length, 0);
-  assert.ok(!Object.values(idle).includes('hover'));
-  targetSelect(ctx).props.onFocus();
-  assert.equal(roles()['c:b1:2'], 'hover'); // the parent (default target) path is in the hover colour
-  pickTarget(ctx, 'root');
-  assert.equal(targetSelect(ctx).props.value, 'root');
-  assert.equal(roles()['c:root:2'], 'hover');
-  targetSelect(ctx).props.onBlur();
-  assert.deepEqual(roles(), idle);
-  ctx.unload();
 });
 
-test('on the root chat the merge section is disabled with a one-line reason', async () => {
+test('on the root chat no row carries Merge into', async () => {
   const ctx = setup({ host: fakeHost({ stored: 'root', runtime: 'rt-root' }) });
   await flush();
   ctx.mark = ctx.host.calls.length;
-  const s = section(ctx);
-  assert.equal(s.props['data-merge-disabled'], 'true');
-  assert.equal(textOf(byAttr(s, 'data-merge-reason')[0]), mod.MERGE_ROOT_TEXT);
-  assert.equal(byAttr(s, 'data-merge-target').length, 0);
-  assert.ok(byAttr(s, 'data-merge').every((b) => b.props.disabled === true));
-  await mergeButton(ctx).props.onClick(fakeEvent());
+  const tree = ctx.pane.render();
+  assert.equal(byAttr(tree, 'data-merge-here').length + byAttr(tree, 'data-merge-slot').length, 0);
   assert.equal(sessionCalls(ctx).length, 0);
-  assert.deepEqual(ctx.host.order, []);
   ctx.unload();
 });
 
@@ -1684,8 +1721,8 @@ test('Merge as-is stages the header and the own pairs into the parent, opens it 
   const notice = exactText(tree, MERGE_STAGED_TEXT);
   assert.equal(notice.props.style.userSelect, 'text');
   assert.equal(notice.props['data-selectable-text'], 'true');
-  assert.match(textOf(fitOf(ctx)), /20/);
-  assert.match(textOf(fitOf(ctx)), /127,000/);
+  assert.match(fitText(ctx), /20/);
+  assert.match(fitText(ctx), /127,000/);
   ctx.unload();
 });
 
@@ -1788,9 +1825,9 @@ test('a digest failure shows a notice and stages nothing: an error event, -32601
     let done;
     await assert.doesNotReject(async () => {
       done = mergeButton(ctx, 'digest').props.onClick(fakeEvent());
-      await flush();
-      await ctx.clock.tick(mod.DIGEST_TIMEOUT_MS);
       await done;
+      await ctx.clock.tick(mod.DIGEST_TIMEOUT_MS);
+      await flush();
     });
     await flush();
     assert.deepEqual(ctx.host.order.filter(([k]) => k !== 'digest'), [], text);
@@ -1802,33 +1839,54 @@ test('a digest failure shows a notice and stages nothing: an error event, -32601
   }
 });
 
-test('a no-fit notice holds until Dismiss; nothing opens or stages', async () => {
+test('a mode that does not fit is greyed with its numbers and cannot be picked; nothing opens or stages', async () => {
   const ctx = await mergeCtx({ prepare: (host) => (host.usage = { context_used: 127990, context_max: 128000 }) });
-  await assert.doesNotReject(async () => mergeButton(ctx).props.onClick(fakeEvent()));
+  const how = await openHow(ctx);
+  const asis = byAttr(how, 'data-merge', 'asis')[0];
+  assert.equal(asis.props['aria-disabled'], 'true');
+  assert.equal(asis.props['data-fit'], 'no');
+  assert.match(textOf(asis), /about 20 tokens · does not fit \(10 free\)$/);
+  assert.equal(asis.props.autoFocus, undefined); // the focus goes to Digest
+  assert.equal(byAttr(how, 'data-merge', 'digest')[0].props.autoFocus, true);
+  asis.props.onClick(fakeEvent());
   await flush();
   assert.deepEqual(ctx.host.order, []);
-  const text = "Doesn't fit (Merge as-is): side chat is 20 tokens (estimated), Main has 10 available (127,990 used of 128,000).";
-  const held = () => byAttr(ctx.pane.render(), 'data-held-notice', 'merge')[0];
-  assert.equal(textOf(held()).split('\n')[0], text);
-  assert.equal(fitOf(ctx).props['data-token-fit'], 'no');
-  assert.match(textOf(fitOf(ctx)), /20/);
-  // A refresh, a focus change, and a later merge that fits all leave it.
-  await ctx.clock.tick(REFRESH_MS);
-  assert.ok(held());
-  ctx.host.state.focusedStoredSessionId.set('par');
-  ctx.host.state.focusedSessionId.set('rt-par');
-  await flush();
-  assert.ok(held());
-  ctx.host.state.focusedStoredSessionId.set('sd');
-  ctx.host.state.focusedSessionId.set('rt-sd');
-  await flush();
-  ctx.host.usage = { context_used: 1000, context_max: 128000 };
+  assert.ok(pickOf(ctx)); // the pick stays open
+  ctx.unload();
+});
+
+test('a failed merge shows in the destructive colour under its row and stays until Dismiss or the next merge', async () => {
+  const ctx = await mergeCtx({ prepare: (host) => (host.composer.setDraft = async () => false) });
   await mergeButton(ctx).props.onClick(fakeEvent());
-  assert.equal(ctx.host.drafts.length, 1);
-  assert.ok(held());
-  // Dismiss clears it.
-  byAttr(held(), 'data-dismiss', 'merge')[0].props.onClick(fakeEvent());
-  assert.equal(held(), undefined);
+  const line = () => byAttr(ctx.pane.render(), 'data-merge-result')[0];
+  assert.equal(line().props['data-merge-result'], 'error');
+  assert.match(line().props.className, /text-destructive/);
+  assert.equal(textOf(byAttr(line(), 'data-merge-notice')[0]), MERGE_HIDDEN_TEXT);
+  // Under the merged chat's row: the next row in the graph is the result line.
+  const graph = byAttr(ctx.pane.render(), 'data-tree-graph')[0];
+  const kids = graph.props.children.filter((c) => c?.props);
+  const at = kids.findIndex((c) => c.props['data-merge-result']);
+  assert.ok(at > 0);
+  assert.equal(kids[at - 1].props['data-chat-id'], 'sd');
+  assert.equal(line().props.style.height, 2 * mod.ROW_H);
+  await ctx.clock.tick(REFRESH_MS);
+  assert.ok(line());
+  byAttr(line(), 'data-result-dismiss')[0].props.onClick(fakeEvent());
+  assert.equal(line(), undefined);
+  // A staged merge: one line, an Open action, and it stays until Dismiss.
+  ctx.host.composer.setDraft = async () => true;
+  await mergeButton(ctx).props.onClick(fakeEvent());
+  assert.equal(line().props['data-merge-result'], 'ok');
+  assert.equal(textOf(byAttr(line(), 'data-merge-notice')[0]), '✓ Staged in the composer of "Main". Not sent.');
+  assert.equal(line().props.style.height, mod.ROW_H);
+  const opened = ctx.host.opened.length;
+  byAttr(line(), 'data-result-open')[0].props.onClick(fakeEvent());
+  await flush();
+  assert.equal(ctx.host.opened.length, opened + 1);
+  assert.equal(ctx.host.opened.at(-1)[0], 'par');
+  assert.equal(ctx.host.opened.at(-1)[1].intent, 'in-place');
+  await ctx.clock.tick(REFRESH_MS);
+  assert.ok(line());
   ctx.unload();
 });
 
@@ -1989,9 +2047,9 @@ test('a chat with nothing of its own, or one that cannot be read, writes nothing
 
 test('Merge as-is never opens the merged chat itself, and a double click stages once', async () => {
   const ctx = await mergeCtx();
-  const a = mergeButton(ctx).props.onClick(fakeEvent());
-  const b = mergeButton(ctx).props.onClick(fakeEvent());
-  await Promise.all([a, b]);
+  const asis = byAttr(await openHow(ctx), 'data-merge', 'asis')[0];
+  asis.props.onClick(fakeEvent());
+  asis.props.onClick(fakeEvent());
   await flush();
   assert.equal(ctx.host.drafts.length, 1);
   assert.equal(ctx.host.opened.some(([id]) => id === 'sd'), false);
@@ -2416,7 +2474,7 @@ test('exactly one model pill, on the open node, and it moves with the open node'
   ctx.unload();
 });
 
-test('selectable text covers the nodes, pills, the branch form, the merge section and every notice', async () => {
+test('selectable text covers the nodes, pills, the branch form, the merge pick and every notice', async () => {
   const ctx = await mergeCtx({ prepare: (host) => (host.usage = { context_used: 127990, context_max: 128000 }) });
   await mergeButton(ctx).props.onClick(fakeEvent());
   branchButton(ctx, 'sd:1').props.onClick(fakeEvent());
@@ -2429,7 +2487,7 @@ test('selectable text covers the nodes, pills, the branch form, the merge sectio
   );
   assert.ok(holders.length >= 8, `only ${holders.length} text nodes`);
   for (const n of holders) assert.equal(n.props.style?.userSelect, 'text', `${n.type} ${JSON.stringify(n.props.children)}`);
-  for (const key of ['data-pill', 'data-branch-form', 'data-branch-error', 'data-merge-section', 'data-merge-targets', 'data-merge-result', 'data-held-notice']) {
+  for (const key of ['data-pill', 'data-branch-form', 'data-branch-error', 'data-merge-pick', 'data-pick-item', 'data-pick-detail', 'data-pick-head']) {
     const nodes = byAttr(tree, key);
     assert.ok(nodes.length >= 1, key);
     for (const n of nodes) {
@@ -2723,5 +2781,219 @@ test('opening a subagent chat (not in the session list) keeps the last tree, rea
   assert.deepEqual(nodeKeys(tree), before);
   assert.equal(byAttr(tree, 'data-unlisted-focus').length, 1);
   assert.equal(byAttr(tree, 'data-merge-section').length, 0);
+  ctx.unload();
+});
+
+// ── Row icon actions, the merge popover, the refresh icon, a narrow pane ──────────────────────
+
+const SDK_UI = { Popover: 'Popover', PopoverTrigger: 'PopoverTrigger', PopoverContent: 'PopoverContent', Tip: 'Tip', Codicon: 'Codicon' };
+// The three icon slots of a node row, in order: branch, merge, tab.
+const slotsOf = (node) =>
+  node.props.children
+    .filter((c) => c?.props)
+    .slice(-3)
+    .map((c) => {
+      const p = findAll(c, (n) => n.props && Object.keys(n.props).some((k) => /^data-(branch|merge|tab|open-tab|empty)/.test(k)))[0]?.props ?? {};
+      const k = Object.keys(p).find((key) => /^data-(branch-here|branch-slot|merge-here|merge-slot|open-tab|tab-slot|empty-slot)$/.test(key));
+      return k === 'data-empty-slot' ? `empty:${p[k]}` : k?.replace('data-', '');
+    });
+
+test('row icons: Branch on branchable rows, Merge only on the open lane with a parent, Open in a tab on every row', async () => {
+  const ctx = setup(); // focus b2, parent b1
+  await flush();
+  const tree = ctx.pane.render();
+  const rows = nodeRows(tree);
+  assert.ok(rows.length >= 4);
+  for (const row of rows) {
+    const slots = slotsOf(row);
+    assert.equal(slots.length, 3, row.props['data-node']);
+    const own = row.props['data-chat-id'] === 'b2';
+    assert.ok(['branch-here', 'branch-slot', 'empty:branch'].includes(slots[0]));
+    assert.equal(['merge-here', 'merge-slot'].includes(slots[1]), own, `${row.props['data-node']} ${slots[1]}`);
+    if (!own) assert.equal(slots[1], 'empty:merge');
+    assert.ok(['open-tab', 'tab-slot'].includes(slots[2]));
+  }
+  // A hidden slot is the same size as a shown icon: nothing moves when the icons show.
+  const hidden = byAttr(tree, 'data-tab-slot')[0];
+  assert.equal(hidden.props.style.visibility, 'hidden');
+  assert.equal(hidden.props.style.width, 20);
+  assert.equal(hidden.props.tabIndex, -1);
+  // The pointer on a row shows its icons; each is an icon with an aria-label and a tooltip.
+  const key = rows.find((r) => r.props['data-chat-id'] === 'root').props['data-node'];
+  nodeOf(ctx.pane.render(), key).props.onMouseEnter();
+  const row = nodeOf(ctx.pane.render(), key);
+  const tab = byAttr(row, 'data-open-tab', key)[0];
+  assert.equal(tab.props['aria-label'], 'Open in a tab');
+  assert.equal(tab.props.title, 'Open in a tab'); // no Tip in this setup: the native title
+  assert.equal(typeof tab.props.children, 'object'); // an icon, no text
+  assert.equal(byAttr(row, 'data-merge-here').length, 0);
+  const event = fakeEvent();
+  tab.props.onClick(event);
+  await flush();
+  assert.equal(event.stopped, 1);
+  assert.deepEqual(ctx.host.opened.at(-1), ['root', { intent: 'tab', profile: 'default' }]);
+  // On the open lane, Merge shows too.
+  const own = rows.find((r) => r.props['data-chat-id'] === 'b2').props['data-node'];
+  nodeOf(ctx.pane.render(), own).props.onMouseEnter();
+  assert.equal(byAttr(nodeOf(ctx.pane.render(), own), 'data-merge-here', own).length, 1);
+  ctx.unload();
+});
+
+test('with the SDK Popover, Tip and Codicon: the pick is anchored at the row, icons carry tooltips', async () => {
+  const host = fakeHost();
+  host.usage = { context_used: 1000, context_max: 128000 };
+  const ctx = setup({ host, deps: SDK_UI });
+  await flush();
+  const own = nodeRows(ctx.pane.render()).find((r) => r.props['data-chat-id'] === 'b2').props['data-node'];
+  nodeOf(ctx.pane.render(), own).props.onMouseEnter();
+  const root = () => findAll(nodeOf(ctx.pane.render(), own), (n) => n.type === 'Popover' && n.key === 'merge')[0];
+  assert.equal(root().props.open, false);
+  const tip = findAll(root(), (n) => n.type === 'Tip')[0];
+  assert.equal(tip.props.label, 'Merge into…');
+  const trigger = tip.props.children;
+  assert.equal(trigger.type, 'PopoverTrigger');
+  assert.equal(trigger.props.asChild, true);
+  const icon = trigger.props.children;
+  assert.equal(icon.props['aria-label'], 'Merge into');
+  assert.equal(icon.props.title, undefined); // the Tip is the tooltip
+  assert.equal(icon.props.children.type, 'Codicon');
+  assert.equal(icon.props.children.props.name, 'git-merge');
+  root().props.onOpenChange(true);
+  const content = findAll(root(), (n) => n.type === 'PopoverContent')[0];
+  assert.equal(root().props.open, true);
+  assert.equal(content.props['data-merge-pick'], own);
+  // A click or key in the content never reaches the row.
+  const event = fakeEvent();
+  content.props.onClick(event);
+  assert.equal(event.stopped, 1);
+  // No pick under the graph when the Popover holds it.
+  const under = byAttr(ctx.pane.render(), 'data-merge-pick').filter((n) => n.type !== 'PopoverContent');
+  assert.equal(under.length, 0);
+  // Pick the parent, then As-is: the popover closes and the draft is staged.
+  byAttr(content, 'data-merge-target', 'b1')[0].props.onClick(fakeEvent());
+  await flush();
+  byAttr(findAll(root(), (n) => n.type === 'PopoverContent')[0], 'data-merge', 'asis')[0].props.onClick(fakeEvent());
+  await flush();
+  assert.equal(ctx.host.drafts.length, 1);
+  assert.equal(ctx.host.drafts[0][0], 'b1');
+  assert.equal(byAttr(ctx.pane.render(), 'data-merge-result')[0].props['data-merge-result'], 'ok');
+  // Refresh: an icon button with its name as aria-label and Tip.
+  const refreshTip = findAll(ctx.pane.render(), (n) => n.type === 'Tip' && n.props.label === 'Refresh')[0];
+  assert.equal(refreshTip.props.children.props['aria-label'], 'Refresh');
+  assert.equal(refreshTip.props.children.props['data-refresh'], 'true');
+  ctx.unload();
+});
+
+test('Refresh is an icon button with no text', async () => {
+  const ctx = setup();
+  await flush();
+  const refresh = byAttr(ctx.pane.render(), 'data-refresh')[0];
+  assert.equal(refresh.type, 'Button');
+  assert.equal(refresh.props['aria-label'], 'Refresh');
+  assert.equal(refresh.props.title, 'Refresh');
+  assert.equal(findAll(refresh, (n) => n.type === 'svg').length, 1);
+  assert.equal(findAll(ctx.pane.render(), (n) => n.props?.children === 'Refresh').length, 0);
+  ctx.unload();
+});
+
+test('the merge pick and the result line keep the hook order (React error 300)', async () => {
+  const log = [];
+  const useValue = (a) => {
+    log.push(a);
+    return a.get();
+  };
+  const host = fakeHost();
+  host.usage = { context_used: 1000, context_max: 128000 };
+  const ctx = setup({ host, useValue });
+  await flush();
+  const order = () => {
+    log.length = 0;
+    ctx.pane.render();
+    return [...log];
+  };
+  const states = [order()];
+  openPickOf(ctx);
+  states.push(order()); // step Where
+  const how = await openHow(ctx);
+  states.push(order()); // step How
+  byAttr(how, 'data-merge', 'asis')[0].props.onClick(fakeEvent());
+  states.push(order()); // the result line, busy
+  await flush();
+  assert.equal(byAttr(ctx.pane.render(), 'data-merge-result')[0].props['data-merge-result'], 'ok');
+  states.push(order()); // the result line, staged
+  for (const s of states) assert.deepEqual(s, states[0]);
+  assert.equal(states[0].length, 8);
+  ctx.unload();
+});
+
+test('withSpacer moves every row index past the spacer, so the lines run through it', () => {
+  const { plan } = planFor(ROWS, 'b2', HIST);
+  const spaced = mod.withSpacer(plan, 0, 2, { key: 'result' });
+  assert.equal(spaced.rows.length, plan.rows.length + 2);
+  assert.deepEqual(spaced.rows.slice(1, 3).map((r) => [r.kind, r.spanIndex, r.span]), [['spacer', 0, 2], ['spacer', 1, 2]]);
+  for (let i = 0; i < plan.lanes.length; i++) {
+    assert.deepEqual(spaced.lanes[i].rows, plan.lanes[i].rows.map((r) => (r > 0 ? r + 2 : r)));
+  }
+  const geo = mod.graphGeometry(spaced);
+  assert.equal(geo.height, spaced.rows.length * mod.ROW_H);
+  assert.equal(geo.circles.length, mod.graphGeometry(plan).circles.length);
+  assert.equal(mod.withSpacer(plan, -1, 1), plan);
+});
+
+test('a narrow pane: rows, labels, pills and icons keep to the width; notes wrap', async () => {
+  const host = fakeHost({ stored: 'b2', runtime: 'rt-b2' });
+  host.agents = [{ subagent_id: 'sa', goal: 'a very long subagent goal '.repeat(8) }];
+  const ctx = setup({ host });
+  await flush();
+  await ctx.clock.tick(REFRESH_MS);
+  const tree = ctx.pane.render();
+  const root = byAttr(tree, 'data-chat-tree-root')[0];
+  assert.equal(root.props.style.width, 0); // Radix ScrollArea's display:table child cannot grow it
+  assert.equal(root.props.style.minWidth, '100%');
+  assert.equal(root.props.style.overflowX, 'hidden');
+  assert.equal(root.props.style.boxSizing, 'border-box');
+  const graph = byAttr(tree, 'data-tree-graph')[0];
+  assert.equal(graph.props.style.width, '100%');
+  assert.equal(graph.props.style.minWidth, 0);
+  for (const row of nodeRows(tree)) {
+    assert.equal(row.props.style.display, 'flex');
+    assert.equal(row.props.style.width, '100%');
+    assert.equal(row.props.style.minWidth, 0);
+    const label = byAttr(row, 'data-label')[0];
+    assert.deepEqual(
+      [label.props.style.flex, label.props.style.minWidth, label.props.style.overflow, label.props.style.textOverflow, label.props.style.whiteSpace],
+      ['1 1 auto', 0, 'hidden', 'ellipsis', 'nowrap'],
+    );
+    for (const c of row.props.children.filter((x) => x?.props && x !== label)) assert.equal(c.props.style?.flex ?? findAll(c, (n) => n.props?.style?.flex)[0]?.props.style.flex, '0 0 auto');
+  }
+  for (const pill of byAttr(tree, 'data-pill')) assert.equal(pill.props.style.flex, '0 0 auto');
+  const notes = [...findAll(tree, (n) => n.type === 'p'), ...byAttr(tree, 'data-subagent-goal')];
+  assert.ok(notes.length >= 2);
+  for (const n of notes) {
+    assert.equal(n.props.style.whiteSpace, 'normal');
+    assert.equal(n.props.style.overflowWrap, 'anywhere');
+    assert.equal(n.props.style.wordBreak, 'break-word');
+  }
+  ctx.unload();
+});
+
+test('with the SDK Popover, Branch here opens its form at the row; Escape or a click outside closes it', async () => {
+  const ctx = setup({ deps: SDK_UI });
+  await flush();
+  const key = 'root:1';
+  nodeOf(ctx.pane.render(), key).props.onMouseEnter();
+  const root = () => findAll(nodeOf(ctx.pane.render(), key), (n) => n.type === 'Popover' && n.key === 'branch')[0];
+  assert.equal(root().props.open, false);
+  const tip = findAll(root(), (n) => n.type === 'Tip')[0];
+  assert.equal(tip.props.label, 'Branch here');
+  root().props.onOpenChange(true);
+  assert.equal(root().props.open, true);
+  const content = findAll(root(), (n) => n.type === 'PopoverContent')[0];
+  assert.equal(content.props['data-branch-pick'], key);
+  assert.equal(byAttr(content, 'data-branch-form').length, 1);
+  // Not under the graph as well.
+  assert.equal(byAttr(ctx.pane.render(), 'data-branch-form').length, 1);
+  root().props.onOpenChange(false);
+  assert.equal(ctx.tree.$ui.get().branch, null);
   ctx.unload();
 });

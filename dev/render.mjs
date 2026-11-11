@@ -62,6 +62,20 @@ function useValue(store) {
   return useSyncExternalStore((onChange) => store.listen(() => onChange()), get, get);
 }
 
+// Radix ScrollArea as Hermes ships it (components/ui/scroll-area.tsx): a viewport whose child is a
+// display:table div with min-width 100%, which grows to its content's min-content width. The pane
+// root must keep to the viewport's width inside it.
+const ScrollArea = ({ children }) =>
+  jsx('div', {
+    'data-slot': 'scroll-area',
+    style: { position: 'relative', overflow: 'hidden', width: '100%' },
+    children: jsx('div', {
+      'data-radix-scroll-area-viewport': '',
+      style: { width: '100%', height: '100%', overflowX: 'hidden', overflowY: 'scroll' },
+      children: jsx('div', { style: { minWidth: '100%', display: 'table' }, children }),
+    }),
+  });
+
 // Plain elements stand in for the SDK components.
 const MessageTextContent = ({ text }) => jsx('div', { style: { whiteSpace: 'pre-wrap' }, children: text });
 
@@ -157,7 +171,7 @@ const sdk = (host) => ({
   useValue,
   Button: 'button',
   Input: 'input',
-  ScrollArea: 'div',
+  ScrollArea,
   MessageTextContent,
   setTimeout: () => 0,
   clearTimeout: () => {},
@@ -168,6 +182,12 @@ const sdk = (host) => ({
 const PANES = [
   { file: 'chat-tree', title: 'Chat tree', create: (deps) => createChatTree(deps) },
   { file: 'chat-tree-hover', pane: 'chat-tree', hover: true, title: 'Chat tree', create: (deps) => createChatTree(deps) },
+  // The merge pick at step How (no Popover in the harness: it shows under the graph), with the
+  // pointer on a row so its icons show.
+  { file: 'chat-tree-merge', pane: 'chat-tree', hover: true, merge: true, title: 'Chat tree', create: (deps) => createChatTree(deps) },
+  // A narrow pane (260 px): a long label, the model pill, a long note (the chat is running) and a
+  // failed merge line. No text may leave the pane.
+  { file: 'chat-tree-narrow', pane: 'chat-tree', narrow: true, width: '260px', title: 'Chat tree', create: (deps) => createChatTree(deps) },
   { file: 'side-chat', title: 'Side chat', create: (deps) => createSideChat(deps) },
 ];
 
@@ -235,7 +255,16 @@ ${markup}
 async function renderPane(spec) {
   const id = spec.pane ?? spec.file;
   const focusId = fixture.focus?.[id];
+  // The narrow render asks the open chat a long question: its label must end in an ellipsis.
+  const saved = fixture.history[focusId];
+  if (spec.narrow && Array.isArray(saved)) {
+    const lastUser = saved.map((m) => m.role).lastIndexOf('user');
+    fixture.history[focusId] = saved.map((m, i) =>
+      i === lastUser ? { ...m, content: `${m.content} and also explain how to scope a PyPI API token to a single project without breaking CI` } : m,
+    );
+  }
   const host = fakeHost(focusId);
+  if (spec.narrow) host.state.busyBySession.set({ [focusId]: true });
   const plugin = spec.create(sdk(host));
   const { ctx, registered, dispose } = fakeCtx();
   plugin.register(ctx);
@@ -248,13 +277,28 @@ async function renderPane(spec) {
     if (!hoverKey || typeof plugin.$hover?.set !== 'function') throw new Error(`${spec.file}: no hover node or no $hover atom`);
     plugin.$hover.set({ pointer: hoverKey, focus: null });
   }
+  const parentId = fixture.sessions.find((row) => row.id === focusId)?.parent_session_id ?? null;
+  if (spec.merge) {
+    plugin.$ui.set({
+      ...plugin.$ui.get(),
+      pick: { rowKey: hoverKey, chatId: focusId, step: 'how', targetId: parentId, prep: { turns: 2, sideTokens: 3100, headroom: { available: 36000, used: 92000, max: 128000 } } },
+    });
+    plugin.$hover.set({ ...plugin.$hover.get(), target: parentId });
+  }
+  if (spec.narrow) {
+    plugin.$ui.set({
+      ...plugin.$ui.get(),
+      result: { ok: false, kind: 'asis', anchor: null, targetId: parentId, title: 'Publish a Python package to PyPI', text: "The main chat's composer is not visible. Open the main chat and try again." },
+    });
+  }
   const markup = renderToStaticMarkup(createElement(pane.render));
   dispose();
+  if (spec.narrow) fixture.history[focusId] = saved;
   if (!markup) throw new Error(`${spec.file}: the pane rendered nothing`);
   if (hoverKey && !(markup.includes(`data-node="${escapeHtml(hoverKey)}"`) && markup.includes('data-role="hover"'))) {
     throw new Error(`${spec.file}: the hover node ${hoverKey} drew no hover path`);
   }
-  const width = typeof pane.data?.width === 'string' ? pane.data.width : '300px';
+  const width = spec.width ?? (typeof pane.data?.width === 'string' ? pane.data.width : '300px');
   const file = join(outDir, `${spec.file}.html`);
   writeFileSync(file, page(pane.title || spec.title, width, markup));
   const missing = (fixture.expect?.[id] ?? []).filter((text) => !markup.includes(escapeHtml(text)));

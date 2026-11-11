@@ -21,6 +21,15 @@ const DropdownMenuTrigger = sdk.DropdownMenuTrigger
 const DropdownMenuContent = sdk.DropdownMenuContent
 const reasoningEffortLabel = sdk.reasoningEffortLabel
 const BranchIcon = sdk.icons?.GitForkIcon || sdk.icons?.GitFork
+// Row and header icons, tooltips and the merge popover; each is undefined on an SDK without it
+// (the pane then draws the icon, uses the native title, or shows the pick under the graph).
+const TabIcon = sdk.icons?.ExternalLink
+const RefreshIcon = sdk.icons?.RefreshCwIcon || sdk.icons?.RefreshCw
+const Codicon = sdk.Codicon
+const Tip = sdk.Tip
+const Popover = sdk.Popover
+const PopoverTrigger = sdk.PopoverTrigger
+const PopoverContent = sdk.PopoverContent
 
 // Chat tree pane: a git graph of the focused chat's tree. A node is one exchange (one user
 // message and its replies). A lane is one chat. A child lane forks off its parent at the last
@@ -1078,6 +1087,30 @@ function planGraph(lanes, options = {}) {
   return { rows, lanes: laneList, merges, openKey };
 }
 
+// The plan with `span` spacer rows after row `after` (the merge result line under its row). Every
+// row index past `after` moves down by `span`, so lane lines, fork elbows and merge curves run on
+// through the spacer. A plan with no such row comes back unchanged.
+function withSpacer(plan, after, span, spacer = {}) {
+  const rows = Array.isArray(plan?.rows) ? plan.rows : [];
+  if (!Number.isInteger(after) || after < 0 || after >= rows.length || !(span >= 1)) return plan;
+  const at = (i) => (Number.isInteger(i) && i > after ? i + span : i);
+  const key = spacer.key ?? 'spacer';
+  const pad = Array.from({ length: span }, (_, k) => ({ ...spacer, kind: 'spacer', key: `${key}:${k}`, spanIndex: k, span }));
+  return {
+    ...plan,
+    rows: [...rows.slice(0, after + 1), ...pad, ...rows.slice(after + 1)],
+    lanes: (Array.isArray(plan.lanes) ? plan.lanes : []).map((lane) => ({
+      ...lane,
+      rows: Array.isArray(lane.rows) ? lane.rows.map(at) : lane.rows,
+      firstRow: at(lane.firstRow),
+      lastRow: at(lane.lastRow),
+      anchorRow: lane.anchorRow >= 0 ? at(lane.anchorRow) : lane.anchorRow,
+      ...(Number.isInteger(lane.end) ? { end: at(lane.end) } : {}),
+    })),
+    merges: (Array.isArray(plan.merges) ? plan.merges : []).map((m) => ({ ...m, fromRow: at(m.fromRow), toRow: at(m.toRow) })),
+  };
+}
+
 // ── Graph geometry: a pure function of the plan, in px ──────────────────────────────────────
 
 const laneX = (col) => GRAPH_PAD + col * LANE_GAP;
@@ -1182,9 +1215,18 @@ async function eachLimited(items, limit, fn) {
 }
 
 // Inline styles, not host classes: the plugin cannot rely on the host's CSS having them.
+// A block of the pane never grows past the pane's width (a narrow side pane).
+const BLOCK = { ...SELECTABLE, width: '100%', minWidth: 0, boxSizing: 'border-box', overflowX: 'hidden' };
+// The pane root. Radix ScrollArea puts its children in a display:table div that grows to its
+// content's min-content width; width 0 with min-width 100% keeps the root at the viewport's width.
+const PANE_ROOT = { ...SELECTABLE, ...BLOCK, display: 'block', width: 0, minWidth: '100%' };
+// A note, a message or an error line: it wraps inside the pane, also a long word or path.
+const NOTE = { ...SELECTABLE, whiteSpace: 'normal', overflowWrap: 'anywhere', wordBreak: 'break-word', minWidth: 0, maxWidth: '100%', margin: 0 };
 const ROW_STYLE = {
   ...SELECTABLE,
   height: ROW_H,
+  width: '100%',
+  minWidth: 0,
   boxSizing: 'border-box',
   display: 'flex',
   alignItems: 'center',
@@ -1214,21 +1256,34 @@ const PILL = {
 // A small action button inside a one-line row, and a merge target chip.
 const ROW_ACTION = { ...SELECTABLE, flex: '0 0 auto', fontSize: 10, lineHeight: '14px', padding: '0 4px' };
 const CHIP = { ...SELECTABLE, maxWidth: 140, minWidth: 0, justifyContent: 'flex-start' };
-const TARGET_SELECT = {
-  ...SELECTABLE,
-  maxWidth: 240,
-  minWidth: 0,
-  fontSize: 12,
-  padding: '2px 4px',
-  borderRadius: 4,
-  color: 'inherit',
-  background: 'var(--dt-card, transparent)',
-  border: '1px solid var(--dt-border, #3f3f46)',
-};
-// The Branch label: Hermes's GitBranch icon (sdk.icons) next to the word, or a drawn one.
-// Hermes's own Branch in new chat button draws GitForkIcon at size-3.5, 14 px
+// The row icons: Hermes's own Branch in new chat button draws GitForkIcon at size-3.5, 14 px
 // (components/assistant-ui/thread/assistant-message.tsx:1418); the SDK exports it as icons.GitForkIcon.
 const BRANCH_GLYPH = { flex: '0 0 auto', width: 14, height: 14 };
+// One icon slot at a row's right edge. Every node row reserves all three slots, so the icons line
+// up in columns and a row never changes width when they show.
+const ICON_SLOT = { ...SELECTABLE, flex: '0 0 auto', width: 20, height: 20, minWidth: 20, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' };
+// A Quick Pick item in the merge popover: a label line and a detail line.
+const PICK_ITEM = {
+  ...SELECTABLE,
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'stretch',
+  gap: 1,
+  width: '100%',
+  minWidth: 0,
+  boxSizing: 'border-box',
+  textAlign: 'left',
+  padding: '4px 6px',
+  borderRadius: 4,
+  border: 'none',
+  background: 'transparent',
+  color: 'inherit',
+  font: 'inherit',
+  fontSize: 12,
+  cursor: 'pointer',
+};
+const PICK_GROUP = { ...NOTE, fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.04em', color: MUTED, padding: '4px 6px 0' };
+const DETAIL = { ...NOTE, fontSize: 11, color: MUTED };
 // How an ancestor relates to the open chat, so two ancestors with one title stay apart.
 function targetRelation(i, count) {
   if (i === 0) return count === 1 ? 'Parent (root)' : 'Parent';
@@ -1243,6 +1298,14 @@ function createChatTree(deps) {
   const { host, jsx, jsxs, atom, useValue, Button, ScrollArea } = deps;
   const Input = deps.Input ?? 'input';
   const BranchIcon = deps.BranchIcon ?? null;
+  // Row and header icons (sdk.icons, sdk.Codicon) and tooltips (sdk.Tip). Each falls back: a drawn
+  // icon, the native title.
+  const MergeCodicon = deps.Codicon ?? null;
+  const TabIcon = deps.TabIcon ?? null;
+  const RefreshIcon = deps.RefreshIcon ?? null;
+  const Tip = deps.Tip ?? null;
+  // The merge pick opens in Hermes's Popover at the row. Without it, the pick shows under the graph.
+  const pop = deps.Popover && deps.PopoverTrigger && deps.PopoverContent ? { Root: deps.Popover, Trigger: deps.PopoverTrigger, Content: deps.PopoverContent } : null;
   // Hermes's model picker, as the kanban plugin uses it: ModelCatalogMenu inside DropdownMenu,
   // DropdownMenuTrigger and DropdownMenuContent (all SDK exports). null when the SDK lacks one:
   // the Branch form then says so and sends no override.
@@ -1265,11 +1328,12 @@ function createChatTree(deps) {
   // note: why live subagents are not shown (not an error).
   const $status = atom({ loading: false, error: null, note: null });
   // In memory only, never stored. open: { chatId, index } the clicked node. expanded: { [run key]:
-  // true } the +N runs the user opened. merge: the last merge result { busy, kind, notice, fit,
-  // sideTokens, available }. held: a no-fit notice that only Dismiss clears. target: { chatId, id }
-  // the merge target picked for chat chatId. branch: the Branch here form { chatId, index, label,
-  // question, model, busy, error }. forkNotice: a failed fork digest, until Dismiss.
-  const freshUi = () => ({ open: null, expanded: {}, merge: {}, held: null, target: null, branch: null, forkNotice: null });
+  // true } the +N runs the user opened. pick: the open merge popover { rowKey, chatId, step
+  // ('where' | 'how'), targetId, prep }. result: the last merge { busy, ok, kind, text, targetId,
+  // title, anchor, fit, sideTokens, available }, shown under its row until Dismiss or the next
+  // merge. branch: the Branch here form { chatId, index, label, question, model, busy, error }.
+  // forkNotice: a failed fork digest, until Dismiss.
+  const freshUi = () => ({ open: null, expanded: {}, pick: null, result: null, branch: null, forkNotice: null });
   const $ui = atom(freshUi());
   // The node rows under the pointer and under keyboard focus: { pointer, focus } node keys, in
   // memory only. The pointer's node gets the hover path; either one reveals its Branch button.
@@ -1650,8 +1714,7 @@ function createChatTree(deps) {
     event.preventDefault?.();
     fn();
   };
-  const pickTarget = (chatId, id) => setUi({ target: { chatId, id } });
-  const dismissHeld = () => setUi({ held: null });
+  const dismissResult = () => setUi({ result: null });
   const dismissForkNotice = () => setUi({ forkNotice: null });
 
   // The tree as the pane draws it now, for the click handlers (render never runs an action).
@@ -1800,45 +1863,58 @@ function createChatTree(deps) {
 
   // ── Merge: stage the open chat in an ancestor's composer. Never sends. ─────────────────────
 
-  // Click handler of Merge as-is (kind 'asis') and Digest (kind 'digest'). Reads the open chat,
-  // builds the text, checks it against the target's window, opens the target in place, and stages
-  // the draft. Never throws, and never merges unless the user clicked.
-  async function merge(kind) {
-    if ($ui.get().merge?.busy) return;
+  // The open chat's own part after its fork point: { question, turns }, { notice } when there is
+  // nothing to merge or a read failed, or { dead: true } when the activation ended.
+  async function readOwnPart(open, lanes, alive = () => true) {
+    let exchanges;
+    try {
+      exchanges = exchangesFromRows(await readOpenRows(open.id));
+    } catch (error) {
+      return { notice: `Could not read this chat: ${errorText(error)}` };
+    }
+    if (!alive()) return { dead: true };
+    // The fork point: against the parent as the tree loaded it, else a fresh read of the parent.
+    let parentExchanges = lanes.find((lane) => lane.id === open.parentId)?.exchanges ?? [];
+    if (!parentExchanges.length) {
+      try {
+        parentExchanges = exchangesFromRows(await readRows(open.parentId));
+      } catch (error) {
+        return { notice: `Could not read the parent chat: ${errorText(error)}` };
+      }
+      if (!alive()) return { dead: true };
+    }
+    const { question, turns } = ownPart(exchanges, sharedExchangeCount(exchanges, parentExchanges));
+    if (!turns.length) return { notice: MERGE_NOTHING_TEXT };
+    return { question, turns };
+  }
+
+  // Runs when the user picks a mode in the merge popover: kind 'asis' (As-is) or 'digest'. Reads
+  // the open chat, builds the text, checks it against the target's window, opens the target in
+  // place, and stages the draft. The outcome is ui.result, under the row `anchor`. Never throws,
+  // and never sends.
+  async function merge(kind, targetId, anchor = null) {
+    if ($ui.get().result?.busy) return;
     const act = activation;
     const alive = () => !disposed && act === activation;
-    const show = (state) => {
-      if (alive()) setUi({ merge: state });
+    let target = null;
+    const finish = (patch) => {
+      if (alive()) setUi({ result: { kind, anchor, targetId: target?.id ?? null, title: target?.title ?? '', ...patch } });
     };
+    const fail = (text, extra = {}) => finish({ ok: false, text, ...extra });
     const mode = kind === 'digest' ? 'Digest' : 'Merge as-is';
     try {
       const { lanes, open } = currentView();
-      if (!open) return show({ notice: 'Open a chat first.' });
+      if (!open) return fail('Open a chat first.');
       const targets = mergeTargets(lanes, open.id);
-      if (!targets.length) return show({ notice: forkParentId(open.row) ? MERGE_PARENT_MISSING_TEXT : MERGE_ROOT_TEXT });
-      if (typeof host?.composer?.setDraft !== 'function') return show({ notice: MERGE_NO_COMPOSER_TEXT });
-      const target = selectedTarget(targets, $ui.get().target, open.id);
-      show({ busy: true, kind });
+      if (!targets.length) return fail(forkParentId(open.row) ? MERGE_PARENT_MISSING_TEXT : MERGE_ROOT_TEXT);
+      if (typeof host?.composer?.setDraft !== 'function') return fail(MERGE_NO_COMPOSER_TEXT);
+      target = targets.find((t) => t.id === targetId) ?? selectedTarget(targets, null, open.id);
+      finish({ busy: true });
 
-      let exchanges;
-      try {
-        exchanges = exchangesFromRows(await readOpenRows(open.id));
-      } catch (error) {
-        return show({ notice: `Could not read this chat: ${errorText(error)}` });
-      }
-      if (!alive()) return;
-      // The fork point: against the parent as the tree loaded it, else a fresh read of the parent.
-      let parentExchanges = lanes.find((lane) => lane.id === open.parentId)?.exchanges ?? [];
-      if (!parentExchanges.length) {
-        try {
-          parentExchanges = exchangesFromRows(await readRows(open.parentId));
-        } catch (error) {
-          return show({ notice: `Could not read the parent chat: ${errorText(error)}` });
-        }
-        if (!alive()) return;
-      }
-      const { question, turns } = ownPart(exchanges, sharedExchangeCount(exchanges, parentExchanges));
-      if (!turns.length) return show({ notice: MERGE_NOTHING_TEXT });
+      const part = await readOwnPart(open, lanes, alive);
+      if (part.dead || !alive()) return;
+      if (part.notice) return fail(part.notice);
+      const { question, turns } = part;
 
       let body = verbatimBody(turns);
       if (kind === 'digest') {
@@ -1846,7 +1922,7 @@ function createChatTree(deps) {
         const viewing = atomOf('focusedStoredSessionId').get() === open.id ? runtimeId() || open.id : open.id;
         const reply = await requestDigest(viewing, 'merge', open.title, turns);
         if (!alive()) return;
-        if (!reply.ok) return show({ notice: reply.missing ? DIGEST_MISSING_TEXT : `Digest failed: ${reply.error.replace(/[.\s]+$/, '')}. Nothing was staged.` });
+        if (!reply.ok) return fail(reply.missing ? DIGEST_MISSING_TEXT : `Digest failed: ${reply.error.replace(/[.\s]+$/, '')}. Nothing was staged.`);
         body = reply.digest;
       }
       const text = formatMergeText(question, body);
@@ -1855,10 +1931,8 @@ function createChatTree(deps) {
       const headroom = await targetHeadroom(target.id);
       if (!alive()) return;
       if (headroom && sideTokens > headroom.available) {
-        // Held: later merges, loads and focus changes leave it. Only Dismiss clears it.
-        setUi({
-          merge: { fit: 'no', sideTokens, available: headroom.available },
-          held: formatNoFitNotice({
+        return fail(
+          formatNoFitNotice({
             sideTokens,
             available: headroom.available,
             used: headroom.used,
@@ -1868,8 +1942,8 @@ function createChatTree(deps) {
             mode,
             target: target.title,
           }),
-        });
-        return;
+          { fit: 'no', sideTokens, available: headroom.available },
+        );
       }
 
       // setDraft fails closed on a composer that is not mounted (sdk/composer.ts): open the target first.
@@ -1893,35 +1967,131 @@ function createChatTree(deps) {
 
       const fit = headroom ? 'yes' : 'unknown';
       const base = { fit, sideTokens, available: headroom?.available };
-      if (!ok) return show({ ...base, notice: MERGE_HIDDEN_TEXT });
+      if (!ok) return fail(MERGE_HIDDEN_TEXT, base);
       // Staged. Once the user sends it, the target's next history read shows the Merged node.
-      show({ ...base, notice: headroom ? MERGE_STAGED_TEXT : formatMissingWindowNotice(sideTokens) });
+      finish({ ...base, ok: true, text: headroom ? MERGE_STAGED_TEXT : formatMissingWindowNotice(sideTokens) });
     } catch (error) {
-      show({ notice: `Merge failed: ${errorText(error)}` });
+      fail(`Merge failed: ${errorText(error)}`);
     }
+  }
+
+  // ── The merge popover: step 'where' (an ancestor), then step 'how' (As-is or Digest) ───────
+
+  // Opens the pick on the Merge icon of row rowKey. The parent is preselected: its lane lights up.
+  function openPick(rowKey) {
+    const { lanes, open } = currentView();
+    if (!open) return;
+    setUi({ pick: { rowKey, chatId: open.id, step: 'where', targetId: null, prep: null } });
+    hoverSet('target', mergeTargets(lanes, open.id)[0]?.id ?? null);
+  }
+
+  function closePick() {
+    if ($ui.get().pick) setUi({ pick: null });
+    hoverSet('target', null);
+  }
+
+  // The size of an As-is merge into targetId, for the detail line of step 'how'.
+  async function measureMerge(targetId) {
+    try {
+      const { lanes, open } = currentView();
+      if (!open) return { error: 'Open a chat first.' };
+      const part = await readOwnPart(open, lanes);
+      if (part.notice || part.dead) return { error: part.notice ?? 'The pane was closed.' };
+      const sideTokens = estimateTokens(formatMergeText(part.question, verbatimBody(part.turns)));
+      const headroom = await targetHeadroom(targetId);
+      return { turns: part.turns.length, sideTokens, headroom };
+    } catch (error) {
+      return { error: `Could not measure this chat: ${errorText(error)}` };
+    }
+  }
+
+  // Step 'where' picked targetId: show step 'how' and measure the As-is merge.
+  async function pickWhere(targetId) {
+    const pick = $ui.get().pick;
+    if (!pick || !targetId) return;
+    const token = {};
+    setUi({ pick: { ...pick, step: 'how', targetId, prep: { busy: true, token } } });
+    hoverSet('target', targetId);
+    const act = activation;
+    const prep = await measureMerge(targetId);
+    const now = $ui.get().pick;
+    if (disposed || act !== activation || !now || now.prep?.token !== token) return;
+    setUi({ pick: { ...now, prep } });
+  }
+
+  function backToWhere() {
+    const pick = $ui.get().pick;
+    if (pick) setUi({ pick: { ...pick, step: 'where', targetId: null, prep: null } });
+  }
+
+  // Step 'how' picked kind: close the popover and stage.
+  function pickHow(kind) {
+    const pick = $ui.get().pick;
+    if (!pick?.targetId) return;
+    closePick();
+    merge(kind, pick.targetId, pick.rowKey).then(null, () => {});
   }
 
   // ── Branch here: fork the open chat at an exchange and ask the branch a question ──────────
 
   // A new form has nothing picked: the branch keeps this chat's model until the user picks one.
   // model: the picked choice (EMPTY_CHOICE). picking: the model picker is open.
-  function branchLabel() {
-    const icon = BranchIcon
-      ? jsx(BranchIcon, { size: 14, style: BRANCH_GLYPH, 'aria-hidden': 'true' }, 'icon')
-      : jsxs('svg', {
-          // Tabler's git-fork outline, the icon Hermes uses, for a Hermes without sdk.icons.
-          viewBox: '0 0 24 24', style: BRANCH_GLYPH, fill: 'none', stroke: 'currentColor', strokeWidth: 2,
-          strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true',
-          children: [
-            jsx('circle', { cx: 12, cy: 18, r: 2 }, 'a'),
-            jsx('circle', { cx: 7, cy: 6, r: 2 }, 'b'),
-            jsx('circle', { cx: 17, cy: 6, r: 2 }, 'c'),
-            jsx('path', { d: 'M7 8v2a2 2 0 0 0 2 2h6a2 2 0 0 0 2 -2v-2' }, 'd'),
-            jsx('path', { d: 'M12 12l0 4' }, 'e'),
-          ],
-        }, 'icon');
-    return jsxs('span', { style: { ...SELECTABLE, display: 'inline-flex', alignItems: 'center', gap: 3 }, children: [icon, 'Branch'] });
+  // A Tabler outline icon, drawn when the SDK has no icon for it (an older Hermes).
+  const drawn = (paths) =>
+    jsx(
+      'svg',
+      {
+        viewBox: '0 0 24 24', style: BRANCH_GLYPH, fill: 'none', stroke: 'currentColor', strokeWidth: 2,
+        strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true',
+        children: paths.map((d, i) => jsx('path', { d }, i)),
+      },
+      'icon',
+    );
+  const sdkIcon = (Icon, paths) => (Icon ? jsx(Icon, { size: 14, style: BRANCH_GLYPH, 'aria-hidden': 'true' }, 'icon') : drawn(paths));
+  // Tabler's git-fork, the icon Hermes's own Branch button uses.
+  const forkGlyph = () =>
+    sdkIcon(BranchIcon, ['M10 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M5 6a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M15 6a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M7 8v2a2 2 0 0 0 2 2h6a2 2 0 0 0 2 -2v-2', 'M12 12l0 4']);
+  // The codicon git-merge (the SDK has no Tabler merge icon), else Tabler's git-merge.
+  const mergeGlyph = () =>
+    MergeCodicon
+      ? jsx(MergeCodicon, { name: 'git-merge', size: 14, style: { flex: '0 0 auto', lineHeight: 1 }, 'aria-hidden': 'true' }, 'icon')
+      : drawn(['M5 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M5 6a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M15 12a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'M7 8l0 8', 'M7 8a4 4 0 0 0 4 4h4']);
+  const tabGlyph = () => sdkIcon(TabIcon, ['M12 6h-6a2 2 0 0 0 -2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-6', 'M11 13l9 -9', 'M15 4h5v5']);
+  const refreshGlyph = () => sdkIcon(RefreshIcon, ['M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4', 'M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4']);
+
+  // A tooltip with the control's name: Hermes's Tip, else the native title (set on the control).
+  const tipped = (label, child, key) => (Tip ? jsx(Tip, { label, children: child }, key) : child);
+
+  // One icon button. An icon only, with its name as aria-label and tooltip. A click or a key on it
+  // never reaches the row (the row selects its node).
+  function iconButton({ label, glyph, attrs, onClick, disabled = false, key, popTrigger = false }) {
+    const button = jsx(
+      Button,
+      {
+        type: 'button',
+        size: 'xs',
+        variant: 'ghost',
+        style: ICON_SLOT,
+        'aria-label': label,
+        ...(Tip ? {} : { title: label }),
+        disabled,
+        ...attrs,
+        onClick: (event) => {
+          stop(event);
+          if (onClick) onClick(event);
+        },
+        onKeyDown: stop,
+        children: glyph(),
+      },
+      popTrigger ? 'button' : key,
+    );
+    return popTrigger ? button : tipped(label, button, key);
   }
+  // A reserved slot: the same size, hidden and inert, so showing the icon moves nothing.
+  const hiddenSlot = (glyph, attrs, key) =>
+    jsx(Button, { type: 'button', size: 'xs', variant: 'ghost', style: { ...ICON_SLOT, visibility: 'hidden' }, tabIndex: -1, 'aria-hidden': 'true', disabled: true, ...attrs, children: glyph() }, key);
+  // A slot whose action does not apply to the row: empty space, so the columns line up.
+  const emptySlot = (key) => jsx('span', { 'aria-hidden': 'true', style: { ...ICON_SLOT, visibility: 'hidden' }, 'data-empty-slot': key }, key);
 
   // Branch on a node of another chat opens that chat first, then the form once it is the open chat.
   let pendingBranch = null;
@@ -2083,15 +2253,18 @@ function createChatTree(deps) {
     if ($hover.get()[field] === key) hoverSet(field, null);
   };
 
-  // actions: { openId, busy, model, hover }: the open chat's id, its busy flag, its model, and the
-  // $hover value. A branchable node carries a Branch button for the open chat. The button shows on
-  // the open row and on the row under the pointer or keyboard focus. On every other branchable row
-  // it stays in place, hidden and inert, so a row never changes width when its button shows.
+  // actions: { openId, busy, model, hover, mergeLane, merging, pick, targets, open }: the open
+  // chat's id, its busy flag, its model, the $hover value, the lane whose rows carry Merge (the open
+  // chat when it has a parent, else null), a merge in flight, the open pick, the merge targets and
+  // the open lane. Every node row reserves three icon slots at its right edge: Branch here (a
+  // branchable node), Merge into (a row of the open chat's own lane) and Open in a tab (every row).
+  // The icons show on the open row, on the row under the pointer or keyboard focus, and on the row
+  // whose merge popover is open. Elsewhere they stay in place, hidden and inert.
   function nodeLine(row, lane, lanesById, indent, actions) {
     const children = [
       jsx(
         'span',
-        { style: { ...LABEL_STYLE, ...(row.blue ? {} : { opacity: 0.72 }), ...(row.open ? { fontWeight: 600 } : {}) }, 'data-selectable-text': 'true', children: row.label },
+        { style: { ...LABEL_STYLE, ...(row.blue ? {} : { opacity: 0.72 }), ...(row.open ? { fontWeight: 600 } : {}) }, 'data-selectable-text': 'true', 'data-label': 'true', children: row.label },
         'label',
       ),
     ];
@@ -2099,46 +2272,33 @@ function createChatTree(deps) {
     const model = row.open ? actions.model || lane.model : '';
     if (model) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'model', children: modelName(model) }, 'model'));
     if (row.first && lane.side) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'side', children: 'side' }, 'side'));
-    const shown = row.open || row.key === actions.hover?.pointer || row.key === actions.hover?.focus;
-    if (row.branchable && !shown) {
+    const picking = actions.pick?.rowKey === row.key;
+    // The Branch here form of this node: with Hermes's Popover it opens at the row.
+    const formHere = Boolean(pop && row.branchable && actions.form && actions.form.chatId === row.branchFrom && actions.form.index === row.index);
+    const shown = row.open || picking || formHere || row.key === actions.hover?.pointer || row.key === actions.hover?.focus;
+    const own = row.branchFrom === actions.openId;
+    if (!row.branchable) children.push(emptySlot('branch'));
+    else if (!shown) children.push(hiddenSlot(forkGlyph, { 'data-branch-slot': row.key }, 'branch'));
+    else {
+      const label = own && actions.busy ? BRANCH_BUSY_TEXT : 'Branch here';
+      const button = iconButton({
+        label,
+        glyph: forkGlyph,
+        key: 'branch',
+        disabled: own && actions.busy,
+        attrs: { 'data-branch-here': row.key, 'aria-label': 'Branch here' },
+        popTrigger: Boolean(pop),
+        onClick: pop ? null : () => branchAt(row, actions),
+      });
+      children.push(pop ? branchPopover(row, actions, label, button, formHere) : button);
+    }
+    if (!actions.mergeLane || row.lane !== actions.mergeLane) children.push(emptySlot('merge'));
+    else if (!shown) children.push(hiddenSlot(mergeGlyph, { 'data-merge-slot': row.key }, 'merge'));
+    else children.push(mergeControl(row, actions, picking));
+    if (!shown) children.push(hiddenSlot(tabGlyph, { 'data-tab-slot': row.key }, 'tab'));
+    else {
       children.push(
-        jsx(
-          Button,
-          {
-            type: 'button',
-            size: 'xs',
-            variant: 'ghost',
-            style: { ...ROW_ACTION, visibility: 'hidden' },
-            tabIndex: -1,
-            'aria-hidden': 'true',
-            disabled: true,
-            'data-branch-slot': row.key,
-            children: branchLabel(),
-          },
-          'branch',
-        ),
-      );
-    } else if (row.branchable) {
-      children.push(
-        jsx(
-          Button,
-          {
-            type: 'button',
-            size: 'xs',
-            variant: 'ghost',
-            style: ROW_ACTION,
-            'data-branch-here': row.key,
-            disabled: row.branchFrom === actions.openId && actions.busy,
-            title: row.branchFrom === actions.openId && actions.busy ? BRANCH_BUSY_TEXT : 'Branch here: fork this chat after this exchange and ask the branch a question.',
-            onClick: (event) => {
-              stop(event);
-              branchAt(row, actions);
-            },
-            onKeyDown: stop,
-            children: branchLabel(),
-          },
-          'branch',
-        ),
+        iconButton({ label: 'Open in a tab', glyph: tabGlyph, key: 'tab', attrs: { 'data-open-tab': row.key }, onClick: () => openChat(row.lane, 'tab') }),
       );
     }
     const select = () => selectNode(row.lane, row.index);
@@ -2176,6 +2336,291 @@ function createChatTree(deps) {
         children,
       },
       row.key,
+    );
+  }
+
+  // Branch here in Hermes's Popover at the row: the one-line question, the model picker and Enter
+  // to send (branchForm). Branch on another chat's node opens that chat first; the popover opens
+  // once the form is set. A form that is sending stays open.
+  function branchPopover(row, actions, label, button, formHere) {
+    return jsx(
+      pop.Root,
+      {
+        open: formHere,
+        onOpenChange: (next) => {
+          if (next) branchAt(row, actions);
+          else if (!actions.form?.busy) cancelBranch();
+        },
+        children: [
+          tipped(label, jsx(pop.Trigger, { asChild: true, children: button }, 'trigger'), 'tip'),
+          formHere
+            ? jsx(
+                pop.Content,
+                {
+                  align: 'end',
+                  side: 'bottom',
+                  style: { ...SELECTABLE, boxSizing: 'border-box', maxWidth: 'calc(100vw - 16px)', padding: 4 },
+                  'data-branch-pick': row.key,
+                  'data-selectable-text': 'true',
+                  onClick: stop,
+                  onKeyDown: stop,
+                  children: branchForm(actions.form, actions.busy),
+                },
+                'content',
+              )
+            : null,
+        ].filter(Boolean),
+      },
+      'branch',
+    );
+  }
+
+  // The Merge into icon. With Hermes's Popover, the pick opens anchored at the row; without it,
+  // the icon toggles the pick under the graph.
+  function mergeControl(row, actions, picking) {
+    const label = 'Merge into…';
+    const attrs = { 'data-merge-here': row.key, 'aria-label': 'Merge into', 'aria-haspopup': 'dialog', 'aria-expanded': picking };
+    const disabled = actions.merging === true;
+    if (!pop) return iconButton({ label, glyph: mergeGlyph, key: 'merge', disabled, attrs, onClick: () => (picking ? closePick() : openPick(row.key)) });
+    const trigger = jsx(pop.Trigger, { asChild: true, children: iconButton({ label, glyph: mergeGlyph, key: 'merge', disabled, attrs, popTrigger: true }) }, 'trigger');
+    return jsx(
+      pop.Root,
+      {
+        open: picking,
+        onOpenChange: (next) => (next ? openPick(row.key) : closePick()),
+        children: [
+          tipped(label, trigger, 'tip'),
+          picking
+            ? jsx(
+                pop.Content,
+                {
+                  align: 'end',
+                  side: 'bottom',
+                  style: { ...SELECTABLE, boxSizing: 'border-box', maxWidth: 'calc(100vw - 16px)', padding: 4 },
+                  'data-merge-pick': row.key,
+                  'data-selectable-text': 'true',
+                  // The content is a React child of the row: its clicks and keys must not select the node.
+                  onClick: stop,
+                  onKeyDown: pickKeys,
+                  children: pickPanel(actions),
+                },
+                'content',
+              )
+            : null,
+        ].filter(Boolean),
+      },
+      'merge',
+    );
+  }
+
+  // Arrow keys move between the pick items; Enter picks the focused one (its native click).
+  function pickKeys(event) {
+    stopHostEvent(event);
+    const key = event?.key;
+    if (key !== 'ArrowDown' && key !== 'ArrowUp') return;
+    const items = [...(event.currentTarget?.querySelectorAll?.('[data-pick-item]') ?? [])];
+    if (!items.length) return;
+    event.preventDefault?.();
+    const at = items.indexOf(globalThis.document?.activeElement);
+    items[(at + (key === 'ArrowDown' ? 1 : -1) + items.length) % items.length]?.focus?.();
+  }
+
+  // One Quick Pick item: a label and a detail line. A disabled item stays focusable (its detail
+  // says why) and cannot be picked.
+  function pickItem({ key, label, detail, title, disabled = false, autoFocus = false, onPick, target = null, attrs = {} }) {
+    return jsxs(
+      'button',
+      {
+        type: 'button',
+        className: disabled ? '' : 'hover:bg-muted',
+        style: { ...PICK_ITEM, ...(disabled ? { opacity: 0.45, cursor: 'default' } : {}) },
+        ...(title ? { title } : {}),
+        ...(autoFocus ? { autoFocus: true } : {}),
+        ...(disabled ? { 'aria-disabled': 'true' } : {}),
+        'data-pick-item': key,
+        'data-selectable-text': 'true',
+        onClick: (event) => {
+          stop(event);
+          if (!disabled) onPick();
+        },
+        // Hovering or focusing a target lights its lane in the graph ($hover.target).
+        ...(target ? { onMouseEnter: () => hoverSet('target', target), onFocus: () => hoverSet('target', target) } : {}),
+        ...attrs,
+        children: [
+          jsx('span', { style: { ...LABEL_STYLE, fontWeight: 500 }, 'data-selectable-text': 'true', children: label }, 'label'),
+          detail ? jsx('span', { style: DETAIL, 'data-selectable-text': 'true', 'data-pick-detail': key, children: detail }, 'detail') : null,
+        ].filter(Boolean),
+      },
+      key,
+    );
+  }
+
+  // The two steps of the merge pick. 'where': the ancestors, the parent first and preselected.
+  // 'how': As-is with its size and fit, and Digest. A mode that does not fit is greyed.
+  function pickPanel(actions) {
+    const pick = actions.pick;
+    const targets = actions.targets ?? [];
+    const title = actions.open?.title ?? '';
+    const head = (left, right) =>
+      jsxs(
+        'div',
+        {
+          style: { ...NOTE, display: 'flex', alignItems: 'baseline', gap: 6, padding: '2px 6px 4px', fontSize: 12, fontWeight: 600 },
+          'data-selectable-text': 'true',
+          'data-pick-head': right,
+          children: [
+            jsx('span', { style: { ...NOTE, flex: '1 1 auto' }, 'data-selectable-text': 'true', children: left }, 'left'),
+            jsx('span', { style: { ...SELECTABLE, flex: '0 0 auto', color: MUTED, fontWeight: 400, fontSize: 11 }, 'data-selectable-text': 'true', children: right }, 'right'),
+          ],
+        },
+        'head',
+      );
+    if (pick.step !== 'how') {
+      const rows = [head(`Merge "${shortLabel(title, 40)}"`, '1/2 Where')];
+      targets.forEach((t, i) => {
+        if (i === 0) rows.push(jsx('div', { style: PICK_GROUP, 'data-selectable-text': 'true', children: 'Parent' }, 'group:parent'));
+        if (i === 1) rows.push(jsx('div', { style: PICK_GROUP, 'data-selectable-text': 'true', children: 'Older ancestors' }, 'group:older'));
+        rows.push(
+          pickItem({
+            key: t.id,
+            label: shortLabel(t.title, 48),
+            detail: i === 0 ? 'default' : targetRelation(i, targets.length),
+            title: t.title,
+            autoFocus: i === 0,
+            target: t.id,
+            onPick: () => pickWhere(t.id),
+            attrs: { 'data-merge-target': t.id, ...(i === 0 ? { 'data-default': 'true' } : {}) },
+          }),
+        );
+      });
+      return rows;
+    }
+    const target = targets.find((t) => t.id === pick.targetId);
+    const prep = pick.prep ?? {};
+    let asisDetail;
+    let asisOff = false;
+    let asisFit = 'unknown';
+    if (prep.busy) {
+      asisDetail = 'Measuring this chat...';
+      asisOff = true;
+      asisFit = 'pending';
+    } else if (prep.error) {
+      asisDetail = prep.error;
+      asisOff = true;
+      asisFit = 'error';
+    } else {
+      const size = `${prep.turns} exchange${prep.turns === 1 ? '' : 's'} · about ${formatTokenCount(prep.sideTokens)} tokens`;
+      const free = prep.headroom ? `${formatTokenCount(prep.headroom.available)} free` : '';
+      if (!prep.headroom) asisDetail = `${size} · the target's window is not reported`;
+      else if (prep.sideTokens > prep.headroom.available) {
+        asisDetail = `${size} · does not fit (${free})`;
+        asisOff = true;
+        asisFit = 'no';
+      } else {
+        asisDetail = `${size} · fits (${free})`;
+        asisFit = 'yes';
+      }
+    }
+    const digestOff = Boolean(prep.error);
+    return [
+      head(`Merge "${shortLabel(title, 28)}" into "${shortLabel(target?.title ?? '', 28)}"`, '2/2 How'),
+      pickItem({
+        key: 'asis',
+        label: 'As-is',
+        detail: asisDetail,
+        title: 'Stage this chat after its fork point in the target composer as it is. Nothing is sent.',
+        disabled: asisOff,
+        // While it measures, As-is keeps the focus: Enter, Enter merges as-is into the parent.
+        autoFocus: prep.busy === true || !asisOff || digestOff,
+        onPick: () => pickHow('asis'),
+        attrs: { 'data-merge': 'asis', 'data-fit': asisFit },
+      }),
+      pickItem({
+        key: 'digest',
+        label: 'Digest',
+        detail: prep.error ? prep.error : 'a summary by the digest model',
+        title: 'Stage a short digest of this chat after its fork point in the target composer. Nothing is sent.',
+        disabled: digestOff,
+        autoFocus: prep.busy !== true && asisOff && !digestOff,
+        onPick: () => pickHow('digest'),
+        attrs: { 'data-merge': 'digest' },
+      }),
+      jsx(
+        'button',
+        {
+          type: 'button',
+          className: 'hover:bg-muted',
+          style: { ...PICK_ITEM, color: MUTED, fontSize: 11 },
+          'data-pick-back': 'true',
+          onClick: (event) => {
+            stop(event);
+            backToWhere();
+          },
+          children: '‹ Back to Where',
+        },
+        'back',
+      ),
+    ];
+  }
+
+  // The result line of the last merge, under its row: staged (with Open), in flight, or failed (in
+  // the destructive colour). It stays until Dismiss or the next merge.
+  function resultLine(result, indent, span) {
+    const busy = result.busy === true;
+    const ok = !busy && result.ok === true;
+    const text = busy
+      ? result.kind === 'digest'
+        ? 'Writing the digest...'
+        : 'Staging...'
+      : ok
+        ? `✓ Staged in the composer of "${shortLabel(result.title, 32)}". Not sent.`
+        : result.text;
+    const detail = [ok ? result.text : '', result.fit ? fitReadout(result) : ''].filter(Boolean).join('\n');
+    const link = (label, attr, onClick) =>
+      jsx(
+        Button,
+        {
+          type: 'button',
+          size: 'xs',
+          variant: 'ghost',
+          style: { ...SELECTABLE, flex: '0 0 auto', padding: '0 4px', height: 20, fontSize: 11 },
+          [`data-result-${attr}`]: 'true',
+          onClick: (event) => {
+            stop(event);
+            onClick();
+          },
+          onKeyDown: stop,
+          children: label,
+        },
+        attr,
+      );
+    return jsxs(
+      'div',
+      {
+        role: busy || ok ? 'status' : 'alert',
+        className: busy || ok ? 'text-xs' : 'text-xs text-destructive',
+        style: { ...SELECTABLE, ...BLOCK, height: span * ROW_H, paddingLeft: indent, paddingRight: 4, display: 'flex', alignItems: 'center', gap: 4 },
+        ...(detail ? { title: detail } : {}),
+        'data-selectable-text': 'true',
+        'data-merge-result': busy ? 'busy' : ok ? 'ok' : 'error',
+        ...(result.fit ? { 'data-token-fit': result.fit } : {}),
+        onClick: stop,
+        children: [
+          jsx(
+            'span',
+            {
+              style: { ...NOTE, flex: '1 1 auto', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: span, WebkitBoxOrient: 'vertical' },
+              'data-selectable-text': 'true',
+              'data-merge-notice': 'true',
+              children: text,
+            },
+            'text',
+          ),
+          ok && result.targetId ? link('Open', 'open', () => openChat(result.targetId, 'in-place')) : null,
+          busy ? null : link('Dismiss', 'dismiss', dismissResult),
+        ].filter(Boolean),
+      },
+      'result',
     );
   }
 
@@ -2244,11 +2689,18 @@ function createChatTree(deps) {
     return jsxs(
       'div',
       {
-        style: { ...SELECTABLE, position: 'relative', minWidth: 0 },
+        style: { ...SELECTABLE, ...BLOCK, position: 'relative' },
         'data-selectable-text': 'true',
         'data-tree-graph': 'true',
         children: [
-          ...plan.rows.map((row) => (row.kind === 'more' ? moreLine(row, indent) : nodeLine(row, lanesById.get(row.lane), lanesById, indent, actions))),
+          ...plan.rows
+            .map((row) => {
+              if (row.kind === 'more') return moreLine(row, indent);
+              // The result line spans its spacer rows: the first one draws it, the rest hold its height.
+              if (row.kind === 'spacer') return row.spanIndex === 0 && actions.result ? resultLine(actions.result, indent, row.span) : null;
+              return nodeLine(row, lanesById.get(row.lane), lanesById, indent, actions);
+            })
+            .filter(Boolean),
           jsxs(
             'svg',
             {
@@ -2270,7 +2722,7 @@ function createChatTree(deps) {
 
   // A line of pane text.
   const note = (text, extra, key) =>
-    jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, 'data-selectable-text': 'true', ...extra, children: text }, key);
+    jsx('p', { className: 'text-xs opacity-70', style: NOTE, 'data-selectable-text': 'true', ...extra, children: text }, key);
 
   // The branch model field: Hermes's ModelCatalogMenu in a DropdownMenu, as the kanban plugin's
   // per-task override (plugins/kanban/model-override.tsx). The controller only holds the choice in the
@@ -2387,12 +2839,12 @@ function createChatTree(deps) {
       'div',
       {
         className: 'flex flex-col gap-1 rounded border p-2',
-        style: { ...SELECTABLE, marginTop: 6 },
+        style: { ...BLOCK, marginTop: 6 },
         'data-selectable-text': 'true',
         'data-branch-form': `${form.chatId}:${form.index}`,
         onClick: stop,
         children: [
-          jsx('p', { className: 'text-xs font-semibold', style: SELECTABLE, 'data-selectable-text': 'true', children: `Branch here: ${form.label}` }, 'head'),
+          jsx('p', { className: 'text-xs font-semibold', style: NOTE, 'data-selectable-text': 'true', children: `Branch here: ${form.label}` }, 'head'),
           field('question', 'Question for the branch (optional)', {
             onKeyDown: (event) => {
               stopHostEvent(event);
@@ -2438,34 +2890,12 @@ function createChatTree(deps) {
           ),
           busy ? note(BRANCH_BUSY_TEXT, { 'data-branch-busy': 'true' }, 'busy') : null,
           form.error
-            ? jsx('p', { className: 'text-xs text-destructive', style: SELECTABLE, 'data-selectable-text': 'true', 'data-branch-error': 'true', children: form.error }, 'error')
+            ? jsx('p', { className: 'text-xs text-destructive', style: NOTE, 'data-selectable-text': 'true', 'data-branch-error': 'true', children: form.error }, 'error')
             : null,
         ].filter(Boolean),
       },
       'branch-form',
     );
-  }
-
-  function mergeResult(state) {
-    return jsxs('div', {
-      className: 'flex flex-col',
-      style: SELECTABLE,
-      'data-selectable-text': 'true',
-      'data-merge-result': 'true',
-      ...(state.fit ? { 'data-token-fit': state.fit } : {}),
-      children: [
-        state.notice
-          ? jsx('p', {
-              className: 'text-xs',
-              style: SELECTABLE,
-              'data-selectable-text': 'true',
-              'data-merge-notice': 'true',
-              children: state.notice,
-            })
-          : null,
-        state.fit ? jsx('span', { className: 'text-xs opacity-70', style: SELECTABLE, 'data-selectable-text': 'true', 'data-token-readout': 'true', children: fitReadout(state) }) : null,
-      ].filter(Boolean),
-    });
   }
 
   // A notice that stays until Dismiss: the no-fit notice, or a failed fork digest.
@@ -2474,12 +2904,12 @@ function createChatTree(deps) {
       'div',
       {
         className: 'flex items-start justify-between gap-2',
-        style: SELECTABLE,
+        style: { ...SELECTABLE, ...BLOCK },
         'data-selectable-text': 'true',
         'data-held-notice': kind,
         onClick: stop,
         children: [
-          jsx('p', { className: 'text-xs', style: SELECTABLE, 'data-selectable-text': 'true', children: text }),
+          jsx('p', { className: 'text-xs', style: { ...NOTE, flex: '1 1 auto' }, 'data-selectable-text': 'true', children: text }, 'text'),
           jsx(Button, {
             type: 'button',
             size: 'xs',
@@ -2497,106 +2927,6 @@ function createChatTree(deps) {
     );
   }
 
-  // The one merge section, for the open chat: the target chips (parent first, then older
-  // ancestors) and the two buttons. On the root chat it is disabled with its reason.
-  function mergeSection(open, targets, target, ui) {
-    const state = ui.merge ?? {};
-    const busy = state.busy === true;
-    const reason = targets.length ? null : forkParentId(open.row) ? MERGE_PARENT_MISSING_TEXT : MERGE_ROOT_TEXT;
-    const button = (kind, label, title) =>
-      jsx(Button, {
-        type: 'button',
-        'data-merge': kind,
-        disabled: busy || reason !== null,
-        title,
-        onClick: (event) => {
-          stop(event);
-          return merge(kind);
-        },
-        children: label,
-      });
-    return jsxs(
-      'div',
-      {
-        className: 'flex flex-col gap-1',
-        style: { ...SELECTABLE, marginTop: 8 },
-        'data-selectable-text': 'true',
-        'data-merge-section': open.id,
-        ...(reason ? { 'data-merge-disabled': 'true' } : {}),
-        onClick: stop,
-        children: [
-          jsx('p', { className: 'text-xs font-semibold', style: SELECTABLE, 'data-selectable-text': 'true', children: `Merge ${open.title}` }, 'head'),
-          reason
-            ? note(reason, { 'data-merge-reason': 'true' }, 'reason')
-            : jsxs(
-                'div',
-                {
-                  className: 'flex flex-wrap items-center gap-1',
-                  style: SELECTABLE,
-                  'data-selectable-text': 'true',
-                  'data-merge-targets': 'true',
-                  role: 'group',
-                  'aria-label': 'Merge target',
-                  children: [
-                    jsx('span', { className: 'text-xs opacity-70', style: SELECTABLE, 'data-selectable-text': 'true', children: 'into:' }, 'into'),
-                    // A dropdown, because ancestors often share a title. Its lane lights up in the hover
-                    // colour only while the user works with the dropdown (Rohan, 2026-11-12 02:15).
-                    jsx(
-                      'select',
-                      {
-                        value: target?.id ?? '',
-                        style: TARGET_SELECT,
-                        title: target?.title ?? '',
-                        'aria-label': 'Merge into',
-                        'data-merge-target-select': 'true',
-                        'data-selectable-text': 'true',
-                        onChange: (event) => {
-                          const id = str(event?.target?.value);
-                          if (!id) return;
-                          pickTarget(open.id, id);
-                          hoverSet('target', id);
-                        },
-                        onFocus: () => hoverSet('target', target?.id ?? null),
-                        onBlur: () => hoverSet('target', null),
-                        onMouseEnter: () => hoverSet('target', target?.id ?? null),
-                        onMouseLeave: (event) => {
-                          if (globalThis.document?.activeElement !== event?.currentTarget) hoverSet('target', null);
-                        },
-                        onKeyDown: stop,
-                        onClick: stop,
-                        children: targets.map((t, i) =>
-                          jsx('option', { value: t.id, style: SELECTABLE, 'data-selectable-text': 'true', 'data-merge-target': t.id, children: `${targetRelation(i, targets.length)} · ${t.title}` }, t.id),
-                        ),
-                      },
-                      'select',
-                    ),
-                  ],
-                },
-                'targets',
-              ),
-          jsxs(
-            'div',
-            {
-              className: 'flex flex-wrap items-center gap-1',
-              style: SELECTABLE,
-              'data-selectable-text': 'true',
-              children: [
-                button('asis', 'Merge as-is', 'Stage this chat after its fork point in the target composer as it is. Nothing is sent.'),
-                button('digest', 'Digest', 'Stage a short digest of this chat after its fork point in the target composer. Nothing is sent.'),
-                busy
-                  ? jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, 'data-selectable-text': 'true', children: state.kind === 'digest' ? 'Writing the digest...' : 'Checking...' })
-                  : null,
-              ].filter(Boolean),
-            },
-            'buttons',
-          ),
-          state.notice || state.fit ? mergeResult(state) : null,
-        ].filter(Boolean),
-      },
-      'merge',
-    );
-  }
-
   function agentLine(agent) {
     const parts = [agent.status, agent.model].filter(Boolean);
     const id = agent.child_session_id;
@@ -2604,13 +2934,13 @@ function createChatTree(deps) {
       'div',
       {
         className: `flex min-w-0 flex-col rounded px-1 py-0.5${id ? ' cursor-pointer hover:bg-muted' : ''}`,
-        style: SELECTABLE,
+        style: BLOCK,
         'data-selectable-text': 'true',
         'data-subagent-id': agent.subagent_id,
         ...(id ? { role: 'button', onClick: onClickOpen(id) } : {}),
         children: [
-          jsx('span', { className: 'text-sm', style: { ...LABEL_STYLE, flex: 'none' }, children: `↳ subagent: ${agent.goal ?? '(no goal)'}` }),
-          jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: parts.join(' · ') }),
+          jsx('span', { className: 'text-sm', style: NOTE, 'data-selectable-text': 'true', 'data-subagent-goal': 'true', children: `↳ subagent: ${agent.goal ?? '(no goal)'}` }, 'goal'),
+          jsx('span', { className: 'text-xs opacity-60', style: NOTE, 'data-selectable-text': 'true', children: parts.join(' · ') }, 'meta'),
         ],
       },
       `agent:${agent.subagent_id}`,
@@ -2640,14 +2970,39 @@ function createChatTree(deps) {
     const lanes = buildLanes(chats, data.exchanges, data.branchIds);
     const open = tree && !fellBack ? (lanes.find((lane) => lane.id === tree.focused.id) ?? null) : null;
     const targets = open ? mergeTargets(lanes, open.id) : [];
-    const target = open ? selectedTarget(targets, ui.target, open.id) : null;
-    // The target lights up only while the dropdown is in use: its last exchange takes the hover path.
-    const previewLane = hover.target ? lanes.find((lane) => lane.id === hover.target) : null;
+    // The pick of the open chat only. While it is open, its hovered target lights up: the target's
+    // last exchange takes the hover path.
+    const pick = ui.pick && open && ui.pick.chatId === open.id ? ui.pick : null;
+    const previewLane = pick && hover.target ? lanes.find((lane) => lane.id === hover.target) : null;
     const preview = previewLane && previewLane.exchanges.length ? `${previewLane.id}:${previewLane.exchanges.length - 1}` : null;
-    const plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded, digests: data.digests, hovered: hover.pointer ?? preview });
+    let plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded, digests: data.digests, hovered: hover.pointer ?? preview });
+    // The result line takes spacer rows under its row (else the open row, else the last row), so
+    // the graph's lines run on through it: one row, two for a failure.
+    const result = ui.result;
+    if (result && plan.rows.length) {
+      let at = plan.rows.findIndex((row) => row.kind === 'node' && row.key === result.anchor);
+      if (at < 0) at = plan.rows.findIndex((row) => row.open);
+      if (at < 0) at = plan.rows.length - 1;
+      plan = withSpacer(plan, at, result.busy !== true && result.ok !== true ? 2 : 1, { key: 'result' });
+    }
     const agents = runtime && data.agentsFor === runtime ? data.agents : [];
     const busy = open ? chatBusy(busyMap, [runtime, open.id]) : false;
     const form = ui.branch && open && ui.branch.chatId === open.id ? ui.branch : null;
+    const actions = {
+      openId: open?.id ?? null,
+      busy,
+      model: open?.model ?? '',
+      hover,
+      mergeLane: open && targets.length ? open.id : null,
+      merging: result?.busy === true,
+      pick,
+      targets,
+      open,
+      result,
+      form,
+    };
+    // The form shows under the graph when no row holds it in a popover.
+    const formAnchored = Boolean(pop && form && plan.rows.some((row) => row.kind === 'node' && row.branchable && row.branchFrom === form.chatId && row.index === form.index));
 
     let notice = null;
     if (!stored && !runtime) notice = 'Open a chat to see its tree.';
@@ -2668,37 +3023,57 @@ function createChatTree(deps) {
     return jsx(ScrollArea, {
       children: jsxs('div', {
         className: 'flex flex-col gap-1 p-3 text-sm',
-        style: SELECTABLE,
+        style: PANE_ROOT,
         'data-selectable-text': 'true',
         'data-chat-tree-root': 'true',
         children: [
-          jsxs('div', {
-            className: 'flex flex-wrap items-center gap-2',
-            children: [
-              jsx(Button, { type: 'button', disabled: disposed, onClick: reload, children: 'Refresh' }),
-              status.loading ? jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: 'Loading...' }) : null,
-            ].filter(Boolean),
-          }),
+          jsxs(
+            'div',
+            {
+              className: 'flex flex-wrap items-center gap-2',
+              style: BLOCK,
+              'data-pane-head': 'true',
+              children: [
+                iconButton({ label: 'Refresh', glyph: refreshGlyph, key: 'refresh', disabled: disposed, attrs: { 'data-refresh': 'true' }, onClick: () => reload() }),
+                status.loading ? jsx('span', { className: 'text-xs opacity-60', style: SELECTABLE, children: 'Loading...' }, 'loading') : null,
+              ].filter(Boolean),
+            },
+            'head',
+          ),
           status.error
             ? jsx('pre', {
                 className: 'text-xs text-destructive',
-                style: { ...SELECTABLE, whiteSpace: 'pre-wrap', margin: 0, font: 'inherit' },
+                style: { ...NOTE, whiteSpace: 'pre-wrap', font: 'inherit' },
+                'data-note': 'error',
                 children: status.error,
-              })
+              }, 'error')
             : null,
-          notice ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: notice }) : null,
-          capped ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: capped }) : null,
-          status.note ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: status.note }) : null,
-          fellBack ? jsx('p', { className: 'text-xs opacity-70', style: { ...SELECTABLE, whiteSpace: 'normal', overflowWrap: 'anywhere' }, 'data-selectable-text': 'true', 'data-unlisted-focus': 'true', children: UNLISTED_FOCUS_TEXT }) : null,
-          plan.rows.length ? graphView(plan, lanes, { openId: open?.id ?? null, busy, model: open?.model ?? '', hover }) : null,
-          form ? branchForm(form, busy) : null,
+          notice ? note(notice, { 'data-note': 'notice' }, 'notice') : null,
+          capped ? note(capped, { 'data-note': 'capped' }, 'capped') : null,
+          status.note ? note(status.note, { 'data-note': 'status' }, 'status') : null,
+          fellBack ? note(UNLISTED_FOCUS_TEXT, { 'data-unlisted-focus': 'true' }, 'unlisted') : null,
+          plan.rows.length ? graphView(plan, lanes, actions) : null,
+          // Without Hermes's Popover, the merge pick shows here, under the graph.
+          pick && !pop
+            ? jsx(
+                'div',
+                {
+                  className: 'flex flex-col',
+                  style: { ...BLOCK, marginTop: 4, border: '1px solid var(--dt-border, #3f3f46)', borderRadius: 6, padding: 4 },
+                  'data-merge-pick': pick.rowKey,
+                  'data-selectable-text': 'true',
+                  onKeyDown: pickKeys,
+                  children: pickPanel(actions),
+                },
+                'pick',
+              )
+            : null,
+          form && !formAnchored ? branchForm(form, busy) : null,
           !form && busy && plan.rows.some((row) => row.branchable) ? note(BRANCH_BUSY_TEXT, { 'data-branch-busy': 'true' }, 'busy') : null,
           ui.forkNotice ? heldNotice(ui.forkNotice, 'fork', dismissForkNotice) : null,
           agents.length
-            ? jsx('div', { className: 'flex flex-col', style: { ...SELECTABLE, marginTop: 4 }, 'data-subagents': 'true', children: agents.map(agentLine) }, 'agents')
+            ? jsx('div', { className: 'flex flex-col', style: { ...BLOCK, marginTop: 4 }, 'data-subagents': 'true', children: agents.map(agentLine) }, 'agents')
             : null,
-          open && plan.rows.length ? mergeSection(open, targets, target, ui) : null,
-          ui.held ? heldNotice(ui.held, 'merge', dismissHeld) : null,
         ].filter(Boolean),
       }),
     });
@@ -2812,6 +3187,13 @@ const _plugin = createChatTree({
   DropdownMenuContent,
   reasoningEffortLabel,
   BranchIcon,
+  TabIcon,
+  RefreshIcon,
+  Codicon,
+  Tip,
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
   setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
   clearTimeout: (id) => globalThis.clearTimeout(id),
 })
