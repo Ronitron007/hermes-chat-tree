@@ -1,6 +1,6 @@
 # Decision tree: the competition build
 
-Updated: 2026-11-12 02:16 IST. Green is chosen. Grey is dropped. Yellow is open.
+Updated: 2026-11-12 02:42 IST. Green is chosen. Grey is dropped. Yellow is open.
 
 ```mermaid
 flowchart TD
@@ -107,11 +107,17 @@ flowchart TD
   HR2 --> HL[history.read: one lineage, no hidden or archived chats, a size cap]
   HR2 --> BX[Exact cut: branch_index from the rows Hermes branches from]
 
+  W1 --> BN{Branch names}
+  BN -->|chosen, Rohan 02:41| BN1[Name row at the fork: the Hermes title]
+  BN -->|chosen, Rohan 02:41| BN2[Branches mode: one row for each chat]
+  BN -->|dropped| BN3[Ref pill at the tip]
+  W1 --> RA[Row icon actions and a two-step merge pick, Rohan 02:16]
+
   classDef chosen fill:#d1fae5,stroke:#059669,color:#064e3b
   classDef dropped fill:#f3f4f6,stroke:#9ca3af,color:#6b7280
   classDef open fill:#fef3c7,stroke:#d97706,color:#78350f
-  class B1,H1,T1,V1,O,C,M1,M2,M6,M9,M8,P1,Q1,W1,RV1,F2,MS,MT1,NM1,FD,LN1,BM1,CS1,SC1,SC3,LF,AC2,BA2,BQ,BI,TD2,HL,BX chosen
-  class B2,H2,T2,T3,V2,M3,M5,M10,P2,R2,W2,RV2,MT2,NM2,BM2,SC2,AC1,BA1,TD1 dropped
+  class B1,H1,T1,V1,O,C,M1,M2,M6,M9,M8,P1,Q1,W1,RV1,F2,MS,MT1,NM1,FD,LN1,BM1,CS1,SC1,SC3,LF,AC2,BA2,BQ,BI,TD2,HL,BX,BN1,BN2,RA chosen
+  class B2,H2,T2,T3,V2,M3,M5,M10,P2,R2,W2,RV2,MT2,NM2,BM2,SC2,AC1,BA1,TD1,BN3 dropped
   class Q2,UI1,UI2 open
   classDef deferred fill:#e0e7ff,stroke:#6366f1,color:#312e81
   class R1,TC,LN2 deferred
