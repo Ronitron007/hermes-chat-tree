@@ -33,6 +33,8 @@ const DropdownMenu = sdk.DropdownMenu
 const DropdownMenuTrigger = sdk.DropdownMenuTrigger
 const DropdownMenuContent = sdk.DropdownMenuContent
 const reasoningEffortLabel = sdk.reasoningEffortLabel
+// Hermes's confirm for a guarded model switch; undefined on an SDK without it (a guarded pick then stays unset).
+const surfaceModelSwitchConfirm = sdk.surfaceModelSwitchConfirm
 const BranchIcon = sdk.icons?.GitForkIcon || sdk.icons?.GitFork
 // Row and header icons, tooltips and the merge popover; each is undefined on an SDK without it
 // (the pane then draws the icon, uses the native title, or shows the pick under the graph).
@@ -63,6 +65,7 @@ const _plugin = createChatTree({
   DropdownMenuTrigger,
   DropdownMenuContent,
   reasoningEffortLabel,
+  surfaceModelSwitchConfirm,
   BranchIcon,
   TabIcon,
   RefreshIcon,
