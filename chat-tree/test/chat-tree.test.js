@@ -20,7 +20,7 @@ const MERGE_STAGED_TEXT =
 const MERGE_HIDDEN_TEXT = "The main chat's composer is not visible. Open the main chat and try again.";
 const MERGE_NO_COMPOSER_TEXT = 'The composer draft API is missing. Nothing was written.';
 // The theme colours the pane maps roles to: Hermes variables with the old fixed colours as fallbacks.
-const ACCENT = 'var(--ui-accent, #3B82F6)';
+const ACCENT = 'var(--dt-primary, #3B82F6)';
 const MUTED = 'var(--dt-muted-foreground, #6B7280)';
 const HOVER = 'var(--dt-foreground, currentColor)';
 
@@ -1565,7 +1565,7 @@ test('one merge section for the open chat: two buttons, ancestor chips, the pare
   assert.doesNotMatch(textOf(tree), /Merge record|Digest \(later\)/);
   // into: <parent> <grandparent>, the parent pressed.
   const chips = byAttr(sections[0], 'data-merge-target');
-  assert.deepEqual(chips.map((c) => [c.props['data-merge-target'], c.props.children, c.props['aria-pressed']]), [
+  assert.deepEqual(chips.map((c) => [c.props['data-merge-target'], textOf(c), c.props['aria-pressed']]), [
     ['b1', 'b1', true],
     ['root', 'root', false],
   ]);
@@ -2649,4 +2649,15 @@ test('a second click aborts the first reveal', async () => {
   // root's first user row.
   assert.equal(viewport.events.at(-1).detail.rowId, 10);
   ctx.unload();
+});
+
+test('shortLabel drops HTML comments and leading quote marks', () => {
+  assert.equal(mod.shortLabel('<!-- reply 1 --> > Supabase Auth has its own schema'), 'Supabase Auth has its own schema');
+  assert.equal(mod.shortLabel('> > quoted twice'), 'quoted twice');
+  assert.equal(mod.shortLabel('a <!-- x --> b'), 'a b');
+});
+
+test('the active colour is the theme primary, not the neutral --ui-accent', () => {
+  assert.equal(mod.ACCENT, 'var(--dt-primary, #3B82F6)');
+  assert.notEqual(mod.ACCENT, mod.ROLE_COLOURS.hover);
 });
