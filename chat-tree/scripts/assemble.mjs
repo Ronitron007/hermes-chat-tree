@@ -34,6 +34,15 @@ const DropdownMenuTrigger = sdk.DropdownMenuTrigger
 const DropdownMenuContent = sdk.DropdownMenuContent
 const reasoningEffortLabel = sdk.reasoningEffortLabel
 const BranchIcon = sdk.icons?.GitForkIcon || sdk.icons?.GitFork
+// Row and header icons, tooltips and the merge popover; each is undefined on an SDK without it
+// (the pane then draws the icon, uses the native title, or shows the pick under the graph).
+const TabIcon = sdk.icons?.ExternalLink
+const RefreshIcon = sdk.icons?.RefreshCwIcon || sdk.icons?.RefreshCw
+const Codicon = sdk.Codicon
+const Tip = sdk.Tip
+const Popover = sdk.Popover
+const PopoverTrigger = sdk.PopoverTrigger
+const PopoverContent = sdk.PopoverContent
 
 `
 
@@ -54,6 +63,13 @@ const _plugin = createChatTree({
   DropdownMenuContent,
   reasoningEffortLabel,
   BranchIcon,
+  TabIcon,
+  RefreshIcon,
+  Codicon,
+  Tip,
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
   setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
   clearTimeout: (id) => globalThis.clearTimeout(id),
 })
