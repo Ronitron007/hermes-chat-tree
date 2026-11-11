@@ -3133,14 +3133,15 @@ test('the view toggle: Exchanges by default, Branches shows one row per chat, a 
   let tree = ctx.pane.render();
   const toggle = byAttr(tree, 'data-mode-toggle')[0];
   assert.ok(toggle);
-  const button = (t, mode) => byAttr(t, 'data-mode', mode)[0];
-  assert.deepEqual([button(tree, 'exchanges').props['aria-pressed'], button(tree, 'branches').props['aria-pressed']], [true, false]);
+  const flip = (t) => byAttr(t, 'data-mode-toggle')[0];
+  assert.equal(flip(tree).props['aria-pressed'], false);
+  assert.equal(flip(tree).props['data-mode'], 'exchanges');
   assert.deepEqual(nodeKeys(tree), MAIN_KEYS);
-  button(tree, 'branches').props.onClick();
+  flip(tree).props.onClick();
   tree = ctx.pane.render();
   assert.equal(ctx.tree.$ui.get().mode, 'branches');
   assert.equal(ctx.storage.map.get(mod.MODE_KEY), 'branches');
-  assert.deepEqual(button(tree, 'branches').props['aria-pressed'], true);
+  assert.equal(flip(tree).props['aria-pressed'], true);
   assert.deepEqual(nodeKeys(tree), []);
   assert.deepEqual(nameRows(tree).map((n) => n.props['data-name-row']), ['root', 'b3', 'b1', 'b2']);
   const open = nameRows(tree).find((n) => n.props['data-open']);
@@ -3151,7 +3152,7 @@ test('the view toggle: Exchanges by default, Branches shows one row per chat, a 
   await flush();
   assert.deepEqual(ctx.host.opened, [['b3', { intent: 'in-place', profile: 'default' }]]);
   assert.equal(ctx.tree.$ui.get().open, null);
-  button(ctx.pane.render(), 'exchanges').props.onClick();
+  byAttr(ctx.pane.render(), 'data-mode-toggle')[0].props.onClick();
   assert.deepEqual(nodeKeys(ctx.pane.render()), MAIN_KEYS);
   // The stored mode comes back on the next activation.
   ctx.unload();
@@ -3182,11 +3183,11 @@ test('name rows and the Branches view keep the hook order (React error 300)', as
   const states = [order()];
   nameRows(ctx.pane.render())[0].props.onMouseEnter();
   states.push(order()); // a hovered name row
-  byAttr(ctx.pane.render(), 'data-mode', 'branches')[0].props.onClick();
+  byAttr(ctx.pane.render(), 'data-mode-toggle')[0].props.onClick();
   states.push(order()); // the Branches view
   nameRows(ctx.pane.render())[1].props.onMouseEnter();
   states.push(order());
-  byAttr(ctx.pane.render(), 'data-mode', 'exchanges')[0].props.onClick();
+  byAttr(ctx.pane.render(), 'data-mode-toggle')[0].props.onClick();
   states.push(order()); // back
   for (const s of states) {
     assert.equal(s.length, 8);

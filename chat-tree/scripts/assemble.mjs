@@ -38,6 +38,7 @@ const BranchIcon = sdk.icons?.GitForkIcon || sdk.icons?.GitFork
 // (the pane then draws the icon, uses the native title, or shows the pick under the graph).
 const TabIcon = sdk.icons?.ExternalLink
 const RefreshIcon = sdk.icons?.RefreshCwIcon || sdk.icons?.RefreshCw
+const ViewIcon = sdk.icons?.GitBranchIcon || sdk.icons?.GitBranch
 const Codicon = sdk.Codicon
 const Tip = sdk.Tip
 const Popover = sdk.Popover
@@ -65,6 +66,7 @@ const _plugin = createChatTree({
   BranchIcon,
   TabIcon,
   RefreshIcon,
+  ViewIcon,
   Codicon,
   Tip,
   Popover,
