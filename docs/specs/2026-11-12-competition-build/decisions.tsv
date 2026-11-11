@@ -43,3 +43,6 @@ date	decision	why	evidence	result	by
 2026-11-12 02:06	The merge target is a dropdown; its path lights in the hover colour only while the dropdown is in use	Ancestors often share a title; Rohan's rule	chat with Rohan	chosen; replaces the chips and the standing dashed lane	Rohan
 2026-11-12 02:12	history.read returns one lineage, skips hidden and archived chats, and caps the text	End-of-build review finding	chat-tree/__init__.py	chosen	Claude
 2026-11-12 02:12	Branch cuts at branch_index + 1 from the rows Hermes branches from	The visible history can drop rows that Hermes counts	methods_session_branch.py:21-25, :104-108	chosen	Claude
+2026-11-12 02:16	Merge and branch live as row icon actions with a two-step merge pick and a result line	Rohan chose the proposal of docs/research/2026-11-12-merge-ui-proposal.md	PR 45	chosen	Rohan
+2026-11-12 02:22	Make the repo public	The catalog loads the repo at the pinned SHA; gitleaks found no leaks	gitleaks over 86 commits	done	Rohan
+2026-11-12 02:41	Show branch names with a name row at each fork, and add a Branches mode	Options in docs/research/2026-11-12-branch-names.md	Brief D	chosen	Rohan
