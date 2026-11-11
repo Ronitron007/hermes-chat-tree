@@ -1,6 +1,6 @@
 name: chat-tree
 title: Chat Tree
-repo: https://github.com/Ronitron007/hermes-concept-links
+repo: https://github.com/Ronitron007/hermes-chat-tree
 sha: "0000000000000000000000000000000000000000"
 subdir: chat-tree
 description: >-
@@ -40,7 +40,7 @@ tier: community
 category: desktop
 requires_hermes: ">=0.23"
 version: "0.1.0"
-docs_url: https://github.com/Ronitron007/hermes-concept-links/tree/main/chat-tree#readme
+docs_url: https://github.com/Ronitron007/hermes-chat-tree/tree/outbox/competition-entry/chat-tree#readme
 readme: true
 platforms: []
 known_issues:
