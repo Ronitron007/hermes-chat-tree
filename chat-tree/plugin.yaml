@@ -1,0 +1,11 @@
+name: chat-tree
+label: Chat Tree
+version: 0.1.0
+author: Rohan Malik
+license: MIT
+description: >
+  A git-graph tree of the open chat, its forks and its side chats, in a side
+  pane. Each node is one exchange. Blue marks the path to the open node and
+  grey marks the rest. A click opens that node's chat. Desktop only
+  (desktop/plugin.js); no agent tools, hooks, middleware or env vars.
+requires_hermes: ">=0.23"
