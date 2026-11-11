@@ -33,6 +33,7 @@ const DropdownMenu = sdk.DropdownMenu
 const DropdownMenuTrigger = sdk.DropdownMenuTrigger
 const DropdownMenuContent = sdk.DropdownMenuContent
 const reasoningEffortLabel = sdk.reasoningEffortLabel
+const BranchIcon = sdk.icons?.GitForkIcon || sdk.icons?.GitFork
 
 `
 
@@ -52,6 +53,7 @@ const _plugin = createChatTree({
   DropdownMenuTrigger,
   DropdownMenuContent,
   reasoningEffortLabel,
+  BranchIcon,
   setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
   clearTimeout: (id) => globalThis.clearTimeout(id),
 })

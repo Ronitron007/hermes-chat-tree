@@ -18,6 +18,8 @@
 export const PLUGIN_ID = 'chat-tree';
 export const PANE_ID = 'pane';
 export const REFRESH_MS = 15_000;
+// How long a Branch on another chat waits for that chat to open before it gives up.
+export const PENDING_BRANCH_MS = 20_000;
 // Gateway events that change the tree. The pane reloads soon after one (debounced) instead of at
 // the next REFRESH_MS tick. Names from hermes-agent apps/desktop/src/app/session/hooks/use-message-stream/
 // gateway-event/: sessions.changed (lifecycle.ts:80, the change watcher's session-store broadcast),
@@ -52,14 +54,14 @@ export const CURVE_R = 5;
 // pane still draws where the variables are missing. A role takes the token Hermes uses for that job
 // (paths in hermes-agent/apps/desktop/src):
 // - active (the open node's path, its fill, the open row band and left accent, the merge target
-//   lane): --ui-accent, the brand-accent stroke (styles.css:240, from midground, themes/types.ts:34-39).
-//   Hermes marks the active pane and tab with it (components/pane-shell/tree/renderer/tree-group.tsx:1214,
-//   components/ui/pane-tab.tsx:49).
+//   lane): --dt-primary, the theme's primary colour (styles.css:429, from --theme-primary). It carries
+//   the user's chosen accent (themes/context.tsx:168, :342). --ui-accent is not used: it is
+//   --theme-midground, a neutral (styles.css:240), so the active path looked like the hover path.
 // - inactive: --dt-muted-foreground, the muted text token (styles.css:426, text-muted-foreground at styles.css:133).
 // - hover: --dt-foreground, the text token (styles.css:422, text-foreground at styles.css:129). Hermes
 //   lifts muted text to it on hover (hover:text-foreground). The row hover fill (bg-muted,
 //   styles.css:425) is too faint for a line.
-export const ACCENT = 'var(--ui-accent, #3B82F6)';
+export const ACCENT = 'var(--dt-primary, #3B82F6)';
 export const MUTED = 'var(--dt-muted-foreground, #6B7280)';
 export const HOVER = 'var(--dt-foreground, currentColor)';
 export const ROLE_COLOURS = { active: ACCENT, hover: HOVER, inactive: MUTED };
@@ -532,7 +534,9 @@ function fitReadout(state) {
 
 // One line, at most `max` characters, with an ellipsis when cut.
 export function shortLabel(text, max = LABEL_MAX) {
-  const line = typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '';
+  // Markup the reader never sees in the chat: HTML comments and leading quote marks.
+  const raw = typeof text === 'string' ? text.replace(/<!--[\s\S]*?-->/g, ' ').replace(/^(\s*>)+\s*/, '') : '';
+  const line = raw.replace(/\s+/g, ' ').trim();
   if (!line) return '(no text)';
   return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
 }
@@ -870,12 +874,20 @@ export function planGraph(lanes, options = {}) {
   }
   const hover = pathFrom(hoverAt);
 
-  // Branch here: every answered exchange of the focused chat, on the node that draws it.
-  const branchable = new Set();
+  // Branch here: every answered exchange in the tree, on the node that draws it. The value is the
+  // chat that branches there (branchFrom): the focused chat for its own path, else the chat that
+  // owns the node. Hermes branches only a loaded chat, so the pane opens that chat first.
+  const branchable = new Map();
   if (focused) {
     focused.exchanges.forEach((ex, i) => {
       const at = str(ex.reply) ? resolve(focused.id, i) : null;
-      if (at) branchable.add(nodeKey(at.lane, at.index));
+      if (at) branchable.set(nodeKey(at.lane, at.index), focused.id);
+    });
+  }
+  for (const lane of list) {
+    lane.exchanges.forEach((ex, i) => {
+      const at = str(ex.reply) ? resolve(lane.id, i) : null;
+      if (at && !branchable.has(nodeKey(at.lane, at.index))) branchable.set(nodeKey(at.lane, at.index), at.lane);
     });
   }
   // Fork digests, joined per node when two chats forked at one shared exchange.
@@ -911,6 +923,7 @@ export function planGraph(lanes, options = {}) {
       first: false,
       target: lane.id === mergeLane,
       branchable: branchable.has(key),
+      branchFrom: branchable.get(key) ?? null,
       digest: digestOf.get(key) ?? null,
       stub: false,
     });
@@ -931,6 +944,7 @@ export function planGraph(lanes, options = {}) {
       first: false,
       target: lane.id === mergeLane,
       branchable: false,
+      branchFrom: null,
       digest: null,
       stub: true,
     });
@@ -1164,12 +1178,36 @@ const PILL = {
 
 // A small action button inside a one-line row, and a merge target chip.
 const ROW_ACTION = { ...SELECTABLE, flex: '0 0 auto', fontSize: 10, lineHeight: '14px', padding: '0 4px' };
-const CHIP = { ...SELECTABLE, maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+const CHIP = { ...SELECTABLE, maxWidth: 140, minWidth: 0, justifyContent: 'flex-start' };
+const TARGET_SELECT = {
+  ...SELECTABLE,
+  maxWidth: 240,
+  minWidth: 0,
+  fontSize: 12,
+  padding: '2px 4px',
+  borderRadius: 4,
+  color: 'inherit',
+  background: 'var(--dt-card, transparent)',
+  border: '1px solid var(--dt-border, #3f3f46)',
+};
+// The Branch label: Hermes's GitBranch icon (sdk.icons) next to the word, or a drawn one.
+// Hermes's own Branch in new chat button draws GitForkIcon at size-3.5, 14 px
+// (components/assistant-ui/thread/assistant-message.tsx:1418); the SDK exports it as icons.GitForkIcon.
+const BRANCH_GLYPH = { flex: '0 0 auto', width: 14, height: 14 };
+// How an ancestor relates to the open chat, so two ancestors with one title stay apart.
+export function targetRelation(i, count) {
+  if (i === 0) return count === 1 ? 'Parent (root)' : 'Parent';
+  if (i === count - 1) return 'Root';
+  return i === 1 ? 'Grandparent' : `Ancestor ${i + 1}`;
+}
+// The SDK Button centres its children, so the ellipsis lives on an inner span that starts at the left.
+const CHIP_TEXT = { ...SELECTABLE, display: 'block', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
 const INPUT_STYLE = { ...SELECTABLE, width: '100%', boxSizing: 'border-box' };
 
 export function createChatTree(deps) {
   const { host, jsx, jsxs, atom, useValue, Button, ScrollArea } = deps;
   const Input = deps.Input ?? 'input';
+  const BranchIcon = deps.BranchIcon ?? null;
   // Hermes's model picker, as the kanban plugin uses it: ModelCatalogMenu inside DropdownMenu,
   // DropdownMenuTrigger and DropdownMenuContent (all SDK exports). null when the SDK lacks one:
   // the Branch form then says so and sends no override.
@@ -1201,7 +1239,7 @@ export function createChatTree(deps) {
   // The node rows under the pointer and under keyboard focus: { pointer, focus } node keys, in
   // memory only. The pointer's node gets the hover path; either one reveals its Branch button.
   // Only SVG colours and those buttons change: nothing is read again.
-  const freshHover = () => ({ pointer: null, focus: null });
+  const freshHover = () => ({ pointer: null, focus: null, target: null });
   const $hover = atom(freshHover());
   // Stand-in so the pane calls useValue the same number of times when host.state lacks an atom.
   const $none = atom(null);
@@ -1399,6 +1437,7 @@ export function createChatTree(deps) {
     next.branchIds = now.branchIds;
     next.digests = storage ? { ...now.digests, ...readDigests(next.exchanges) } : now.digests;
     $data.set(next);
+    settlePendingBranch();
     $status.set({
       loading: false,
       error: errors.length ? errors.join('\n') : null,
@@ -1824,6 +1863,50 @@ export function createChatTree(deps) {
 
   // A new form has nothing picked: the branch keeps this chat's model until the user picks one.
   // model: the picked choice (EMPTY_CHOICE). picking: the model picker is open.
+  function branchLabel() {
+    const icon = BranchIcon
+      ? jsx(BranchIcon, { size: 14, style: BRANCH_GLYPH, 'aria-hidden': 'true' }, 'icon')
+      : jsxs('svg', {
+          // Tabler's git-fork outline, the icon Hermes uses, for a Hermes without sdk.icons.
+          viewBox: '0 0 24 24', style: BRANCH_GLYPH, fill: 'none', stroke: 'currentColor', strokeWidth: 2,
+          strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true',
+          children: [
+            jsx('circle', { cx: 12, cy: 18, r: 2 }, 'a'),
+            jsx('circle', { cx: 7, cy: 6, r: 2 }, 'b'),
+            jsx('circle', { cx: 17, cy: 6, r: 2 }, 'c'),
+            jsx('path', { d: 'M7 8v2a2 2 0 0 0 2 2h6a2 2 0 0 0 2 -2v-2' }, 'd'),
+            jsx('path', { d: 'M12 12l0 4' }, 'e'),
+          ],
+        }, 'icon');
+    return jsxs('span', { style: { ...SELECTABLE, display: 'inline-flex', alignItems: 'center', gap: 3 }, children: [icon, 'Branch'] });
+  }
+
+  // Branch on a node of another chat opens that chat first, then the form once it is the open chat.
+  let pendingBranch = null;
+  function branchAt(row, actions) {
+    if (!row?.branchFrom) return;
+    if (row.branchFrom === actions?.openId) {
+      if (!actions.busy) openBranchForm(actions.openId, row.index, row.label);
+      return;
+    }
+    pendingBranch = { chatId: row.branchFrom, index: row.index, label: row.label, at: Date.now() };
+    selectNode(row.branchFrom, row.index);
+  }
+  // Called after each load: the chat a pending Branch opened is now open, so show its form.
+  function settlePendingBranch() {
+    if (!pendingBranch) return;
+    if (Date.now() - pendingBranch.at > PENDING_BRANCH_MS) {
+      pendingBranch = null;
+      return;
+    }
+    const { open } = currentView();
+    if (open && open.id === pendingBranch.chatId && runtimeId()) {
+      const { chatId, index, label } = pendingBranch;
+      pendingBranch = null;
+      openBranchForm(chatId, index, label);
+    }
+  }
+
   function openBranchForm(chatId, index, label) {
     setUi({ branch: { chatId, index, label, question: '', model: EMPTY_CHOICE, picking: false, busy: false, error: null } });
   }
@@ -1883,8 +1966,8 @@ export function createChatTree(deps) {
       const now = $ui.get().branch;
       if (alive() && now) setUi({ branch: { ...now, busy: false, error } });
     };
+    // The question is optional: with none, the branch is made and opened, and the user types there.
     const question = str(form.question);
-    if (!question) return fail('Type a question for the branch.');
     const { open } = currentView();
     const runtime = runtimeId();
     if (!open || open.id !== form.chatId || !runtime) return fail('The open chat changed. Click Branch on a node again.');
@@ -1917,15 +2000,17 @@ export function createChatTree(deps) {
     // The new fork shows at once: its stub node until its first exchange lands.
     reload();
 
-    // Nothing picked keeps the chat's own model: no override at all.
-    const override = modelOverride(form.model);
-    const submit = { session_id: sessionId, text: question, ...(override ? { model_override: override } : {}) };
-    try {
-      await host.request('prompt.submit', submit);
-    } catch (error) {
-      return fail(`The branch was made, but the question was not sent: ${errorText(error)}`);
+    if (question) {
+      // Nothing picked keeps the chat's own model: no override at all.
+      const override = modelOverride(form.model);
+      const submit = { session_id: sessionId, text: question, ...(override ? { model_override: override } : {}) };
+      try {
+        await host.request('prompt.submit', submit);
+      } catch (error) {
+        return fail(`The branch was made, but the question was not sent: ${errorText(error)}`);
+      }
+      if (!alive()) return;
     }
-    if (!alive()) return;
     setUi({ branch: null });
     openChat(storedId, 'in-place');
     const fixed = exchangesFromRows(rows)
@@ -1973,7 +2058,7 @@ export function createChatTree(deps) {
     if (model) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'model', children: modelName(model) }, 'model'));
     if (row.first && lane.side) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'side', children: 'side' }, 'side'));
     const shown = row.open || row.key === actions.hover?.pointer || row.key === actions.hover?.focus;
-    if (row.branchable && actions.openId && !shown) {
+    if (row.branchable && !shown) {
       children.push(
         jsx(
           Button,
@@ -1986,12 +2071,12 @@ export function createChatTree(deps) {
             'aria-hidden': 'true',
             disabled: true,
             'data-branch-slot': row.key,
-            children: 'Branch',
+            children: branchLabel(),
           },
           'branch',
         ),
       );
-    } else if (row.branchable && actions.openId) {
+    } else if (row.branchable) {
       children.push(
         jsx(
           Button,
@@ -2001,14 +2086,14 @@ export function createChatTree(deps) {
             variant: 'ghost',
             style: ROW_ACTION,
             'data-branch-here': row.key,
-            disabled: actions.busy,
-            title: actions.busy ? BRANCH_BUSY_TEXT : 'Branch here: fork this chat after this exchange and ask the branch a question.',
+            disabled: row.branchFrom === actions.openId && actions.busy,
+            title: row.branchFrom === actions.openId && actions.busy ? BRANCH_BUSY_TEXT : 'Branch here: fork this chat after this exchange and ask the branch a question.',
             onClick: (event) => {
               stop(event);
-              if (!actions.busy) openBranchForm(actions.openId, row.index, row.label);
+              branchAt(row, actions);
             },
             onKeyDown: stop,
-            children: 'Branch',
+            children: branchLabel(),
           },
           'branch',
         ),
@@ -2266,7 +2351,7 @@ export function createChatTree(deps) {
         onClick: stop,
         children: [
           jsx('p', { className: 'text-xs font-semibold', style: SELECTABLE, 'data-selectable-text': 'true', children: `Branch here: ${form.label}` }, 'head'),
-          field('question', 'Question for the branch', {
+          field('question', 'Question for the branch (optional)', {
             onKeyDown: (event) => {
               stopHostEvent(event);
               if (event?.key === 'Enter' && !event.shiftKey) {
@@ -2291,7 +2376,7 @@ export function createChatTree(deps) {
                     stop(event);
                     return submit();
                   },
-                  children: 'Branch and ask',
+                  children: str(form.question) ? 'Branch and ask' : 'Branch',
                 }),
                 jsx(Button, {
                   type: 'button',
@@ -2412,25 +2497,36 @@ export function createChatTree(deps) {
                   'aria-label': 'Merge target',
                   children: [
                     jsx('span', { className: 'text-xs opacity-70', style: SELECTABLE, 'data-selectable-text': 'true', children: 'into:' }, 'into'),
-                    ...targets.map((t) =>
-                      jsx(
-                        Button,
-                        {
-                          type: 'button',
-                          size: 'xs',
-                          variant: t.id === target?.id ? 'secondary' : 'ghost',
-                          style: CHIP,
-                          title: t.title,
-                          'aria-pressed': t.id === target?.id,
-                          'data-merge-target': t.id,
-                          onClick: (event) => {
-                            stop(event);
-                            pickTarget(open.id, t.id);
-                          },
-                          children: t.title,
+                    // A dropdown, because ancestors often share a title. Its lane lights up in the hover
+                    // colour only while the user works with the dropdown (Rohan, 2026-11-12 02:15).
+                    jsx(
+                      'select',
+                      {
+                        value: target?.id ?? '',
+                        style: TARGET_SELECT,
+                        title: target?.title ?? '',
+                        'aria-label': 'Merge into',
+                        'data-merge-target-select': 'true',
+                        'data-selectable-text': 'true',
+                        onChange: (event) => {
+                          const id = str(event?.target?.value);
+                          if (!id) return;
+                          pickTarget(open.id, id);
+                          hoverSet('target', id);
                         },
-                        t.id,
-                      ),
+                        onFocus: () => hoverSet('target', target?.id ?? null),
+                        onBlur: () => hoverSet('target', null),
+                        onMouseEnter: () => hoverSet('target', target?.id ?? null),
+                        onMouseLeave: (event) => {
+                          if (globalThis.document?.activeElement !== event?.currentTarget) hoverSet('target', null);
+                        },
+                        onKeyDown: stop,
+                        onClick: stop,
+                        children: targets.map((t, i) =>
+                          jsx('option', { value: t.id, style: SELECTABLE, 'data-selectable-text': 'true', 'data-merge-target': t.id, children: `${targetRelation(i, targets.length)} · ${t.title}` }, t.id),
+                        ),
+                      },
+                      'select',
                     ),
                   ],
                 },
@@ -2500,7 +2596,10 @@ export function createChatTree(deps) {
     const open = tree ? (lanes.find((lane) => lane.id === tree.focused.id) ?? null) : null;
     const targets = open ? mergeTargets(lanes, open.id) : [];
     const target = open ? selectedTarget(targets, ui.target, open.id) : null;
-    const plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded, target: target?.id, digests: data.digests, hovered: hover.pointer });
+    // The target lights up only while the dropdown is in use: its last exchange takes the hover path.
+    const previewLane = hover.target ? lanes.find((lane) => lane.id === hover.target) : null;
+    const preview = previewLane && previewLane.exchanges.length ? `${previewLane.id}:${previewLane.exchanges.length - 1}` : null;
+    const plan = planGraph(lanes, { focusedId: tree?.focused?.id, open: ui.open, expanded: ui.expanded, digests: data.digests, hovered: hover.pointer ?? preview });
     const agents = runtime && data.agentsFor === runtime ? data.agents : [];
     const busy = open ? chatBusy(busyMap, [runtime, open.id]) : false;
     const form = ui.branch && open && ui.branch.chatId === open.id ? ui.branch : null;
