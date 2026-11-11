@@ -40,7 +40,16 @@ export const WORKSPACE_VIEWPORT = '[data-session-anchor="workspace"] [data-slot=
 const TURN_PAIR = '[data-slot="aui_turn-pair"]';
 export const REVEAL_POLL_MS = 100;
 export const REVEAL_WAIT_MS = 5_000;
-export const REVEAL_SETTLE_MS = 150;
+// Hermes sets this attribute on the chat surface while a chat switch places its transcript
+// (components/assistant-ui/thread/session-switching.ts:1-38). The reveal waits for it to go, at
+// most REVEAL_SWITCH_WAIT_MS, then sends anyway.
+export const CHAT_SURFACE = '[data-chat-surface]';
+export const SWITCHING_ATTR = 'data-session-switching';
+export const REVEAL_SWITCH_WAIT_MS = 5_000;
+// After the scroll, each animation frame measures the turn again and corrects the scroll. It
+// stops after REVEAL_STABLE_FRAMES frames with no change, or after REVEAL_FRAMES frames.
+export const REVEAL_STABLE_FRAMES = 2;
+export const REVEAL_FRAMES = 20;
 export const REVEAL_RETRY_MS = 400;
 export const REVEAL_RETRIES = 2;
 export const REVEAL_TIMEOUT_MS = 15_000;
@@ -1560,6 +1569,14 @@ export function createChatTree(deps) {
     return () => clear(id);
   }
 
+  // One animation frame (deps.requestAnimationFrame in tests). ctx has no frame timer; callers
+  // check that they are still live when the frame runs.
+  function nextFrame(fn) {
+    if (typeof deps.requestAnimationFrame === 'function') return void deps.requestAnimationFrame(fn);
+    if (typeof globalThis.requestAnimationFrame === 'function') return void globalThis.requestAnimationFrame(fn);
+    schedule(fn, 16);
+  }
+
   // ── ctx.storage (write copied from side-chat; best effort, a store that throws never breaks the pane) ──
 
   const write = (key, value) => {
@@ -1913,23 +1930,30 @@ export function createChatTree(deps) {
     revealing = controller;
     const live = () => !disposed && !controller.signal.aborted;
     let waits = 0;
+    let holds = 0;
     let misses = 0;
     // Wait for the main chat to show the clicked chat; openSession settles before it renders.
+    // Then wait while its surface is switching: the scroll restore of a switch runs up to 15
+    // frames and can end with a scroll to the bottom (thread/list.tsx:1140-1146), after a reveal.
     const attempt = () => {
       if (!live()) return;
       const viewport = atomOf('focusedStoredSessionId').get() === chatId ? doc.querySelector(WORKSPACE_VIEWPORT) : null;
-      if (viewport) {
-        schedule(() => live() && send(viewport), REVEAL_SETTLE_MS);
+      if (!viewport) {
+        if (++waits < REVEAL_WAIT_MS / REVEAL_POLL_MS) schedule(attempt, REVEAL_POLL_MS);
         return;
       }
-      if (++waits < REVEAL_WAIT_MS / REVEAL_POLL_MS) schedule(attempt, REVEAL_POLL_MS);
+      if (switching(viewport) && ++holds < REVEAL_SWITCH_WAIT_MS / REVEAL_POLL_MS) {
+        schedule(attempt, REVEAL_POLL_MS);
+        return;
+      }
+      send(viewport);
     };
     const send = (viewport) => {
       let settled = false;
       const complete = (revealed) => {
         if (settled || !live()) return;
         settled = true;
-        if (revealed) return scrollToTurn(viewport, revealed);
+        if (revealed) return scrollToTurn(viewport, revealed, live);
         // A miss right after the switch can be the old chat's rows: try again a little later.
         if (++misses <= REVEAL_RETRIES) schedule(attempt, REVEAL_RETRY_MS);
       };
@@ -1945,17 +1969,53 @@ export function createChatTree(deps) {
     attempt();
   }
 
-  function scrollToTurn(viewport, revealedId) {
+  // True while the viewport's chat surface holds the switching attribute.
+  const switching = (viewport) => {
     try {
-      const escape = globalThis.CSS?.escape ?? ((s) => String(s).replace(/["\\]/g, '\\$&'));
+      return Boolean(viewport.closest?.(CHAT_SURFACE)?.hasAttribute?.(SWITCHING_ATTR));
+    } catch {
+      return false;
+    }
+  };
+
+  // Puts the turn 8px under the top of the viewport. A direct scrollTop write, never a smooth
+  // scroll: a later write stops a smooth scroll short. Turns not drawn yet keep a 37.5rem
+  // placeholder height (thread/list.tsx:468-473), so the turn moves when they draw. Each frame
+  // after the write measures the turn again and corrects scrollTop by its offset.
+  function scrollToTurn(viewport, revealedId, live) {
+    const escape = globalThis.CSS?.escape ?? ((s) => String(s).replace(/["\\]/g, '\\$&'));
+    // Measures the turn and corrects scrollTop. true: scrollTop moved 1px or more. false: no
+    // change. null: the turn is gone.
+    const correct = () => {
       const node = viewport.querySelector(`[data-message-id="${escape(revealedId)}"]`);
       const turn = node?.closest?.(TURN_PAIR) ?? node;
-      if (!turn?.getBoundingClientRect) return;
-      const top = viewport.scrollTop + turn.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 8;
-      viewport.scrollTo?.({ top: Math.max(0, top), behavior: 'smooth' });
+      if (!turn?.getBoundingClientRect) return null;
+      const offset = turn.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 8;
+      const before = viewport.scrollTop;
+      if (Math.abs(offset) >= 1) viewport.scrollTop = Math.max(0, before + offset);
+      // At the end of the chat the write moves nothing: that counts as no change.
+      return Math.abs(viewport.scrollTop - before) >= 1;
+    };
+    let frames = 0;
+    let stable = 0;
+    const frame = () => {
+      if (!live()) return;
+      try {
+        const moved = correct();
+        if (moved === null) return;
+        stable = moved ? 0 : stable + 1;
+      } catch {
+        return;
+      }
+      if (stable < REVEAL_STABLE_FRAMES && ++frames < REVEAL_FRAMES) nextFrame(frame);
+    };
+    try {
+      if (correct() === null) return;
     } catch {
       // Markup that changed under us: the chat stays opened.
+      return;
     }
+    nextFrame(frame);
   }
   // The view toggle: remembered in $ui and in ctx.storage (best effort).
   const setMode = (mode) => {

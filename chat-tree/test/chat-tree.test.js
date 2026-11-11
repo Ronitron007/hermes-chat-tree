@@ -2658,19 +2658,33 @@ const withRowIds = (list, first) => list.map((m, i) => ({ ...m, row_id: first + 
 const HIST_ROWS = Object.fromEntries(Object.entries(HIST).map(([id, list], n) => [id, withRowIds(list, 10 + n * 100)]));
 
 // The main chat's viewport, as the chat thread renders it: dispatchEvent reaches the reveal
-// listener; querySelector finds the revealed message; closest finds its turn.
-function fakeViewport({ answer } = {}) {
+// listener; querySelector finds the revealed message; closest finds its turn and the chat
+// surface. The turn sits geometry.rowY px down the content, so its top moves with scrollTop.
+// writes: each scrollTop write. smooth: each scrollTo call (the reveal makes none).
+function fakeViewport({ answer, surface = null } = {}) {
   const events = [];
-  const scrolls = [];
-  const turn = { getBoundingClientRect: () => ({ top: 500 }) };
+  const writes = [];
+  const smooth = [];
+  const geometry = { rowY: 550 };
+  let top = 100;
+  const turn = { getBoundingClientRect: () => ({ top: 50 + geometry.rowY - top }) };
   const message = { closest: (sel) => (sel === '[data-slot="aui_turn-pair"]' ? turn : null) };
   const viewport = {
-    scrollTop: 100,
+    get scrollTop() {
+      return top;
+    },
+    set scrollTop(value) {
+      top = value;
+      writes.push(value);
+    },
     events,
-    scrolls,
+    writes,
+    smooth,
+    geometry,
     getBoundingClientRect: () => ({ top: 50 }),
     querySelector: (sel) => (sel.startsWith('[data-message-id=') ? message : null),
-    scrollTo: (opts) => scrolls.push(opts),
+    closest: (sel) => (sel === mod.CHAT_SURFACE ? surface : null),
+    scrollTo: (opts) => smooth.push(opts),
     dispatchEvent(event) {
       events.push(event);
       if (answer) answer(event.detail);
@@ -2678,6 +2692,24 @@ function fakeViewport({ answer } = {}) {
     },
   };
   return viewport;
+}
+// The [data-chat-surface] element around the viewport: Hermes sets and removes its attributes.
+function fakeSurface(attrs = []) {
+  const set = new Set(attrs);
+  return { attrs: set, hasAttribute: (name) => set.has(name) };
+}
+// requestAnimationFrame as the tests drive it: run() runs the frames queued so far, as one frame does.
+function fakeFrames() {
+  let queue = [];
+  return {
+    request: (fn) => queue.push(fn),
+    pending: () => queue.length,
+    run() {
+      const now = queue;
+      queue = [];
+      now.forEach((fn) => fn());
+    },
+  };
 }
 const fakeDocument = (viewport) => {
   const asked = [];
@@ -2701,7 +2733,7 @@ test('a node click reveals its exchange in the main chat and scrolls the turn in
   await ctx.clock.tick(mod.REVEAL_POLL_MS);
   assert.equal(viewport.events.length, 0);
   ctx.host.state.focusedStoredSessionId.set('b1');
-  await ctx.clock.tick(mod.REVEAL_POLL_MS + mod.REVEAL_SETTLE_MS);
+  await ctx.clock.tick(mod.REVEAL_POLL_MS);
   assert.ok(document.asked.includes(mod.WORKSPACE_VIEWPORT));
   assert.equal(viewport.events.length, 1);
   const [event] = viewport.events;
@@ -2711,8 +2743,9 @@ test('a node click reveals its exchange in the main chat and scrolls the turn in
   assert.equal(event.detail.id, 'history:114');
   assert.equal(typeof event.detail.complete, 'function');
   assert.equal(event.detail.signal.aborted, false);
-  // scrollTop 100 + turn top 500 - viewport top 50 - 8.
-  assert.deepEqual(viewport.scrolls, [{ top: 542, behavior: 'smooth' }]);
+  // scrollTop 100 + turn top 500 - viewport top 50 - 8, written at once: no smooth scroll.
+  assert.deepEqual(viewport.writes, [542]);
+  assert.deepEqual(viewport.smooth, []);
   ctx.unload();
 });
 
@@ -2724,7 +2757,7 @@ test('a miss right after the switch is tried again, then given up', async () => 
   nodeOf(ctx.pane.render(), 'b1:2').props.onClick();
   await ctx.clock.tick(5_000);
   assert.equal(viewport.events.length, 1 + mod.REVEAL_RETRIES);
-  assert.deepEqual(viewport.scrolls, []);
+  assert.deepEqual(viewport.writes, []);
   ctx.unload();
 });
 
@@ -2767,17 +2800,100 @@ test('a second click aborts the first reveal', async () => {
   await flush();
   ctx.host.state.focusedStoredSessionId.set('b1');
   nodeOf(ctx.pane.render(), 'b1:2').props.onClick();
-  await ctx.clock.tick(mod.REVEAL_SETTLE_MS);
   const first = viewport.events[0].detail;
   nodeOf(ctx.pane.render(), 'root:0').props.onClick();
   assert.equal(first.signal.aborted, true);
   first.complete('late');
   ctx.host.state.focusedStoredSessionId.set('root');
-  await ctx.clock.tick(mod.REVEAL_POLL_MS + mod.REVEAL_SETTLE_MS);
-  assert.deepEqual(viewport.scrolls, []);
+  await ctx.clock.tick(mod.REVEAL_POLL_MS);
+  assert.deepEqual(viewport.writes, []);
   // root's first user row.
   assert.equal(viewport.events.at(-1).detail.rowId, 10);
   ctx.unload();
+});
+
+test('the reveal waits while the chat surface has data-session-switching, at most REVEAL_SWITCH_WAIT_MS', async () => {
+  const surface = fakeSurface([mod.SWITCHING_ATTR]);
+  const viewport = fakeViewport({ surface });
+  const ctx = setup({ host: fakeHost({ history: HIST_ROWS }), document: fakeDocument(viewport) });
+  await flush();
+  ctx.host.state.focusedStoredSessionId.set('b1');
+  nodeOf(ctx.pane.render(), 'b1:2').props.onClick();
+  // The switch's scroll restore still runs: no reveal yet.
+  await ctx.clock.tick(mod.REVEAL_POLL_MS * 5);
+  assert.equal(viewport.events.length, 0);
+  // Hermes removes the attribute: the next poll sends the reveal.
+  surface.attrs.delete(mod.SWITCHING_ATTR);
+  await ctx.clock.tick(mod.REVEAL_POLL_MS);
+  assert.equal(viewport.events.length, 1);
+  assert.equal(viewport.events[0].detail.rowId, 114);
+  ctx.unload();
+
+  // An attribute that never goes: the reveal is sent once REVEAL_SWITCH_WAIT_MS has passed.
+  const stuck = fakeViewport({ surface: fakeSurface([mod.SWITCHING_ATTR]) });
+  const late = setup({ host: fakeHost({ history: HIST_ROWS }), document: fakeDocument(stuck) });
+  await flush();
+  late.host.state.focusedStoredSessionId.set('b1');
+  nodeOf(late.pane.render(), 'b1:2').props.onClick();
+  await late.clock.tick(mod.REVEAL_SWITCH_WAIT_MS - 2 * mod.REVEAL_POLL_MS);
+  assert.equal(stuck.events.length, 0);
+  await late.clock.tick(2 * mod.REVEAL_POLL_MS);
+  assert.equal(stuck.events.length, 1);
+  late.unload();
+});
+
+test('the scroll corrects on the next frame when the turn moves after the first scroll', async () => {
+  const frames = fakeFrames();
+  const viewport = fakeViewport({ answer: (d) => d.complete('msg-b1-2') });
+  const ctx = setup({ host: fakeHost({ history: HIST_ROWS }), document: fakeDocument(viewport), deps: { requestAnimationFrame: frames.request } });
+  await flush();
+  ctx.host.state.focusedStoredSessionId.set('b1');
+  nodeOf(ctx.pane.render(), 'b1:2').props.onClick();
+  assert.deepEqual(viewport.writes, [542]);
+  // Placeholder turns above draw taller: the turn is now 600px further down.
+  viewport.geometry.rowY += 600;
+  frames.run();
+  assert.deepEqual(viewport.writes, [542, 1142]);
+  // The turn now sits 8px under the top of the viewport.
+  frames.run();
+  frames.run();
+  assert.deepEqual(viewport.writes, [542, 1142]);
+  assert.deepEqual(viewport.smooth, []);
+  ctx.unload();
+});
+
+test('the scroll stops after REVEAL_STABLE_FRAMES frames with no change, and after REVEAL_FRAMES frames at most', async () => {
+  const frames = fakeFrames();
+  const viewport = fakeViewport({ answer: (d) => d.complete('msg-b1-2') });
+  const ctx = setup({ host: fakeHost({ history: HIST_ROWS }), document: fakeDocument(viewport), deps: { requestAnimationFrame: frames.request } });
+  await flush();
+  ctx.host.state.focusedStoredSessionId.set('b1');
+  nodeOf(ctx.pane.render(), 'b1:2').props.onClick();
+  let ran = 0;
+  while (frames.pending()) {
+    frames.run();
+    ran++;
+  }
+  assert.equal(ran, mod.REVEAL_STABLE_FRAMES);
+  assert.deepEqual(viewport.writes, [542]);
+  ctx.unload();
+
+  // A turn that moves on every frame: the loop gives up after REVEAL_FRAMES frames.
+  const moving = fakeFrames();
+  const drift = fakeViewport({ answer: (d) => d.complete('msg-b1-2') });
+  const busy = setup({ host: fakeHost({ history: HIST_ROWS }), document: fakeDocument(drift), deps: { requestAnimationFrame: moving.request } });
+  await flush();
+  busy.host.state.focusedStoredSessionId.set('b1');
+  nodeOf(busy.pane.render(), 'b1:2').props.onClick();
+  let count = 0;
+  while (moving.pending() && count < 100) {
+    drift.geometry.rowY += 10;
+    moving.run();
+    count++;
+  }
+  assert.equal(count, mod.REVEAL_FRAMES);
+  assert.equal(drift.writes.length, 1 + mod.REVEAL_FRAMES);
+  busy.unload();
 });
 
 test('shortLabel drops HTML comments and leading quote marks', () => {
