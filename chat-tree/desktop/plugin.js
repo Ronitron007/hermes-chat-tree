@@ -37,6 +37,16 @@ const REFRESH_MS = 15_000;
 const LIST_LIMIT = 500;
 const MAX_CHATS = 30;
 const SIDE_PREFIX = 'Side: ';
+// Scroll to a clicked exchange through the chat's own reveal event (see revealExchange).
+const REVEAL_EVENT = 'hermes:timeline-reveal';
+const WORKSPACE_VIEWPORT = '[data-session-anchor="workspace"] [data-slot="aui_thread-viewport"]';
+const TURN_PAIR = '[data-slot="aui_turn-pair"]';
+const REVEAL_POLL_MS = 100;
+const REVEAL_WAIT_MS = 5_000;
+const REVEAL_SETTLE_MS = 150;
+const REVEAL_RETRY_MS = 400;
+const REVEAL_RETRIES = 2;
+const REVEAL_TIMEOUT_MS = 15_000;
 const MERGE_HEADER = 'From side chat: ';
 const LABEL_MAX = 60;
 // Graph geometry in px. A row is one exchange; lanes are columns inside the graph column.
@@ -546,6 +556,8 @@ function exchangesFromRows(rows) {
       const header = mergeHeader(user);
       const merge = header === null ? null : normalizeText(header);
       current = { user, reply: '', label: shortLabel(merge === null ? user : `Merged: ${merge || 'side chat'}`), merge };
+      // The user row's durable id: the scroll to this exchange reveals it by row.
+      if (Number.isInteger(row.row_id)) current.rowId = row.row_id;
       out.push(current);
     } else if (row?.role === 'assistant' && current) {
       const text = rowText(row);
@@ -1344,6 +1356,72 @@ function createChatTree(deps) {
   function selectNode(chatId, index) {
     setUi({ open: { chatId, index } });
     openChat(chatId, 'in-place');
+    revealExchange(chatId, index);
+  }
+
+  // ── Scroll to the clicked exchange ────────────────────────────────────────────────────────
+  //
+  // Not SDK surface. The SDK has no scroll API, so this sends the event the chat's own timeline
+  // rail sends (components/assistant-ui/thread/timeline.tsx:148-230) to the main chat's viewport.
+  // Its listener (use-timeline-reveal.ts) finds the row by rowId, loads older rows when needed, and
+  // answers through `complete`. Then this scrolls the turn into view, as the rail does. Rohan
+  // accepted the catalog risk on 2026-11-12. Anything missing (no viewport, no row id, a Hermes
+  // that renamed the event) leaves the chat opened and nothing else.
+  let revealing = null; // the AbortController of the reveal in flight
+  function revealExchange(chatId, index) {
+    revealing?.abort();
+    revealing = null;
+    const rowId = $data.get().exchanges?.[chatId]?.[index]?.rowId;
+    const doc = deps.document ?? globalThis.document;
+    if (!Number.isInteger(rowId) || typeof doc?.querySelector !== 'function') return;
+    if (typeof CustomEvent !== 'function' || typeof AbortController !== 'function') return;
+    const controller = new AbortController();
+    revealing = controller;
+    const live = () => !disposed && !controller.signal.aborted;
+    let waits = 0;
+    let misses = 0;
+    // Wait for the main chat to show the clicked chat; openSession settles before it renders.
+    const attempt = () => {
+      if (!live()) return;
+      const viewport = atomOf('focusedStoredSessionId').get() === chatId ? doc.querySelector(WORKSPACE_VIEWPORT) : null;
+      if (viewport) {
+        schedule(() => live() && send(viewport), REVEAL_SETTLE_MS);
+        return;
+      }
+      if (++waits < REVEAL_WAIT_MS / REVEAL_POLL_MS) schedule(attempt, REVEAL_POLL_MS);
+    };
+    const send = (viewport) => {
+      let settled = false;
+      const complete = (revealed) => {
+        if (settled || !live()) return;
+        settled = true;
+        if (revealed) return scrollToTurn(viewport, revealed);
+        // A miss right after the switch can be the old chat's rows: try again a little later.
+        if (++misses <= REVEAL_RETRIES) schedule(attempt, REVEAL_RETRY_MS);
+      };
+      schedule(() => {
+        if (!settled) controller.abort();
+      }, REVEAL_TIMEOUT_MS);
+      try {
+        viewport.dispatchEvent(new CustomEvent(REVEAL_EVENT, { detail: { id: `history:${rowId}`, rowId, signal: controller.signal, complete } }));
+      } catch {
+        // A viewport that throws on dispatch: the chat stays opened.
+      }
+    };
+    attempt();
+  }
+
+  function scrollToTurn(viewport, revealedId) {
+    try {
+      const escape = globalThis.CSS?.escape ?? ((s) => String(s).replace(/["\\]/g, '\\$&'));
+      const node = viewport.querySelector(`[data-message-id="${escape(revealedId)}"]`);
+      const turn = node?.closest?.(TURN_PAIR) ?? node;
+      if (!turn?.getBoundingClientRect) return;
+      const top = viewport.scrollTop + turn.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 8;
+      viewport.scrollTo?.({ top: Math.max(0, top), behavior: 'smooth' });
+    } catch {
+      // Markup that changed under us: the chat stays opened.
+    }
   }
   const expandRun = (runKey) => setUi({ expanded: { ...$ui.get().expanded, [runKey]: true } });
   // Enter or Space on a focused row acts like a click.
@@ -2199,6 +2277,8 @@ function createChatTree(deps) {
   // Stops the timer and every store listener. Wired to ctx.onDispose.
   function dispose() {
     disposed = true;
+    revealing?.abort();
+    revealing = null;
     generation += 1;
     if (typeof cancelTimer === 'function') cancelTimer();
     cancelTimer = null;

@@ -274,7 +274,7 @@ function fakeStorage(seed = {}) {
 }
 
 // events: false gives a ctx with no onEvent (an older host).
-function setup({ host = fakeHost(), clock = fakeClock(), useValue, storage = fakeStorage(), events = true } = {}) {
+function setup({ host = fakeHost(), clock = fakeClock(), useValue, storage = fakeStorage(), events = true, document } = {}) {
   const registered = [];
   const disposers = [];
   // ctx.onEvent as the desktop gives it: listeners by type, a disposer back.
@@ -294,6 +294,7 @@ function setup({ host = fakeHost(), clock = fakeClock(), useValue, storage = fak
     useValue: useValue ?? ((a) => a.get()),
     Button: 'Button',
     ScrollArea: 'ScrollArea',
+    ...(document ? { document } : {}),
   });
   tree.register({
     register: (c) => registered.push(c),
@@ -2015,10 +2016,13 @@ test('selectable text covers the nodes, pills, the branch form, the merge sectio
   ctx.unload();
 });
 
-test('the pane code never touches host transcript DOM, never sends a draft, and has no imports', async () => {
+test('the pane touches host transcript DOM only to reveal a clicked exchange, never sends a draft, and has no imports', async () => {
   const { readFile } = await import('node:fs/promises');
   const src = await readFile(new URL('../src/chat-tree.js', import.meta.url), 'utf8');
-  assert.doesNotMatch(src, /data-message-/);
+  // The one reach into the chat's markup is scrollToTurn (Rohan, 2026-11-12): it reads, scrolls, never writes.
+  assert.equal(src.match(/data-message-/g).length, 1);
+  assert.match(src, /function scrollToTurn[\s\S]*?\[data-message-id=/);
+  assert.doesNotMatch(src, /\.(innerHTML|textContent|outerHTML)\s*=|\.click\(\)|removeChild|appendChild|setAttribute/);
   // The composer is only ever drafted. The one send is the branch question, by prompt.submit.
   assert.doesNotMatch(src, /composer\.submit|\.submit\(/);
   assert.equal(src.match(/'prompt\.submit'/g).length, 1);
@@ -2129,4 +2133,134 @@ test('parseHistoryReply keeps list histories and string missing ids; no historie
   assert.equal(mod.parseHistoryReply({}), null);
   assert.equal(mod.parseHistoryReply({ histories: [] }), null);
   assert.equal(mod.parseHistoryReply(null), null);
+});
+
+
+// ── Scroll to the clicked exchange ───────────────────────────────────────────────────────────
+
+// Rows with row ids, as session.history and history.read give them: user rows 10, 12, 14 in b1.
+const withRowIds = (list, first) => list.map((m, i) => ({ ...m, row_id: first + i }));
+const HIST_ROWS = Object.fromEntries(Object.entries(HIST).map(([id, list], n) => [id, withRowIds(list, 10 + n * 100)]));
+
+// The main chat's viewport, as the chat thread renders it: dispatchEvent reaches the reveal
+// listener; querySelector finds the revealed message; closest finds its turn.
+function fakeViewport({ answer } = {}) {
+  const events = [];
+  const scrolls = [];
+  const turn = { getBoundingClientRect: () => ({ top: 500 }) };
+  const message = { closest: (sel) => (sel === '[data-slot="aui_turn-pair"]' ? turn : null) };
+  const viewport = {
+    scrollTop: 100,
+    events,
+    scrolls,
+    getBoundingClientRect: () => ({ top: 50 }),
+    querySelector: (sel) => (sel.startsWith('[data-message-id=') ? message : null),
+    scrollTo: (opts) => scrolls.push(opts),
+    dispatchEvent(event) {
+      events.push(event);
+      if (answer) answer(event.detail);
+      return true;
+    },
+  };
+  return viewport;
+}
+const fakeDocument = (viewport) => {
+  const asked = [];
+  return { asked, querySelector: (sel) => (asked.push(sel), viewport ?? null) };
+};
+
+test('exchangesFromRows keeps the row id of each user row, and leaves it out when rows carry none', () => {
+  const list = mod.exchangesFromRows(withRowIds(msgs(['q1', 'a1'], ['q2', 'a2']), 7));
+  assert.deepEqual(list.map((e) => e.rowId), [7, 9]);
+  assert.equal('rowId' in mod.exchangesFromRows(msgs(['q1', 'a1']))[0], false);
+});
+
+test('a node click reveals its exchange in the main chat and scrolls the turn into view', async () => {
+  const viewport = fakeViewport({ answer: (d) => d.complete('msg-b1-2') });
+  const document = fakeDocument(viewport);
+  const ctx = setup({ host: fakeHost({ history: HIST_ROWS }), document });
+  await flush();
+  nodeOf(ctx.pane.render(), 'b1:2').props.onClick();
+  await flush();
+  // Not yet: the main chat still shows b2.
+  await ctx.clock.tick(mod.REVEAL_POLL_MS);
+  assert.equal(viewport.events.length, 0);
+  ctx.host.state.focusedStoredSessionId.set('b1');
+  await ctx.clock.tick(mod.REVEAL_POLL_MS + mod.REVEAL_SETTLE_MS);
+  assert.ok(document.asked.includes(mod.WORKSPACE_VIEWPORT));
+  assert.equal(viewport.events.length, 1);
+  const [event] = viewport.events;
+  assert.equal(event.type, mod.REVEAL_EVENT);
+  // b1's third user row: rows 110..115, user rows 110, 112, 114.
+  assert.equal(event.detail.rowId, 114);
+  assert.equal(event.detail.id, 'history:114');
+  assert.equal(typeof event.detail.complete, 'function');
+  assert.equal(event.detail.signal.aborted, false);
+  // scrollTop 100 + turn top 500 - viewport top 50 - 8.
+  assert.deepEqual(viewport.scrolls, [{ top: 542, behavior: 'smooth' }]);
+  ctx.unload();
+});
+
+test('a miss right after the switch is tried again, then given up', async () => {
+  const viewport = fakeViewport({ answer: (d) => d.complete(false) });
+  const ctx = setup({ host: fakeHost({ history: HIST_ROWS }), document: fakeDocument(viewport) });
+  await flush();
+  ctx.host.state.focusedStoredSessionId.set('b1');
+  nodeOf(ctx.pane.render(), 'b1:2').props.onClick();
+  await ctx.clock.tick(5_000);
+  assert.equal(viewport.events.length, 1 + mod.REVEAL_RETRIES);
+  assert.deepEqual(viewport.scrolls, []);
+  ctx.unload();
+});
+
+test('no viewport, no row id, or a closed pane: the chat opens and nothing else happens', async () => {
+  // No viewport ever: polling stops after REVEAL_WAIT_MS.
+  const none = fakeDocument(null);
+  const a = setup({ host: fakeHost({ history: HIST_ROWS }), document: none });
+  await flush();
+  a.host.state.focusedStoredSessionId.set('b1');
+  nodeOf(a.pane.render(), 'b1:2').props.onClick();
+  await a.clock.tick(mod.REVEAL_WAIT_MS * 2);
+  assert.deepEqual(a.host.opened.at(-1), ['b1', { intent: 'in-place', profile: 'default' }]);
+  assert.equal(none.asked.length, mod.REVEAL_WAIT_MS / mod.REVEAL_POLL_MS);
+  a.unload();
+
+  // Rows with no row_id: no event at all.
+  const viewport = fakeViewport();
+  const b = setup({ document: fakeDocument(viewport) });
+  await flush();
+  b.host.state.focusedStoredSessionId.set('b1');
+  nodeOf(b.pane.render(), 'b1:2').props.onClick();
+  await b.clock.tick(1_000);
+  assert.equal(viewport.events.length, 0);
+  b.unload();
+
+  // Closed before the main chat switched: the reveal never fires.
+  const late = fakeViewport();
+  const c = setup({ host: fakeHost({ history: HIST_ROWS }), document: fakeDocument(late) });
+  await flush();
+  nodeOf(c.pane.render(), 'b1:2').props.onClick();
+  c.unload();
+  c.host.state.focusedStoredSessionId.set('b1');
+  await c.clock.tick(1_000);
+  assert.equal(late.events.length, 0);
+});
+
+test('a second click aborts the first reveal', async () => {
+  const viewport = fakeViewport();
+  const ctx = setup({ host: fakeHost({ history: HIST_ROWS }), document: fakeDocument(viewport) });
+  await flush();
+  ctx.host.state.focusedStoredSessionId.set('b1');
+  nodeOf(ctx.pane.render(), 'b1:2').props.onClick();
+  await ctx.clock.tick(mod.REVEAL_SETTLE_MS);
+  const first = viewport.events[0].detail;
+  nodeOf(ctx.pane.render(), 'root:0').props.onClick();
+  assert.equal(first.signal.aborted, true);
+  first.complete('late');
+  ctx.host.state.focusedStoredSessionId.set('root');
+  await ctx.clock.tick(mod.REVEAL_POLL_MS + mod.REVEAL_SETTLE_MS);
+  assert.deepEqual(viewport.scrolls, []);
+  // root's first user row.
+  assert.equal(viewport.events.at(-1).detail.rowId, 10);
+  ctx.unload();
 });
