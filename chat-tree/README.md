@@ -14,6 +14,8 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
 
 - A branch can use a cheaper model for a side question.
 
+- **Branch names and a Branches mode.** Each branch starts with a name row at its fork: the Hermes title of the chat and its model. The `Exchanges | Branches` switch beside the refresh icon shows one row for each chat instead, with its number of exchanges and a `merged` mark.
+
 - **Row actions.** When you point to a row, up to three icons show: **Branch here** (the fork icon of Hermes), **Merge into**, and **Open in a tab**. **Merge into** opens a pick in two steps: the ancestor, then the mode, with the size and the fit check.
 
 - A merge brings a branch back into any ancestor chat on its path. Choose the ancestor chat in the target list. While you use the list, the path to the target has the hover colour. Then choose the mode:
