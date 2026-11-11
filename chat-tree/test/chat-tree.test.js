@@ -312,6 +312,7 @@ function setup({ host = fakeHost(), clock = fakeClock(), useValue, storage = fak
     ScrollArea: 'ScrollArea',
     ...(picker ? PICKER : {}),
     ...(document ? { document } : {}),
+    mergeSends: false,
     ...deps,
   });
   tree.register({
@@ -1578,11 +1579,11 @@ const SIDE_ROWS = [
 const DRAFT = 'From side chat: what is a monad?\n\nYou:\nwhat is a monad?\n\nAssistant:\na burrito';
 
 // Focus on the side chat `sd`; its parent is `par` (title Main).
-async function mergeCtx({ rows = MERGE_ROWS, stored = 'sd', runtime = 'rt-sd', prepare, events = true } = {}) {
+async function mergeCtx({ rows = MERGE_ROWS, stored = 'sd', runtime = 'rt-sd', prepare, events = true, deps = {} } = {}) {
   const host = fakeHost({ rows, stored, runtime, history: { par: SHARED, sd: SIDE_ROWS } });
   host.usage = { context_used: 1000, context_max: 128000 };
   if (prepare) prepare(host);
-  const ctx = setup({ host, events });
+  const ctx = setup({ host, events, deps });
   await flush();
   ctx.mark = host.calls.length;
   return ctx;
@@ -2532,9 +2533,9 @@ test('the pane touches host transcript DOM only to reveal a clicked exchange, ne
   assert.equal(src.match(/data-message-/g).length, 1);
   assert.match(src, /function scrollToTurn[\s\S]*?\[data-message-id=/);
   assert.doesNotMatch(src, /\.(innerHTML|textContent|outerHTML)\s*=|\.click\(\)|removeChild|appendChild|setAttribute/);
-  // The composer is only ever drafted. The one send is the branch question, by prompt.submit.
+  // The two sends by prompt.submit: the branch question, and Merge as-is (Rohan, 2026-11-12 03:04).
   assert.doesNotMatch(src, /composer\.submit|\.submit\(/);
-  assert.equal(src.match(/'prompt\.submit'/g).length, 1);
+  assert.equal(src.match(/'prompt\.submit'/g).length, 2);
   assert.doesNotMatch(src, /^import /m);
   // Hermes names branches: the branch call carries no name.
   assert.doesNotMatch(src, /session\.branch_whole|name: branchName/);
@@ -3307,5 +3308,20 @@ test('in the merge pick, a hovered target lights its path even while the row poi
   hovered.props.onMouseLeave();
   const after = byAttr(pickOf(ctx), 'data-pick-item').find((n) => n.props['data-pick-item'] === last.props['data-pick-item']);
   assert.ok(!String(after.props.style.background || '').includes('color-mix'));
+  ctx.unload();
+});
+
+test('Merge as-is sends the merge text as a message in the target, once the target is focused', async () => {
+  const ctx = await mergeCtx({ prepare: (h) => (h.moveFocusOnOpen = true), deps: { mergeSends: true } });
+  const host = ctx.host;
+  const how = await openHow(ctx);
+  const asis = byAttr(how, 'data-pick-item').find((n) => /As-is/.test(textOf(n)));
+  await asis.props.onClick(fakeEvent());
+  for (let i = 0; i < 6; i++) await flush();
+  const prompt = host.order.find(([k]) => k === 'prompt');
+  assert.ok(prompt, 'prompt.submit was called');
+  assert.match(prompt[1].text, /^From side chat: /);
+  assert.equal(host.drafts.length, 0, 'nothing was staged');
+  assert.match(textOf(ctx.pane.render()), /Sent to/);
   ctx.unload();
 });

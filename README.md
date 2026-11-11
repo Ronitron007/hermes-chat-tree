@@ -16,7 +16,7 @@ The entry uses only the public plugin framework of Hermes. It changes no Hermes 
 
 - **Merge back.** Merge the open chat back into any ancestor chat on its path. **Merge into** opens a pick in two steps: first the ancestor (the parent comes first), then the mode. Each mode shows its size and whether it fits the context of the ancestor. You choose the mode:
 
-  - **Merge as-is** copies the questions and answers of the branch.
+  - **Merge as-is** sends the questions and answers of the branch as a message in the ancestor chat.
 
   - **Digest** gives the ancestor a short digest of the branch. The digest tells what the branch asked, what it concluded, and the key facts.
 
