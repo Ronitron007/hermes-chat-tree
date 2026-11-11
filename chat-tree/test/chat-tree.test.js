@@ -184,6 +184,8 @@ function fakeHost({
     flatEvent: false,
     jobs: 0,
     emit: null,
+    // session.active_list: a value, a function of the params, an Error, or undefined (unknown).
+    activeList: undefined,
     openSession: async (id, opts) => {
       opened.push([id, opts]);
       order.push(['open', id, opts]);
@@ -232,6 +234,8 @@ function fakeHost({
           }
           return { histories, missing };
         }
+        case 'session.active_list':
+          return answer(method, host.activeList, params);
         case 'config.set':
           return answer(method, host.configSet, params);
         case 'session.title':
@@ -3324,5 +3328,314 @@ test('Merge as-is sends the merge text as a message in the target, once the targ
   assert.match(prompt[1].text, /^From side chat: /);
   assert.equal(host.drafts.length, 0, 'nothing was staged');
   assert.match(textOf(ctx.pane.render()), /Sent to/);
+  ctx.unload();
+});
+
+// ── Chat status marks (post-deadline.md unit.chat_status) ──────────────────────────────────────
+
+// A session.active_list reply: { stored id: status } as gateway rows.
+const activeReply = (byKey) => ({
+  sessions: Object.entries(byKey).map(([key, status]) => ({ id: `rt-${key}`, session_key: key, status, title: key, model: 'm1' })),
+});
+const statusReads = (host) => host.calls.filter(([m]) => m === mod.ACTIVE_LIST_METHOD).length;
+// The status of each row that has a mark: { row key: status }, name rows as `name:<chat id>`.
+const marksOf = (tree) => {
+  const rows = findAll(tree, (n) => n.props?.['data-node'] !== undefined || n.props?.['data-name-row'] !== undefined);
+  const out = {};
+  for (const r of rows) {
+    const mark = byAttr(r, 'data-chat-status')[0];
+    if (mark) out[r.props['data-node'] ?? `name:${r.props['data-name-row']}`] = mark.props['data-chat-status'];
+  }
+  return out;
+};
+const markOf = (tree, key) => byAttr(findAll(tree, (n) => n.props?.['data-node'] === key || `name:${n.props?.['data-name-row']}` === key)[0], 'data-chat-status')[0];
+const toggleView = (ctx) => byAttr(ctx.pane.render(), 'data-mode-toggle')[0].props.onClick();
+const refresh = async (ctx) => {
+  byAttr(ctx.pane.render(), 'data-refresh')[0].props.onClick(fakeEvent());
+  await flush();
+};
+
+test('chat status: each status has its mark on the lane last row (exchanges) and after the count (branches)', async () => {
+  const host = fakeHost();
+  host.activeList = activeReply({ root: 'working', b1: 'waiting', b3: 'starting', b2: 'idle' });
+  const ctx = setup({ host });
+  await flush();
+  let tree = ctx.pane.render();
+  // Exchanges view: a dot on each lane's last row. Done (b2, idle) has no mark, only its empty slot.
+  assert.deepEqual(marksOf(tree), { 'b3:1': 'starting', 'b1:2': 'waiting', 'root:2': 'working' });
+  const expect = { 'root:2': ['Working', 'working'], 'b1:2': ['Needs you', 'waiting'], 'b3:1': ['Starting', 'starting'] };
+  for (const [key, [text, status]] of Object.entries(expect)) {
+    const mark = markOf(tree, key);
+    assert.deepEqual([mark.props.role, mark.props['aria-label'], mark.props.title], ['img', text, text], key);
+    assert.equal(byAttr(mark, 'data-status-dot', status).length, 1, key);
+    assert.equal(textOf(mark), '', `${key}: the exchanges view shows the dot alone`);
+  }
+  const dot = (key) => byAttr(markOf(tree, key), 'data-status-dot')[0];
+  assert.equal(dot('root:2').props.className, 'animate-pulse');
+  assert.equal(dot('root:2').props.style.background, ACCENT);
+  assert.equal(dot('b1:2').props.className, undefined);
+  assert.equal(dot('b1:2').props.style.background, mod.AMBER);
+  assert.equal(mod.AMBER, '#d97706');
+  assert.equal(dot('b3:1').props.style.border, `1.5px solid ${MUTED}`);
+  assert.equal(dot('b3:1').props.style.background, undefined);
+  const b2 = nodeOf(tree, 'b2:3');
+  assert.equal(byAttr(b2, 'data-chat-status').length, 0);
+  assert.equal(byAttr(b2, 'data-status-slot', 'empty').length, 1);
+  // Only last rows carry a mark or a slot; the slot sits after the label, before the icon slots.
+  for (const key of ['root:0', 'root:1']) assert.equal(byAttr(nodeOf(tree, key), 'data-status-slot').length + byAttr(nodeOf(tree, key), 'data-chat-status').length, 0, key);
+  for (const key of ['root:2', 'b2:3']) {
+    const kids = nodeOf(tree, key).props.children;
+    const at = kids.findIndex((c) => c?.key === 'status');
+    assert.equal(kids[0].props['data-label'], 'true', key);
+    assert.ok(at > 0 && at < kids.findIndex((c) => c?.key === 'branch'), key);
+  }
+  // Branches view: the dot and the word after the exchange count; done is the muted word.
+  toggleView(ctx);
+  tree = ctx.pane.render();
+  assert.deepEqual(marksOf(tree), { 'name:root': 'working', 'name:b3': 'starting', 'name:b1': 'waiting', 'name:b2': 'done' });
+  const words = { 'name:root': ['working', 'Working', ACCENT], 'name:b1': ['needs you', 'Needs you', mod.AMBER], 'name:b3': ['starting', 'Starting', MUTED], 'name:b2': ['done', 'Done', MUTED] };
+  for (const [key, [word, text, colour]] of Object.entries(words)) {
+    const mark = markOf(tree, key);
+    assert.deepEqual([textOf(mark), mark.props['aria-label'], mark.props.title, mark.props.style.color], [word, text, text, colour], key);
+    const kids = findAll(tree, (n) => `name:${n.props?.['data-name-row']}` === key)[0].props.children;
+    assert.equal(kids.findIndex((c) => c?.props?.['data-chat-status']), kids.findIndex((c) => c?.props?.['data-count'] !== undefined) + 1, key);
+  }
+  assert.equal(byAttr(markOf(tree, 'name:b2'), 'data-status-dot').length, 0);
+  assert.equal(byAttr(markOf(tree, 'name:root'), 'data-status-dot')[0].props.className, 'animate-pulse');
+  // No error and no status note: marks are not messages.
+  assert.equal(ctx.tree.$status.get().error, null);
+  ctx.unload();
+});
+
+test('chat status: rows are untrusted, idle is done, and a chat with no row is done', async () => {
+  const live = mod.parseActiveList({
+    sessions: [
+      { session_key: 'a', status: 'working' },
+      { session_key: 7, status: 'working' },
+      { session_key: 'b', status: 'zombie' },
+      { session_key: 'c', status: 'idle' },
+      null,
+      'row',
+      { session_key: 'd', status: 'starting' },
+      { session_key: 'd', status: 'waiting' },
+      { session_key: 'e', status: 'constructor' },
+      { status: 'working' },
+      { session_key: '', status: 'working' },
+    ],
+  });
+  assert.deepEqual([...live], [['a', 'working'], ['c', 'done'], ['d', 'waiting']]);
+  for (const bad of [null, {}, { sessions: 'x' }, { sessions: {} }]) assert.equal(mod.parseActiveList(bad), null);
+  const host = fakeHost();
+  host.activeList = activeReply({ root: 'working', elsewhere: 'waiting' });
+  const ctx = setup({ host });
+  await flush();
+  toggleView(ctx);
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'name:root': 'working', 'name:b3': 'done', 'name:b1': 'done', 'name:b2': 'done' });
+  ctx.unload();
+});
+
+test('chat status: a lineage id (compression root or segment) matches its lane, never another lane', async () => {
+  const rows = [COMPRESSED, row('br', { _branched_from: 'seg1', started_at: 50 })];
+  const lanes = mod.buildLanes(mod.lineageChats(buildTree(rows, 'br')), {});
+  assert.deepEqual(mod.chatStatuses(lanes, new Map([['seg1', 'working']])), { tip: 'working', br: 'done' });
+  assert.deepEqual(mod.chatStatuses(lanes, new Map([['seg0', 'waiting']])), { tip: 'waiting', br: 'done' });
+  assert.deepEqual(mod.chatStatuses(lanes, new Map([['tip', 'starting'], ['br', 'working']])), { tip: 'starting', br: 'working' });
+  // In the pane: the live row names the middle segment; the mark sits on the lineage lane's last row.
+  const history = { tip: msgs(['q1', 'a1'], ['q2', 'a2']), br: msgs(['q1', 'a1'], ['brq', 'bra']) };
+  const host = fakeHost({ rows, stored: 'br', runtime: 'rt-br', history });
+  host.activeList = activeReply({ seg1: 'working' });
+  const ctx = setup({ host });
+  await flush();
+  assert.deepEqual(nodeKeys(ctx.pane.render()), ['tip:0', 'br:1', 'tip:1']);
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'tip:1': 'working' });
+  ctx.unload();
+});
+
+test('chat status: a failed or missing RPC shows no marks and no error; the rows and lines stay as they were', async () => {
+  const host = fakeHost();
+  host.activeList = activeReply({ root: 'working' });
+  const ctx = setup({ host });
+  await flush();
+  const withMarks = ctx.pane.render();
+  assert.deepEqual(marksOf(withMarks), { 'root:2': 'working' });
+  host.activeList = new Error('gateway gone');
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  const without = ctx.pane.render();
+  assert.deepEqual(marksOf(without), {});
+  assert.equal(byAttr(without, 'data-status-slot').length, 0);
+  assert.equal(ctx.tree.$status.get().error, null);
+  assert.doesNotMatch(textOf(without), /gateway gone/);
+  assert.deepEqual(nodeKeys(without), MAIN_KEYS);
+  // A mark never moves the lane lines: the graph is the same with and without marks.
+  assert.deepEqual(byAttr(without, 'data-graph', 'true')[0], byAttr(withMarks, 'data-graph', 'true')[0]);
+  // No live chat after the failure: the 3 s read stopped (the 15 s refresh is the one timer left).
+  assert.equal(ctx.clock.pending(), 1);
+  // An unknown method (an older Hermes) and a reply with no sessions list: no marks either.
+  for (const reply of [undefined, { sessions: 'nope' }]) {
+    host.activeList = activeReply({ root: 'working' });
+    await refresh(ctx);
+    assert.deepEqual(marksOf(ctx.pane.render()), { 'root:2': 'working' });
+    host.activeList = reply;
+    await refresh(ctx);
+    assert.deepEqual(marksOf(ctx.pane.render()), {});
+    assert.equal(ctx.tree.$status.get().error, null);
+  }
+  ctx.unload();
+  // A chat of another profile or connection: the active gateway is not its gateway. No read, no marks.
+  const other = fakeHost({ owner: { connectionId: 'src-b', profile: 'other' } });
+  other.activeList = activeReply({ root: 'working' });
+  const far = setup({ host: other });
+  await flush();
+  assert.equal(statusReads(other), 0);
+  assert.deepEqual(marksOf(far.pane.render()), {});
+  far.unload();
+});
+
+test('chat status: busyBySession makes the open chat working before the RPC reply, and reads at most once per second', async () => {
+  const host = fakeHost();
+  host.activeList = activeReply({ b2: 'idle' });
+  const ctx = setup({ host });
+  await flush();
+  assert.deepEqual(marksOf(ctx.pane.render()), {});
+  const lists = listCalls(host);
+  const histories = historyCalls(host);
+  const r0 = statusReads(host);
+  let release = null;
+  host.activeList = () => new Promise((resolve) => (release = () => resolve(activeReply({ b2: 'working' }))));
+  host.state.busyBySession.set({ 'rt-b2': true });
+  // The reply has not come back: busyBySession alone makes the open chat working.
+  assert.equal(statusReads(host), r0 + 1);
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'b2:3': 'working' });
+  // More changes inside the second read nothing now, then once at its end.
+  host.state.busyBySession.set({ 'rt-b2': true, other: true });
+  host.state.busyBySession.set({ 'rt-b2': true });
+  assert.equal(statusReads(host), r0 + 1);
+  release();
+  await flush();
+  host.activeList = activeReply({ b2: 'working' });
+  await ctx.clock.tick(mod.STATUS_BUSY_MS - 1);
+  assert.equal(statusReads(host), r0 + 1);
+  await ctx.clock.tick(1);
+  assert.equal(statusReads(host), r0 + 2);
+  await ctx.clock.tick(mod.STATUS_BUSY_MS);
+  assert.equal(statusReads(host), r0 + 2);
+  // A read that says the chat waits for the user wins over the busy flag.
+  host.activeList = activeReply({ b2: 'waiting' });
+  host.state.busyBySession.set({ 'rt-b2': true, again: true });
+  await flush();
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'b2:3': 'waiting' });
+  // Before any good read, the busy flag shows nothing: no marks while the RPC is unknown.
+  assert.deepEqual(mod.chatStatuses([{ id: 'b2', row: {} }], null, 'b2'), {});
+  assert.deepEqual(mod.chatStatuses([{ id: 'b2', row: {} }], new Map(), 'b2'), { b2: 'working' });
+  // A status read never reloads the tree or a history.
+  assert.equal(listCalls(host), lists);
+  assert.equal(historyCalls(host), histories);
+  ctx.unload();
+});
+
+test('chat status: the 3 s read runs while a chat in the tree is live, stops when none is, and never reloads the tree', async () => {
+  const host = fakeHost();
+  host.activeList = activeReply({ root: 'working' });
+  const ctx = setup({ host });
+  await flush();
+  assert.equal(ctx.clock.pending(), 2); // the 15 s refresh and the 3 s status read
+  const lists = listCalls(host);
+  const histories = historyCalls(host);
+  const r0 = statusReads(host);
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.equal(statusReads(host), r0 + 1);
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.equal(statusReads(host), r0 + 2);
+  // A live chat outside the tree does not keep the timer: the last live chat of the tree ended.
+  host.activeList = activeReply({ root: 'idle', elsewhere: 'working' });
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.equal(statusReads(host), r0 + 3);
+  assert.equal(ctx.clock.pending(), 1);
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.equal(statusReads(host), r0 + 3);
+  assert.equal(listCalls(host), lists);
+  assert.equal(historyCalls(host), histories);
+  // A tree load reads the status again and starts the timer when a chat is live.
+  host.activeList = activeReply({ b1: 'starting' });
+  await refresh(ctx);
+  assert.equal(statusReads(host), r0 + 4);
+  assert.equal(ctx.clock.pending(), 2);
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'b1:2': 'starting' });
+  // A read between two ticks that finds no live chat stops the pending timer at once (the 15 s
+  // refresh is the one timer left).
+  host.activeList = activeReply({ b1: 'idle' });
+  await refresh(ctx);
+  assert.equal(statusReads(host), r0 + 5);
+  assert.equal(ctx.clock.pending(), 1);
+  // The pane closes while a chat is live: every timer stops, and a busyBySession change reads nothing.
+  host.activeList = activeReply({ b1: 'working' });
+  await refresh(ctx);
+  assert.equal(ctx.clock.pending(), 2);
+  ctx.unload();
+  assert.equal(ctx.clock.pending(), 0);
+  const reads = statusReads(host);
+  host.state.busyBySession.set({ 'rt-b2': true });
+  await ctx.clock.tick(mod.STATUS_POLL_MS * 2);
+  assert.equal(statusReads(host), reads);
+  assert.equal(host.state.busyBySession.listeners(), 0);
+});
+
+test('chat status: a status read that lands while a tree load runs is kept', async () => {
+  const host = fakeHost();
+  host.activeList = activeReply({ root: 'working' });
+  const ctx = setup({ host });
+  await flush();
+  // The next load waits on the open chat's history; the status reply comes back in that wait.
+  const base = host.request;
+  let releaseHistory = null;
+  host.request = (method, params) =>
+    method === 'session.history' && params.session_id === 'b2'
+      ? new Promise((resolve) => (releaseHistory = () => resolve(base(method, params))))
+      : base(method, params);
+  let releaseStatus = null;
+  host.activeList = () => new Promise((resolve) => (releaseStatus = () => resolve(activeReply({ b1: 'waiting' }))));
+  await refresh(ctx);
+  assert.equal(typeof releaseHistory, 'function');
+  releaseStatus();
+  await flush();
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'b1:2': 'waiting' });
+  releaseHistory();
+  await flush();
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'b1:2': 'waiting' });
+  ctx.unload();
+});
+
+test('chat status marks keep the hook order (React error 300)', async () => {
+  const log = [];
+  const useValue = (a) => {
+    log.push(a);
+    return a.get();
+  };
+  const host = fakeHost();
+  const ctx = setup({ host, useValue });
+  await flush();
+  const order = () => {
+    log.length = 0;
+    ctx.pane.render();
+    return [...log];
+  };
+  const states = [order()]; // no marks: the RPC is unknown
+  host.activeList = activeReply({ root: 'working', b1: 'waiting', b3: 'starting' });
+  await refresh(ctx);
+  assert.equal(Object.keys(marksOf(ctx.pane.render())).length, 3);
+  states.push(order()); // marks
+  host.state.busyBySession.set({ 'rt-b2': true });
+  states.push(order()); // the open chat busy
+  await flush();
+  toggleView(ctx);
+  states.push(order()); // the branches view with words
+  host.activeList = new Error('x');
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.deepEqual(marksOf(ctx.pane.render()), {});
+  states.push(order()); // a failed read
+  for (const s of states) {
+    assert.equal(s.length, 8);
+    assert.deepEqual(s, states[0]);
+  }
   ctx.unload();
 });

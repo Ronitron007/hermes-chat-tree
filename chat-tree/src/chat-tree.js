@@ -12,8 +12,11 @@
 // Histories come from the same Python half: one plugin.chat-tree.history.read per refresh reads the
 // stored chats of the tree from the local session store, because session.history answers only for
 // chats loaded in gateway memory. Without the Python half the pane falls back to session.history.
+// Each chat in the tree shows its live status (working, needs you, starting, done) from the gateway
+// RPC session.active_list; a status read never reloads the tree.
 // Plain ESM with no imports: the SDK pieces and timers are injected so it runs under node --test.
-// Spec: docs/specs/2026-11-12-competition-build/spec.md (unit.tree_view, unit.tree_actions)
+// Spec: docs/specs/2026-11-12-competition-build/spec.md (unit.tree_view, unit.tree_actions),
+// post-deadline.md (unit.chat_status)
 
 export const PLUGIN_ID = 'chat-tree';
 export const PANE_ID = 'pane';
@@ -107,6 +110,34 @@ export const DIGEST_TIMEOUT_MS = 60_000;
 // missing: [ids not in the store] }. Read-only, local, no model call.
 export const HISTORY_METHOD = 'plugin.chat-tree.history.read';
 export const BACKEND_NOTE_TEXT = 'Enable the chat-tree plugin backend to see other chats (hermes plugins enable chat-tree).';
+// Chat status (post-deadline.md unit.chat_status). session.active_list with no session id lists the
+// live chats of this gateway: { sessions: [{ id (runtime id), session_key (stored id), status }] }
+// (tui_gateway/methods_session.py:1138-1148, session_registry.py:640-680). status is working,
+// waiting (a prompt waits for the user), starting or idle. A chat with no row, or an idle one, is done.
+export const ACTIVE_LIST_METHOD = 'session.active_list';
+// While a chat in the tree is live, the status is read again every STATUS_POLL_MS. A busyBySession
+// change reads it at most once per STATUS_BUSY_MS.
+export const STATUS_POLL_MS = 3_000;
+export const STATUS_BUSY_MS = 1_000;
+export const DONE_STATUS = 'done';
+// Each status: its rank (one chat with several rows takes the most urgent), its text for screen
+// readers and the tooltip, and its word in the branches view.
+export const CHAT_STATUSES = {
+  done: { rank: 0, text: 'Done', word: 'done' },
+  starting: { rank: 1, text: 'Starting', word: 'starting' },
+  working: { rank: 2, text: 'Working', word: 'working' },
+  waiting: { rank: 3, text: 'Needs you', word: 'needs you' },
+};
+// The wire statuses the pane knows, and the status each one shows. A Map: an untrusted value such
+// as `constructor` never matches.
+const WIRE_STATUS = new Map([
+  ['working', 'working'],
+  ['waiting', 'waiting'],
+  ['starting', 'starting'],
+  ['idle', DONE_STATUS],
+]);
+// The colour of a chat that waits for the user (spec chat_status.marks).
+export const AMBER = '#d97706';
 
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text' };
 const HISTORY_CONCURRENCY = 4;
@@ -803,6 +834,65 @@ export function buildLanes(chats, exchangesById, sideIds) {
   return lanes;
 }
 
+// ── Chat status: the active list, each lane's status, and the row that carries its mark ──────
+
+// The session.active_list reply, checked: Map(stored id -> status), or null when the reply has no
+// sessions list. Rows are untrusted: a row counts only with a string session_key and a known
+// status. idle reads as done. Two rows for one stored id keep the more urgent status.
+export function parseActiveList(result) {
+  const list = result?.sessions;
+  if (!Array.isArray(list)) return null;
+  const out = new Map();
+  for (const item of list) {
+    const key = str(item?.session_key);
+    const status = WIRE_STATUS.get(item?.status);
+    if (!key || !status) continue;
+    const had = out.get(key);
+    if (!had || CHAT_STATUSES[status].rank > CHAT_STATUSES[had].rank) out.set(key, status);
+  }
+  return out;
+}
+
+// Every stored id a lane answers to: its id, its lineage root and its compression chain root..tip
+// (_lineage_ids, see indexRows). A live chat's session_key is the stored id of its newest segment.
+function laneIds(lane) {
+  const row = lane?.row;
+  const chain = Array.isArray(row?._lineage_ids) ? row._lineage_ids : [];
+  return [lane?.id, row?._lineage_root_id, ...chain].filter((id) => typeof id === 'string' && id);
+}
+
+// The status of each lane: { [lane id]: status }, or {} when live is not a good read (no marks).
+// live: parseActiveList's Map. A lane with no row is done; one with several rows takes the most
+// urgent. busyId: the open lane while host.state.busyBySession has its runtime id busy. It is
+// working before the next read lands, unless the read says that it waits for the user.
+export function chatStatuses(lanes, live, busyId = null) {
+  if (!(live instanceof Map)) return {};
+  const out = {};
+  for (const lane of Array.isArray(lanes) ? lanes : []) {
+    let status = lane.id === busyId ? 'working' : DONE_STATUS;
+    for (const id of laneIds(lane)) {
+      const found = live.get(id);
+      if (found && CHAT_STATUSES[found].rank > CHAT_STATUSES[status].rank) status = found;
+    }
+    out[lane.id] = status;
+  }
+  return out;
+}
+
+// The status mark of each row: Map(row key -> status), on each lane's last row. In the exchanges
+// view that is the lane's last exchange (collapse always keeps it); in the branches view it is the
+// lane's only row, its name row.
+export function statusMarks(plan, statuses) {
+  const out = new Map();
+  const rows = Array.isArray(plan?.rows) ? plan.rows : [];
+  for (const lane of Array.isArray(plan?.lanes) ? plan.lanes : []) {
+    const row = rows[lane.lastRow];
+    const status = statuses?.[lane.id];
+    if (row && (row.kind === 'node' || row.kind === 'name') && Object.hasOwn(CHAT_STATUSES, status ?? '')) out.set(row.key, status);
+  }
+  return out;
+}
+
 // ── Graph plan: row order, forks, merges, the blue path, collapse, and columns ──────────────
 
 // The lane that draws exchange `index` of chat `id`: up the parents while that exchange is shared.
@@ -1324,6 +1414,13 @@ const BRANCH_GLYPH = { flex: '0 0 auto', width: 14, height: 14 };
 const NAME_GLYPH = { flex: '0 0 auto', width: 12, height: 12, color: MUTED };
 const NAME_TEXT = { fontSize: 12, color: MUTED };
 const NAME_MODEL = { ...SELECTABLE, flex: '0 0 auto', maxWidth: 72, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: MUTED };
+// A status mark: a 6 px dot, filled in the status colour, hollow while starting. The exchanges view
+// keeps a fixed slot for it on each lane's last row (empty when done), the branches view a fixed box
+// after the exchange count. So a status change never moves the row text; the graph never changes.
+const STATUS_DOT = { ...SELECTABLE, flex: '0 0 auto', width: 6, height: 6, borderRadius: '50%', boxSizing: 'border-box' };
+const STATUS_SLOT = { ...SELECTABLE, flex: '0 0 auto', width: 10, height: 20, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' };
+const STATUS_BOX = { ...SELECTABLE, flex: '0 0 auto', width: 64, display: 'inline-flex', alignItems: 'center', gap: 3, overflow: 'hidden', whiteSpace: 'nowrap', fontSize: 11 };
+const statusColour = (status) => (status === 'working' ? ACCENT : status === 'waiting' ? AMBER : MUTED);
 // The view toggle in the pane header: two small segmented buttons.
 const MODE_BUTTON = { ...SELECTABLE, flex: '0 0 auto', fontSize: 11, lineHeight: '16px', padding: '1px 6px', border: `1px solid ${MUTED}`, background: 'transparent', color: 'inherit', cursor: 'pointer' };
 const MODE_ON = { background: `color-mix(in srgb, ${ACCENT} 14%, transparent)`, borderColor: ACCENT, color: ACCENT };
@@ -1395,7 +1492,8 @@ export function createChatTree(deps) {
   // rows: last good session rows. agents: last good subagents, for agentsFor (a runtime id).
   // exchanges: { [chat id]: exchanges } for the chats of the focused tree. branchIds: the ids of
   // the branches this pane made (ctx.storage). digests: { 'chatId:index': fork digest } (ctx.storage).
-  const $data = atom({ rows: [], agents: [], agentsFor: null, exchanges: {}, branchIds: [], digests: {} });
+  // live: the last status read (parseActiveList's Map), null before one or after a failed one.
+  const $data = atom({ rows: [], agents: [], agentsFor: null, exchanges: {}, branchIds: [], digests: {}, live: null });
   // note: why live subagents are not shown (not an error).
   const $status = atom({ loading: false, error: null, note: null });
   // In memory only, never stored. open: { chatId, index } the clicked node. expanded: { [run key]:
@@ -1436,6 +1534,13 @@ export function createChatTree(deps) {
   let named = new Set();
   // Cancels the debounced reload that RELOAD_EVENTS schedule.
   let cancelSoon = null;
+  // Chat status: a newer read wins (statusGeneration). cancelStatusPoll: the STATUS_POLL_MS read
+  // while a chat is live. busyWait: the STATUS_BUSY_MS window after a busyBySession read; busyAgain:
+  // a change came inside it.
+  let statusGeneration = 0;
+  let cancelStatusPoll = null;
+  let busyWait = null;
+  let busyAgain = false;
   const unsubscribers = [];
 
   const atomOf = (name) => host?.state?.[name] ?? $none;
@@ -1580,6 +1685,8 @@ export function createChatTree(deps) {
       const result = await host.request('subagent.list', { session_id: runtime });
       return (Array.isArray(result?.subagents) ? result.subagents : []).map(cleanAgent).filter(Boolean);
     })();
+    // The chat status at each tree load, beside the two reads; it lands on its own.
+    readStatus();
     const [rows, live] = await Promise.allSettled([sessions, agents]);
     if (disposed || mine !== generation) return;
 
@@ -1605,12 +1712,15 @@ export function createChatTree(deps) {
       errors.push(...histories.errors);
       backendMissing = histories.backendMissing;
     }
-    // A branch or a fork digest may have landed while the reads ran: keep the newest.
+    // A branch, a fork digest or a status read may have landed while the reads ran: keep the newest.
     const now = $data.get();
     next.branchIds = now.branchIds;
+    next.live = now.live;
     if (next.lastFocus === undefined) next.lastFocus = now.lastFocus;
     next.digests = storage ? { ...now.digests, ...readDigests(next.exchanges) } : now.digests;
     $data.set(next);
+    // The tree may have gained or lost a live chat.
+    syncStatusPoll();
     settlePendingBranch();
     settlePendingRename();
     $status.set({
@@ -1673,6 +1783,74 @@ export function createChatTree(deps) {
     if (key === lastKey) return;
     lastKey = key;
     reload();
+  }
+
+  // ── Chat status (unit.chat_status): read into $data.live; render maps it to the lanes ──────
+
+  // One session.active_list read. live is null when the RPC fails or is missing, and when the chat's
+  // owner is not the active gateway (host.request reaches only that one): no marks then, and no
+  // error. A newer read wins. A status read never reloads the tree or a history.
+  async function loadStatus() {
+    if (disposed) return;
+    const mine = ++statusGeneration;
+    let live = null;
+    if (ownerIsActive(atomOf('focusedSessionOwner').get())) {
+      try {
+        live = parseActiveList(await host.request(ACTIVE_LIST_METHOD, {}));
+      } catch {
+        // A failed or unknown RPC: the tree works as before, with no marks.
+      }
+    }
+    if (disposed || mine !== statusGeneration) return;
+    $data.set({ ...$data.get(), live });
+    syncStatusPoll();
+  }
+
+  const readStatus = () => {
+    loadStatus().then(null, () => {});
+  };
+
+  // The status of each lane of the tree as the pane draws it now (render does the same).
+  function currentStatuses() {
+    const { lanes, open } = currentView();
+    const busy = open ? chatBusy(atomOf('busyBySession').get(), [runtimeId(), open.id]) : false;
+    return chatStatuses(lanes, $data.get().live, busy ? open.id : null);
+  }
+
+  // The STATUS_POLL_MS read runs while a chat in the tree is working, waiting or starting. It is
+  // armed again only when a read lands, so two never overlap. It stops when no chat is live, and
+  // on dispose. Called after each status read and each tree load.
+  function syncStatusPoll() {
+    if (disposed) return;
+    const live = Object.values(currentStatuses()).some((status) => status !== DONE_STATUS);
+    if (live && !cancelStatusPoll) {
+      cancelStatusPoll = schedule(() => {
+        cancelStatusPoll = null;
+        readStatus();
+      }, STATUS_POLL_MS);
+    } else if (!live && cancelStatusPoll) {
+      if (typeof cancelStatusPoll === 'function') cancelStatusPoll();
+      cancelStatusPoll = null;
+    }
+  }
+
+  // A busyBySession change reads the status at once, then waits STATUS_BUSY_MS. Changes inside the
+  // wait read once more at its end: at most one read per second.
+  function onBusy() {
+    if (disposed) return;
+    if (busyWait) {
+      busyAgain = true;
+      return;
+    }
+    readStatus();
+    busyWait = schedule(endBusyWait, STATUS_BUSY_MS);
+  }
+
+  function endBusyWait() {
+    busyWait = null;
+    if (!busyAgain || disposed) return;
+    busyAgain = false;
+    onBusy();
   }
 
   // Opens a chat for the focused chat's owner: in place for a tree node, in a tab for a subagent.
@@ -2382,6 +2560,43 @@ export function createChatTree(deps) {
     if ($hover.get()[field] === key) hoverSet(field, null);
   };
 
+  // A chat's status mark (unit.chat_status) for a row of actions.marks, else null. It carries
+  // data-chat-status and an aria-label with its text, the tooltip too. withWord (the branches view):
+  // the dot and the word in a fixed box. Else the dot alone in a fixed slot; done keeps the slot empty.
+  function statusMark(row, actions, withWord) {
+    const status = actions.marks?.get(row.key);
+    const info = status ? CHAT_STATUSES[status] : null;
+    if (!info) return null;
+    const colour = statusColour(status);
+    const dot =
+      status === DONE_STATUS
+        ? null
+        : jsx(
+            'span',
+            {
+              ...(status === 'working' ? { className: 'animate-pulse' } : {}),
+              style: { ...STATUS_DOT, ...(status === 'starting' ? { border: `1.5px solid ${colour}` } : { background: colour }) },
+              'aria-hidden': 'true',
+              'data-status-dot': status,
+            },
+            'dot',
+          );
+    if (!dot && !withWord) return jsx('span', { 'aria-hidden': 'true', style: STATUS_SLOT, 'data-status-slot': 'empty' }, 'status');
+    return jsxs(
+      'span',
+      {
+        role: 'img',
+        'aria-label': info.text,
+        title: info.text,
+        style: withWord ? { ...STATUS_BOX, color: colour } : STATUS_SLOT,
+        'data-selectable-text': 'true',
+        'data-chat-status': status,
+        children: [dot, withWord ? jsx('span', { style: SELECTABLE, children: info.word }, 'word') : null].filter(Boolean),
+      },
+      'status',
+    );
+  }
+
   // actions: { openId, busy, model, hover, mergeLane, merging, pick, targets, open }: the open
   // chat's id, its busy flag, its model, the $hover value, the lane whose rows carry Merge (the open
   // chat when it has a parent, else null), a merge in flight, the open pick, the merge targets and
@@ -2401,6 +2616,9 @@ export function createChatTree(deps) {
     const model = row.open ? actions.model || lane.model : '';
     if (model) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'model', children: modelName(model) }, 'model'));
     if (row.first && lane.side) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'side', children: 'side' }, 'side'));
+    // The chat's status on its lane's last row, before the icon slots so their columns stay.
+    const mark = statusMark(row, actions, false);
+    if (mark) children.push(mark);
     const picking = actions.pick?.rowKey === row.key;
     // The Branch here form of this node: with Hermes's Popover it opens at the row.
     const formHere = Boolean(pop && row.branchable && actions.form && actions.form.chatId === row.branchFrom && actions.form.index === row.index);
@@ -2882,6 +3100,9 @@ export function createChatTree(deps) {
     ];
     if (branches) {
       children.push(jsx('span', { style: { ...NAME_MODEL, maxWidth: 110 }, 'data-selectable-text': 'true', 'data-count': row.count, children: `(${row.count} ${row.count === 1 ? 'exchange' : 'exchanges'})` }, 'count'));
+      // The chat's status, after the exchange count.
+      const mark = statusMark(row, actions, true);
+      if (mark) children.push(mark);
       if (row.merged) children.push(jsx('span', { style: PILL, 'data-selectable-text': 'true', 'data-pill': 'merged', children: 'merged' }, 'merged'));
     }
     // The model in the exchanges view; the branches view keeps the row for the title (the tooltip has it).
@@ -3227,7 +3448,7 @@ export function createChatTree(deps) {
   // Hook order is fixed: eight useValue calls, every render, before any branch (React error 300).
   // The last two are the in-memory UI and hover atoms. Render only reads state; loading happens on focus change
   // and on the timer, in register(); branching and merging happen in click handlers. Row builders
-  // have no hooks.
+  // have no hooks. The chat status adds none: it lives in $data.live, and busyBySession is already read.
   // One toggle for the view: a branch icon, pressed (in the accent) in the Branches view. A click
   // switches between Exchanges and Branches; the tooltip names the view and the next one.
   function modeToggle(mode) {
@@ -3302,8 +3523,11 @@ export function createChatTree(deps) {
     }
     const agents = runtime && data.agentsFor === runtime ? data.agents : [];
     const busy = open ? chatBusy(busyMap, [runtime, open.id]) : false;
+    // The status mark of each lane's last row: none while the last status read failed.
+    const marks = statusMarks(plan, chatStatuses(lanes, data.live, busy ? open.id : null));
     const form = ui.branch && open && ui.branch.chatId === open.id ? ui.branch : null;
     const actions = {
+      marks,
       rename: ui.rename ?? null,
       openId: open?.id ?? null,
       busy,
@@ -3407,6 +3631,13 @@ export function createChatTree(deps) {
     generation += 1;
     if (typeof cancelTimer === 'function') cancelTimer();
     cancelTimer = null;
+    // The status poll and the busy wait stop; a status read in flight lands on nothing.
+    statusGeneration += 1;
+    if (typeof cancelStatusPoll === 'function') cancelStatusPoll();
+    cancelStatusPoll = null;
+    if (typeof busyWait === 'function') busyWait();
+    busyWait = null;
+    busyAgain = false;
     // Pending digests end now; their callers see the dead activation and do nothing.
     for (const finish of [...jobs.values()]) finish({ ok: false, error: 'The pane was closed.' });
     early.clear();
@@ -3432,6 +3663,9 @@ export function createChatTree(deps) {
     historyCache = new Map();
     named = new Set();
     cancelSoon = null;
+    cancelStatusPoll = null;
+    busyWait = null;
+    busyAgain = false;
     storage = ctx?.storage ?? null;
     // ctx.onEvent is tracked and removed with the plugin (contrib/plugin.ts); host.onEvent is the fallback.
     const listen = typeof ctx?.onEvent === 'function' ? ctx.onEvent : typeof host?.onEvent === 'function' ? host.onEvent : null;
@@ -3455,7 +3689,7 @@ export function createChatTree(deps) {
     $status.set({ loading: false, error: null, note: null });
     $ui.set({ ...freshUi(), mode: read(MODE_KEY) === BRANCHES_MODE ? BRANCHES_MODE : EXCHANGES_MODE });
     $hover.set(freshHover());
-    $data.set({ ...$data.get(), branchIds: storedBranchIds() });
+    $data.set({ ...$data.get(), branchIds: storedBranchIds(), live: null });
     // ctx.setTimeout: the host clears it on unload (apps/desktop/src/contrib/plugin.ts).
     if (typeof ctx?.setTimeout === 'function') scopedTimeout = (fn, ms) => ctx.setTimeout(fn, ms);
     if (typeof ctx?.onDispose === 'function') ctx.onDispose(dispose);
@@ -3463,6 +3697,9 @@ export function createChatTree(deps) {
       const store = host?.state?.[name];
       if (typeof store?.listen === 'function') unsubscribers.push(store.listen(onFocus));
     }
+    // A run that starts or ends reads the chat status again; it never reloads the tree.
+    const busyStore = host?.state?.busyBySession;
+    if (typeof busyStore?.listen === 'function') unsubscribers.push(busyStore.listen(onBusy));
     onFocus();
     cancelTimer = schedule(tick, REFRESH_MS);
     ctx.register({
