@@ -275,8 +275,18 @@ function fakeStorage(seed = {}) {
   };
 }
 
+// Hermes's model picker as the SDK gives it, as plain element types. picker: false is an SDK without it.
+const PICKER = {
+  ModelCatalogMenu: 'ModelCatalogMenu',
+  ModelMenuCloseContext: { Provider: 'ModelMenuClose' },
+  DropdownMenu: 'DropdownMenu',
+  DropdownMenuTrigger: 'DropdownMenuTrigger',
+  DropdownMenuContent: 'DropdownMenuContent',
+  reasoningEffortLabel: (effort) => ({ high: 'High', none: 'Off' })[effort] ?? effort,
+};
+
 // events: false gives a ctx with no onEvent (an older host).
-function setup({ host = fakeHost(), clock = fakeClock(), useValue, storage = fakeStorage(), events = true, document } = {}) {
+function setup({ host = fakeHost(), clock = fakeClock(), useValue, storage = fakeStorage(), events = true, document, picker = true } = {}) {
   const registered = [];
   const disposers = [];
   // ctx.onEvent as the desktop gives it: listeners by type, a disposer back.
@@ -296,6 +306,7 @@ function setup({ host = fakeHost(), clock = fakeClock(), useValue, storage = fak
     useValue: useValue ?? ((a) => a.get()),
     Button: 'Button',
     ScrollArea: 'ScrollArea',
+    ...(picker ? PICKER : {}),
     ...(document ? { document } : {}),
   });
   tree.register({
@@ -1720,6 +1731,27 @@ test('Digest asks the plugin RPC on the open chat session, waits for its event, 
   }
 });
 
+test('the digest request sends each question and answer with concept-link markup removed', async () => {
+  assert.deepEqual(mod.digestRequest('fork', ' T ', [{ question: 'what is a [[monad|a type]]?', answer: '::termline{v="A burrito." t="x"}' }, {}]), {
+    purpose: 'fork',
+    title: 'T',
+    exchanges: [
+      { question: 'what is a monad?', answer: 'A burrito.' },
+      { question: '', answer: '' },
+    ],
+  });
+  const ctx = await mergeCtx({
+    prepare: (host) => {
+      host.history.sd = [...SHARED, { role: 'user', text: 'what is a [[monad|a type]]?' }, { role: 'assistant', text: 'A [[monad|a type]] is ::termline{v="a burrito." t="t"}' }];
+      host.digestEvent = () => ({ digest: 'd' });
+    },
+  });
+  await mergeButton(ctx, 'digest').props.onClick(fakeEvent());
+  await flush();
+  assert.deepEqual(ctx.host.order.find(([k]) => k === 'digest')[1].exchanges, [{ question: 'what is a monad?', answer: 'A monad is a burrito.' }]);
+  ctx.unload();
+});
+
 test('digestResult reads the event payload, or a flat event, and checks it', () => {
   assert.deepEqual(mod.digestResult({ type: 't', payload: { job: 'j', digest: ' d ' } }), { job: 'j', ok: true, digest: 'd' });
   assert.deepEqual(mod.digestResult({ job: 7, digest: 'd' }), { job: '7', ok: true, digest: 'd' });
@@ -1977,6 +2009,16 @@ const form = (ctx) => byAttr(ctx.pane.render(), 'data-branch-form')[0];
 const formField = (ctx, key) => byAttr(form(ctx), 'data-branch-field', key)[0];
 const typeInto = (ctx, key, value) => formField(ctx, key).props.onChange({ target: { value } });
 const submitForm = (ctx) => byAttr(form(ctx), 'data-branch-submit', 'true')[0].props.onClick(fakeEvent());
+// The model picker of the form: the ModelCatalogMenu element and its controller, and the trigger text.
+const menuOf = (ctx) => findAll(form(ctx), (n) => n.type === 'ModelCatalogMenu')[0];
+const controllerOf = (ctx) => menuOf(ctx).props.controller;
+const modelButton = (ctx) => byAttr(form(ctx), 'data-branch-model', 'true')[0];
+// A row pick as the menu commits it: select, then the preset with the profile default level.
+const pickRow = (ctx, model, provider) => {
+  controllerOf(ctx).select(model, provider);
+  controllerOf(ctx).applyPreset({ effort: 'medium' }, { model, provider });
+};
+const promptOf = (host) => host.order.find(([k]) => k === 'prompt')[1];
 
 test('Branch here sits on the answered exchanges of the open chat only', async () => {
   const ctx = setup({ host: fakeHost({ history: { ...HIST, b2: [...HIST.b2, { role: 'user', text: 'pending' }] } }) });
@@ -2044,24 +2086,28 @@ test('Branch shows on the open row and on the row under the pointer or keyboard 
   ctx.unload();
 });
 
-test('Branch here: session.branch with the count and no name, prompt.submit with the model, open in place', async () => {
+test('Branch here: session.branch with the count and no name, prompt.submit with the picked model, open in place', async () => {
   const ctx = setup();
   await flush();
   ctx.mark = ctx.host.calls.length;
   branchButton(ctx, 'root:1').props.onClick(fakeEvent());
-  assert.equal(formField(ctx, 'model').props.value, '');
+  // No free-text model field: the model comes from Hermes's picker, and nothing is picked yet.
+  assert.equal(formField(ctx, 'model'), undefined);
+  assert.equal(textOf(modelButton(ctx)), `${mod.MODEL_INHERIT_TEXT}\n▾`);
   typeInto(ctx, 'question', 'why q2?');
-  typeInto(ctx, 'model', 'cheap-model');
+  pickRow(ctx, 'claude-x', 'anthropic');
+  controllerOf(ctx).setOptions({ effort: 'high' }, { isActive: true, model: 'claude-x', provider: 'anthropic' });
+  assert.match(textOf(modelButton(ctx)), /^anthropic: claude-x · High/);
   await submitForm(ctx);
   await flush();
   // b2's rows: q1 a1 q2 a2 b1q b1a b2q b2a. Exchange 1 ends at a2: four rows.
   const branch = ctx.host.order.find(([k]) => k === 'branch');
   assert.deepEqual(branch[1], { session_id: 'rt-b2', count: 4 });
   assert.equal('name' in branch[1], false);
-  assert.deepEqual(ctx.host.order.find(([k]) => k === 'prompt')[1], {
+  assert.deepEqual(promptOf(ctx.host), {
     session_id: 'nb-rt',
     text: 'why q2?',
-    model_override: { model: 'cheap-model' },
+    model_override: { model: 'claude-x', provider: 'anthropic', reasoning: 'high' },
   });
   assert.deepEqual(ctx.host.opened, [['nb', OPEN_HERE]]);
   // Order: read, branch, a reload right after the branch, ask, then the fork digest (after the open).
@@ -2073,11 +2119,11 @@ test('Branch here: session.branch with the count and no name, prompt.submit with
     'plugin.chat-tree.digest.write',
   ]);
   assert.equal(form(ctx), undefined);
-  // Stored: the branch ids (both) and the model for the next form.
+  // Stored: the branch ids (both). The model is never stored: the next form starts with nothing picked.
   assert.deepEqual(ctx.storage.map.get(mod.BRANCH_IDS_KEY), ['nb-rt', 'nb']);
-  assert.deepEqual(ctx.storage.map.get(mod.MODEL_KEY), { model: 'cheap-model' });
+  assert.deepEqual([...ctx.storage.map.keys()].filter((k) => !k.startsWith('digest:')), [mod.BRANCH_IDS_KEY]);
   branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
-  assert.equal(formField(ctx, 'model').props.value, 'cheap-model');
+  assert.deepEqual(controllerOf(ctx).current, { effort: '', fast: false, model: '', provider: '' });
   // The new branch, retitled by Hermes, shows the side pill from the stored ids.
   ctx.host.rows = [...ROWS, row('nb', { _branched_from: 'b2', title: 'Hermes named it', started_at: 50 })];
   ctx.host.history.nb = [...msgs(['q1', 'a1'], ['q2', 'a2']), ...msgs(['why q2?', 'because'])];
@@ -2105,6 +2151,94 @@ test('Branch here sends through_message_id when the rows carry row ids, and no o
   await flush();
   assert.deepEqual(host.order.find(([k]) => k === 'branch')[1], { session_id: 'rt-b2', count: 8, through_message_id: 107 });
   assert.deepEqual(host.order.find(([k]) => k === 'prompt')[1], { session_id: 'nb-rt', text: 'more?' });
+  ctx.unload();
+});
+
+test('the Branch form model picker is Hermes ModelCatalogMenu in a DropdownMenu, as the kanban plugin uses it', async () => {
+  const ctx = setup();
+  await flush();
+  branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+  const root = findAll(form(ctx), (n) => n.type === 'DropdownMenu')[0];
+  assert.equal(root.props.open, false);
+  const trigger = findAll(root, (n) => n.type === 'DropdownMenuTrigger')[0];
+  assert.equal(trigger.props.asChild, true);
+  assert.equal(trigger.props.children.type, 'Button');
+  const content = findAll(root, (n) => n.type === 'DropdownMenuContent')[0];
+  const close = findAll(content, (n) => n.type === 'ModelMenuClose')[0];
+  assert.equal(close.props.children.type, 'ModelCatalogMenu');
+  assert.equal(menuOf(ctx).props.profile, 'default');
+  const controller = controllerOf(ctx);
+  // Read-only against Hermes's presets, no fast or service tier.
+  assert.deepEqual(controller.presetFor('anthropic', 'claude-x'), {});
+  assert.equal(controller.allowSpeed, false);
+  // The menu opens and closes through the form; a pick closes it through the close context.
+  root.props.onOpenChange(true);
+  assert.equal(findAll(form(ctx), (n) => n.type === 'DropdownMenu')[0].props.open, true);
+  findAll(form(ctx), (n) => n.type === 'ModelMenuClose')[0].props.value();
+  assert.equal(findAll(form(ctx), (n) => n.type === 'DropdownMenu')[0].props.open, false);
+  ctx.unload();
+});
+
+test('model_override has only model, provider and reasoning; a key the user did not set is left out', async () => {
+  // A row pick keeps the default level (no reasoning key); a set level sends it; fast edits are ignored.
+  for (const [steps, override] of [
+    [(ctx) => pickRow(ctx, 'claude-x', 'anthropic'), { model: 'claude-x', provider: 'anthropic' }],
+    [
+      (ctx) => {
+        pickRow(ctx, 'claude-x', 'anthropic');
+        controllerOf(ctx).setOptions({ fast: true }, { isActive: true, model: 'claude-x', provider: 'anthropic' });
+        controllerOf(ctx).setOptions({ effort: 'none' }, { isActive: true, model: 'claude-x', provider: 'anthropic' });
+      },
+      { model: 'claude-x', provider: 'anthropic', reasoning: 'none' },
+    ],
+    [(ctx) => controllerOf(ctx).select('local-model', ''), { model: 'local-model' }],
+  ]) {
+    const ctx = setup();
+    await flush();
+    branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+    typeInto(ctx, 'question', 'q?');
+    steps(ctx);
+    await submitForm(ctx);
+    await flush();
+    const sent = promptOf(ctx.host).model_override;
+    assert.deepEqual(sent, override);
+    assert.deepEqual(Object.keys(sent).filter((k) => !['model', 'provider', 'reasoning'].includes(k)), []);
+    ctx.unload();
+  }
+  assert.equal(mod.modelOverride(mod.EMPTY_CHOICE), null);
+  assert.equal(mod.modelOverride({ model: '  ', provider: 'p', effort: 'high' }), null);
+  assert.equal(mod.modelOverride(undefined), null);
+  assert.deepEqual(mod.modelOverride({ model: ' m ', provider: ' ', effort: '' }), { model: 'm' });
+});
+
+test('nothing picked, or Clear after a pick, sends no model_override', async () => {
+  const ctx = setup();
+  await flush();
+  branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+  typeInto(ctx, 'question', 'q?');
+  assert.equal(byAttr(form(ctx), 'data-branch-model-clear').length, 0);
+  pickRow(ctx, 'claude-x', 'anthropic');
+  byAttr(form(ctx), 'data-branch-model-clear', 'true')[0].props.onClick(fakeEvent());
+  assert.equal(textOf(modelButton(ctx)), `${mod.MODEL_INHERIT_TEXT}\n▾`);
+  await submitForm(ctx);
+  await flush();
+  assert.deepEqual(promptOf(ctx.host), { session_id: 'nb-rt', text: 'q?' });
+  ctx.unload();
+});
+
+test('an SDK without the model picker shows a note in the form and sends no model_override', async () => {
+  const ctx = setup({ picker: false });
+  await flush();
+  branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+  assert.equal(menuOf(ctx), undefined);
+  assert.equal(formField(ctx, 'model'), undefined);
+  const missing = byAttr(form(ctx), 'data-branch-model-missing', 'true')[0];
+  assert.equal(missing.props.children, mod.MODEL_PICKER_MISSING_TEXT);
+  assert.equal(missing.props.style.userSelect, 'text');
+  typeInto(ctx, 'question', 'q?');
+  await submitForm(ctx);
+  await flush();
+  assert.deepEqual(promptOf(ctx.host), { session_id: 'nb-rt', text: 'q?' });
   ctx.unload();
 });
 

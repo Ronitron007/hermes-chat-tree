@@ -74,10 +74,11 @@ export const MERGE_NOTHING_TEXT = 'Nothing to merge: this chat has no question a
 export const DIGEST_MISSING_TEXT = 'The digest backend is not available (the chat-tree Python half is not enabled). Nothing was staged.';
 export const DIGEST_TIMEOUT_TEXT = 'No digest came back in 60 seconds.';
 export const BRANCH_BUSY_TEXT = 'This chat is running. Branch here works again when the run ends.';
+export const MODEL_INHERIT_TEXT = "This chat's model";
+export const MODEL_PICKER_MISSING_TEXT = "This Hermes has no model picker for plugins. The branch uses this chat's model.";
 // ctx.storage keys (stored as hermes.plugin.chat-tree.<key>). BRANCH_IDS_KEY lists the ids of the
-// branches this pane made. MODEL_KEY is the last branch model. A fork digest sits under digestKey.
+// branches this pane made. A fork digest sits under digestKey.
 export const BRANCH_IDS_KEY = 'branchIds';
-export const MODEL_KEY = 'branchModel';
 export const digestKey = (chatId, index) => `digest:${chatId}:${index}`;
 // The digest contract with the plugin's Python half. The request answers { job } at once; the
 // result comes as a gateway event to the clients that view session_id, matched on job.
@@ -89,8 +90,6 @@ export const DIGEST_TIMEOUT_MS = 60_000;
 // missing: [ids not in the store] }. Read-only, local, no model call.
 export const HISTORY_METHOD = 'plugin.chat-tree.history.read';
 export const BACKEND_NOTE_TEXT = 'Enable the chat-tree plugin backend to see other chats (hermes plugins enable chat-tree).';
-// side-chat's saved side model, read raw: the branch form's default before this pane saves its own.
-const SIDE_CHAT_MODEL_STORAGE = 'hermes.plugin.side-chat.sideChat:model';
 
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text' };
 const HISTORY_CONCURRENCY = 4;
@@ -622,6 +621,36 @@ export function branchCount(rows, index) {
   return found;
 }
 
+// ── Branch here: the model the user picks ──────────────────────────────────────────────────
+//
+// The user picks the branch model and reasoning level in Hermes's own ModelCatalogMenu (Rohan,
+// 2026-11-12 01:05). A choice is { model, provider, effort }, as the kanban plugin's per-task
+// override holds it (plugins/kanban/model-override.tsx). effort: '' is the default, 'none' is
+// thinking off, else a reasoning level. EMPTY_CHOICE: nothing picked, the chat's own model.
+export const EMPTY_CHOICE = Object.freeze({ model: '', provider: '', effort: '' });
+
+// The one-turn model_override of prompt.submit for a choice, or null when no model is picked.
+// Only model, provider and reasoning: any other key fails with invalid_params
+// (gateway/session_cli_turn.py:40-53). A key the user did not set is left out.
+export function modelOverride(choice) {
+  const model = str(choice?.model);
+  if (!model) return null;
+  const provider = str(choice?.provider);
+  const reasoning = str(choice?.effort);
+  return { model, ...(provider ? { provider } : {}), ...(reasoning ? { reasoning } : {}) };
+}
+
+// The picker button text: `provider: model · level`, or MODEL_INHERIT_TEXT when nothing is picked.
+export function choiceLabel(choice, effortLabel) {
+  const model = str(choice?.model);
+  if (!model) return MODEL_INHERIT_TEXT;
+  const provider = str(choice?.provider);
+  const effort = str(choice?.effort);
+  const level = effort ? (typeof effortLabel === 'function' ? str(effortLabel(effort)) || effort : effort) : '';
+  const base = provider ? `${provider}: ${model}` : model;
+  return level ? `${base} · ${level}` : base;
+}
+
 // ── Merge back: targets, the merged part, the staged text, digests ─────────────────────────
 
 // The merge targets of the open chat: its ancestors in the loaded tree, parent first, up to the root.
@@ -668,14 +697,15 @@ export function formatMergeText(question, body) {
 }
 
 // The digest request without its session_id. purpose: 'fork' (the part a branch fixed) or
-// 'merge' (a chat's own part).
+// 'merge' (a chat's own part). The model reads each question and answer with concept-link markup
+// removed, as the staged text has it.
 export function digestRequest(purpose, title, exchanges) {
   return {
     purpose,
     title: str(title),
     exchanges: (Array.isArray(exchanges) ? exchanges : []).map((ex) => ({
-      question: typeof ex?.question === 'string' ? ex.question : '',
-      answer: typeof ex?.answer === 'string' ? ex.answer : '',
+      question: stripConceptMarkup(ex?.question),
+      answer: stripConceptMarkup(ex?.answer),
     })),
   };
 }
@@ -1132,6 +1162,20 @@ const INPUT_STYLE = { ...SELECTABLE, width: '100%', boxSizing: 'border-box' };
 export function createChatTree(deps) {
   const { host, jsx, jsxs, atom, useValue, Button, ScrollArea } = deps;
   const Input = deps.Input ?? 'input';
+  // Hermes's model picker, as the kanban plugin uses it: ModelCatalogMenu inside DropdownMenu,
+  // DropdownMenuTrigger and DropdownMenuContent (all SDK exports). null when the SDK lacks one:
+  // the Branch form then says so and sends no override.
+  const picker =
+    deps.ModelCatalogMenu && deps.DropdownMenu && deps.DropdownMenuTrigger && deps.DropdownMenuContent
+      ? {
+          Menu: deps.ModelCatalogMenu,
+          Close: deps.ModelMenuCloseContext?.Provider ?? deps.ModelMenuCloseContext ?? null,
+          Root: deps.DropdownMenu,
+          Trigger: deps.DropdownMenuTrigger,
+          Content: deps.DropdownMenuContent,
+          effortLabel: typeof deps.reasoningEffortLabel === 'function' ? deps.reasoningEffortLabel : null,
+        }
+      : null;
 
   // rows: last good session rows. agents: last good subagents, for agentsFor (a runtime id).
   // exchanges: { [chat id]: exchanges } for the chats of the focused tree. branchIds: the ids of
@@ -1759,30 +1803,29 @@ export function createChatTree(deps) {
 
   // ── Branch here: fork the open chat at an exchange and ask the branch a question ──────────
 
-  // The form's model, as side-chat picks its side model: the last one typed (ctx.storage), else
-  // side-chat's saved side model, else blank, which keeps the chat's own model (no override).
-  function defaultModel() {
-    const saved = read(MODEL_KEY);
-    if (saved && typeof saved === 'object' && typeof saved.model === 'string') return str(saved.model);
-    try {
-      const raw = globalThis.localStorage?.getItem?.(SIDE_CHAT_MODEL_STORAGE);
-      const side = raw ? JSON.parse(raw) : null;
-      return side && typeof side === 'object' ? str(side.model) : '';
-    } catch {
-      return '';
-    }
-  }
-
+  // A new form has nothing picked: the branch keeps this chat's model until the user picks one.
+  // model: the picked choice (EMPTY_CHOICE). picking: the model picker is open.
   function openBranchForm(chatId, index, label) {
-    setUi({ branch: { chatId, index, label, question: '', model: defaultModel(), busy: false, error: null } });
+    setUi({ branch: { chatId, index, label, question: '', model: EMPTY_CHOICE, picking: false, busy: false, error: null } });
   }
 
   function setBranchField(key, value) {
     const form = $ui.get().branch;
     if (!form) return;
-    const text = typeof value === 'string' ? value : '';
-    setUi({ branch: { ...form, [key]: text } });
-    if (key === 'model') write(MODEL_KEY, { model: str(text) });
+    setUi({ branch: { ...form, [key]: typeof value === 'string' ? value : '' } });
+  }
+
+  // The picked choice. Only the form holds it: nothing is stored, and Hermes's presets never change.
+  function setBranchModel(choice) {
+    const form = $ui.get().branch;
+    if (!form || form.busy) return;
+    setUi({ branch: { ...form, model: { model: str(choice?.model), provider: str(choice?.provider), effort: str(choice?.effort) } } });
+  }
+
+  function setBranchPicking(open) {
+    const form = $ui.get().branch;
+    if (!form) return;
+    setUi({ branch: { ...form, picking: open === true && !form.busy } });
   }
 
   const cancelBranch = () => setUi({ branch: null });
@@ -1855,10 +1898,9 @@ export function createChatTree(deps) {
     // The new fork shows at once: its stub node until its first exchange lands.
     reload();
 
-    const model = str(form.model);
-    const submit = { session_id: sessionId, text: question };
-    // A blank model keeps the chat's own model: no override at all (side-chat's rule).
-    if (model) submit.model_override = { model };
+    // Nothing picked keeps the chat's own model: no override at all.
+    const override = modelOverride(form.model);
+    const submit = { session_id: sessionId, text: question, ...(override ? { model_override: override } : {}) };
     try {
       await host.request('prompt.submit', submit);
     } catch (error) {
@@ -2084,6 +2126,95 @@ export function createChatTree(deps) {
   const note = (text, extra, key) =>
     jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, 'data-selectable-text': 'true', ...extra, children: text }, key);
 
+  // The branch model field: Hermes's ModelCatalogMenu in a DropdownMenu, as the kanban plugin's
+  // per-task override (plugins/kanban/model-override.tsx). The controller only holds the choice in the
+  // form. presetFor gives {} so Hermes's presets never change. allowSpeed is false: model_override has
+  // no fast key. A picked row starts at the default level (effort ''), so reasoning goes out only
+  // when the user sets a level. Clear goes back to this chat's model.
+  function modelField(form) {
+    if (!picker) return note(MODEL_PICKER_MISSING_TEXT, { 'data-branch-model-missing': 'true' }, 'model');
+    const choice = form.model ?? EMPTY_CHOICE;
+    const latest = () => $ui.get().branch?.model ?? EMPTY_CHOICE;
+    const controller = {
+      allowSpeed: false,
+      applyPreset: (_preset, row) => setBranchModel({ model: row?.model, provider: row?.provider, effort: '' }),
+      current: { effort: choice.effort, fast: false, model: choice.model, provider: choice.provider },
+      presetFor: () => ({}),
+      select: (model, provider) => setBranchModel({ ...latest(), model, provider }),
+      setOptions: (patch, row) => {
+        if (patch?.effort === undefined) return;
+        setBranchModel({ effort: patch.effort, model: row?.model, provider: row?.provider });
+      },
+    };
+    const menu = jsx(picker.Menu, { controller, profile: profileKey(atomOf('profile').get()) }, 'menu');
+    const picked = Boolean(modelOverride(choice));
+    const close = () => setBranchPicking(false);
+    return jsxs(
+      'div',
+      {
+        className: 'flex items-center gap-1',
+        style: SELECTABLE,
+        'data-selectable-text': 'true',
+        children: [
+          jsxs(
+            picker.Root,
+            {
+              open: form.picking === true,
+              onOpenChange: (open) => setBranchPicking(open),
+              children: [
+                jsx(
+                  picker.Trigger,
+                  {
+                    asChild: true,
+                    children: jsxs(Button, {
+                      type: 'button',
+                      variant: 'outline',
+                      className: 'h-8 w-full justify-between gap-2 font-normal',
+                      style: { ...SELECTABLE, flex: '1 1 auto', minWidth: 0, fontSize: 12, padding: '0 10px', ...(picked ? {} : { opacity: 0.72 }) },
+                      'data-branch-model': 'true',
+                      disabled: form.busy,
+                      children: [
+                        jsx('span', { className: 'min-w-0 truncate', style: SELECTABLE, 'data-selectable-text': 'true', children: choiceLabel(choice, picker.effortLabel) }, 'label'),
+                        jsx('span', { 'aria-hidden': 'true', className: 'shrink-0', style: { ...SELECTABLE, opacity: 0.5 }, children: '▾' }, 'caret'),
+                      ],
+                    }),
+                  },
+                  'trigger',
+                ),
+                jsx(
+                  picker.Content,
+                  { align: 'start', className: 'w-72 p-0', children: picker.Close ? jsx(picker.Close, { value: close, children: menu }) : menu },
+                  'content',
+                ),
+              ],
+            },
+            'picker',
+          ),
+          picked
+            ? jsx(
+                Button,
+                {
+                  type: 'button',
+                  variant: 'ghost',
+                  title: `Back to ${MODEL_INHERIT_TEXT.toLowerCase()}`,
+                  'data-branch-model-clear': 'true',
+                  disabled: form.busy,
+                  style: ROW_ACTION,
+                  onClick: (event) => {
+                    stop(event);
+                    setBranchModel(EMPTY_CHOICE);
+                  },
+                  children: 'Clear',
+                },
+                'clear',
+              )
+            : null,
+        ].filter(Boolean),
+      },
+      'model',
+    );
+  }
+
   // The Branch here form, below the graph so the rows never move. busy: the open chat is running.
   function branchForm(form, busy) {
     const blocked = busy || form.busy;
@@ -2125,7 +2256,7 @@ export function createChatTree(deps) {
               }
             },
           }),
-          field('model', "Model (blank: this chat's model)"),
+          modelField(form),
           jsxs(
             'div',
             {
