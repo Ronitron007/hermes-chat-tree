@@ -6,6 +6,7 @@ import {
   TIMEOUT_TEXT,
   TIMEOUT_MS,
   POLL_MS,
+  PAGE_LIMIT,
   MAX_ENTRIES,
   MODEL_KEY,
   listKey,
@@ -14,25 +15,47 @@ import {
 
 const el = (type, props, key) => ({ type, props, key });
 
+// nanostores-like atom: get, set, listen (no immediate call).
 function atom(initial) {
   let value = initial;
-  return { get: () => value, set: (next) => void (value = next) };
+  const subs = new Set();
+  return {
+    get: () => value,
+    set(next) {
+      value = next;
+      subs.forEach((fn) => fn(value));
+    },
+    listen(fn) {
+      subs.add(fn);
+      return () => subs.delete(fn);
+    },
+    listeners: () => subs.size,
+  };
 }
 
-function memoryStorage(seed = {}) {
+function asyncStorage(seed = {}) {
   const data = { ...seed };
   return { data, get: async (k) => data[k], set: async (k, v) => void (data[k] = v) };
 }
 
-// Fake timers and clock: run() fires due timers in order, advancing now().
+// Desktop ctx.storage is synchronous (apps/desktop/src/contrib/plugin.ts createPluginStorage).
+function syncStorage(seed = {}) {
+  const data = { ...seed };
+  return { data, get: (k) => data[k], set: (k, v) => void (data[k] = v) };
+}
+
+// Fake scoped timers and clock, like ctx.setTimeout: each returns a cancel function.
 function fakeClock() {
   let t = 1_000_000;
   let id = 0;
   const timers = new Map();
   return {
     now: () => t,
-    setTimeout: (fn, ms) => (timers.set(++id, { at: t + ms, fn }), id),
-    clearTimeout: (i) => void timers.delete(i),
+    setTimeout(fn, ms) {
+      const key = ++id;
+      timers.set(key, { at: t + ms, fn });
+      return () => timers.delete(key);
+    },
     pending: () => timers.size,
     async tick(ms) {
       const end = t + ms;
@@ -50,59 +73,67 @@ function fakeClock() {
 }
 
 const flush = async () => {
-  for (let i = 0; i < 20; i++) await Promise.resolve();
+  for (let i = 0; i < 30; i++) await Promise.resolve();
 };
 
-const copied = [
+const MAIN_ROWS = [
   { role: 'user', text: 'main question', row_id: 1 },
   { role: 'assistant', text: 'main answer', row_id: 2 },
 ];
 
-// A fake gateway. The branch transcript is the copied rows, then the question and the answer
-// appear after `answerAfter` transcript reads.
-function fakeHost({ focused = 'main-1', branchError, answerAfter = 2, answer = 'side answer', submitError } = {}) {
+// A fake gateway. Each branch transcript starts as a copy of `mainRows` (new row_ids, as a real
+// copy gets). `script(n, branch)` runs before the n-th transcript read after prompt.submit and may
+// push rows or set busy. Cursors are row offsets.
+function fakeHost({
+  runtime = 'rt-main',
+  stored = 'st-main',
+  mainRows = MAIN_ROWS,
+  branchError,
+  submitError,
+  script = defaultScript,
+} = {}) {
   const calls = [];
-  let branches = 0;
-  let reads = 0;
   const opened = [];
-  const state = { focusedSessionId: atom(focused), activeSessionId: atom(null) };
+  const branches = new Map();
+  let nextRowId = 100;
+  const state = {
+    focusedStoredSessionId: atom(stored),
+    focusedSessionId: atom(runtime),
+    activeSessionId: atom(null),
+    busyBySession: atom({}),
+  };
   const host = {
     state,
     calls,
     opened,
+    branches,
     openSession: async (id, opts) => void opened.push([id, opts]),
     revealPane: () => {},
     async request(method, params) {
       calls.push([method, params]);
       if (method === 'session.branch_whole') {
         if (branchError) throw branchError;
-        branches += 1;
-        return { session_id: `branch-${branches}`, stored_session_id: `stored-${branches}`, title: params.name };
+        const id = `branch-${branches.size + 1}`;
+        const rows = mainRows.map((r) => ({ ...r, row_id: ++nextRowId }));
+        branches.set(id, { rows, reads: 0, submitted: false, question: null });
+        return { session_id: id, stored_session_id: id, title: params.name, message_count: rows.length };
       }
       if (method === 'prompt.submit') {
         if (submitError) throw submitError;
+        const b = branches.get(params.session_id);
+        b.submitted = true;
+        b.question = params.text;
         return { status: 'queued', session_id: params.session_id, admission_id: 'a1' };
       }
       if (method === 'session.transcript') {
-        reads += 1;
-        const question = calls.find(([m]) => m === 'prompt.submit')?.[1]?.text;
-        if (!params.cursor) {
-          const rows = [...copied];
-          if (reads >= answerAfter) rows.push({ role: 'user', text: question, row_id: 3 });
-          return { session_id: params.session_id, rows, next_cursor: 'c1', reset: false };
+        const b = branches.get(params.session_id);
+        if (b.submitted) {
+          b.reads += 1;
+          script(b.reads, b, { add: (row) => b.rows.push({ ...row, row_id: ++nextRowId }), state });
         }
-        if (reads >= answerAfter && answer !== null) {
-          return {
-            session_id: params.session_id,
-            rows: [
-              { role: 'user', text: question, row_id: 3 },
-              { role: 'assistant', text: answer, row_id: 4 },
-            ],
-            next_cursor: 'c2',
-            reset: false,
-          };
-        }
-        return { session_id: params.session_id, rows: [], next_cursor: params.cursor, reset: false };
+        const offset = params.cursor ? Number(params.cursor) : 0;
+        const rows = b.rows.slice(offset, offset + params.limit);
+        return { session_id: params.session_id, rows, next_cursor: String(offset + rows.length), reset: false };
       }
       throw new Error(`unexpected ${method}`);
     },
@@ -110,8 +141,15 @@ function fakeHost({ focused = 'main-1', branchError, answerAfter = 2, answer = '
   return host;
 }
 
-function setup({ host = fakeHost(), storage = memoryStorage(), clock = fakeClock(), useValue } = {}) {
+// The question lands on the first read; the answer on the second.
+function defaultScript(n, b, { add }) {
+  if (n === 1) add({ role: 'user', text: b.question });
+  if (n === 2) add({ role: 'assistant', text: 'side answer' });
+}
+
+function setup({ host = fakeHost(), storage = asyncStorage(), clock = fakeClock(), useValue } = {}) {
   const registered = [];
+  const disposers = [];
   const chat = createSideChat({
     host,
     jsx: el,
@@ -121,12 +159,23 @@ function setup({ host = fakeHost(), storage = memoryStorage(), clock = fakeClock
     Button: 'Button',
     Input: 'Input',
     ScrollArea: 'ScrollArea',
-    setTimeout: clock.setTimeout,
-    clearTimeout: clock.clearTimeout,
     now: clock.now,
   });
-  chat.register({ register: (c) => registered.push(c), storage });
-  return { chat, host, storage, clock, registered, pane: registered.find((c) => c.area === 'panes') };
+  chat.register({
+    register: (c) => registered.push(c),
+    storage,
+    setTimeout: clock.setTimeout,
+    onDispose: (fn) => disposers.push(fn),
+  });
+  return {
+    chat,
+    host,
+    storage,
+    clock,
+    registered,
+    unload: () => disposers.forEach((fn) => fn()),
+    pane: registered.find((c) => c.area === 'panes'),
+  };
 }
 
 // Expands function components (EntryRow) so tests see the whole tree.
@@ -154,10 +203,11 @@ const textOf = (node) =>
     .join('\n');
 
 const methods = (host) => host.calls.map(([m]) => m);
+const entryOf = (ctx, chatId = 'st-main') => ctx.chat.$lists.get()[chatId]?.[0];
 
-async function ask(ctx, question, { model = '', provider = '' } = {}) {
+async function ask(ctx, question, { model = '', provider = '', chatId = 'st-main', runtimeId = 'rt-main' } = {}) {
   ctx.chat.$form.set({ question, model, provider });
-  await ctx.chat.ask('main-1');
+  await ctx.chat.ask(chatId, runtimeId);
   await flush();
 }
 
@@ -170,25 +220,77 @@ test('registers the pane and a palette command', () => {
 test('a question forks, submits on the branch, and polls the transcript until the answer', async () => {
   const ctx = setup();
   await ask(ctx, '  what is a monad?  ');
-  const [branchCall, submitCall] = ctx.host.calls;
-  assert.deepEqual(branchCall[0], 'session.branch_whole');
-  assert.equal(branchCall[1].session_id, 'main-1');
+  const [branchCall] = ctx.host.calls;
+  assert.equal(branchCall[0], 'session.branch_whole');
+  assert.equal(branchCall[1].session_id, 'rt-main');
   assert.equal(branchCall[1].name, 'Side: what is a monad?');
   assert.ok(branchCall[1].idempotency_key);
-  assert.deepEqual(submitCall, ['prompt.submit', { session_id: 'branch-1', text: 'what is a monad?' }]);
-  assert.equal(ctx.host.calls[2][0], 'session.transcript');
-  assert.equal(ctx.host.calls[2][1].order, 'oldest');
-  assert.equal(ctx.host.calls[2][1].session_id, 'branch-1');
-
-  // The copied rows hold an old answer; it must not count.
-  assert.equal(ctx.chat.$lists.get()['main-1'][0].status, 'asking');
-  await ctx.clock.tick(POLL_MS);
-  const entry = ctx.chat.$lists.get()['main-1'][0];
+  const submit = ctx.host.calls.find(([m]) => m === 'prompt.submit');
+  assert.deepEqual(submit, ['prompt.submit', { session_id: 'branch-1', text: 'what is a monad?' }]);
+  // Fence read, then submit, then polls; all on the branch, oldest order.
+  assert.deepEqual(methods(ctx.host).slice(0, 3), ['session.branch_whole', 'session.transcript', 'prompt.submit']);
+  for (const [, p] of ctx.host.calls.filter(([m]) => m === 'session.transcript')) {
+    assert.equal(p.session_id, 'branch-1');
+    assert.equal(p.order, 'oldest');
+  }
+  await ctx.clock.tick(POLL_MS * 3);
+  const entry = entryOf(ctx);
   assert.equal(entry.status, 'answered');
   assert.equal(entry.answer, 'side answer');
-  // The second read passes the cursor of the first page.
-  assert.equal(ctx.host.calls[3][1].cursor, 'c1');
-  assert.ok(!ctx.host.calls.some(([m, p]) => m === 'prompt.submit' && p.session_id === 'main-1'));
+  // The first poll starts at the fence cursor (after the 2 copied rows).
+  const polls = ctx.host.calls.filter(([m]) => m === 'session.transcript').slice(1);
+  assert.equal(polls[0][1].cursor, '2');
+  assert.ok(!ctx.host.calls.some(([m, p]) => m === 'prompt.submit' && p.session_id === 'rt-main'));
+});
+
+test('an identical earlier question in the main chat never returns its old answer', async () => {
+  const mainRows = [
+    { role: 'user', text: 'why?' },
+    { role: 'assistant', text: 'OLD main-chat answer' },
+  ];
+  const ctx = setup({ host: fakeHost({ mainRows }) });
+  await ask(ctx, 'why?');
+  await ctx.clock.tick(POLL_MS * 4);
+  assert.equal(entryOf(ctx).answer, 'side answer');
+});
+
+test('interim assistant text before a tool call is not the answer', async () => {
+  const script = (n, b, { add, state }) => {
+    if (n === 1) {
+      add({ role: 'user', text: b.question });
+      add({ role: 'assistant', text: 'Let me search for that.' });
+      state.busyBySession.set({ 'branch-1': true });
+    }
+    if (n === 3) add({ role: 'tool', name: 'web_search' });
+    if (n === 4) {
+      add({ role: 'assistant', text: 'final answer' });
+      state.busyBySession.set({ 'branch-1': false });
+    }
+  };
+  const ctx = setup({ host: fakeHost({ script }) });
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 2);
+  assert.equal(entryOf(ctx).status, 'asking');
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+  assert.equal(entryOf(ctx).answer, 'final answer');
+});
+
+test('with no busy report, the answer must hold for two reads', async () => {
+  const script = (n, b, { add }) => {
+    if (n === 1) {
+      add({ role: 'user', text: b.question });
+      add({ role: 'assistant', text: 'interim' });
+    }
+    if (n === 2) add({ role: 'tool', name: 't' });
+    if (n === 3) add({ role: 'assistant', text: 'done' });
+  };
+  const ctx = setup({ host: fakeHost({ script }) });
+  await ask(ctx, 'q');
+  await ctx.clock.tick(POLL_MS * 2);
+  assert.equal(entryOf(ctx).status, 'asking');
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).answer, 'done');
 });
 
 test('branch name keeps the first 50 characters of the question', () => {
@@ -207,9 +309,8 @@ test('a model field sends model_override with the model and the provider', async
   await ask(ctx, 'q', { model: ' gpt-5.6-luna ', provider: ' openai-codex ' });
   const submit = ctx.host.calls.find(([m]) => m === 'prompt.submit')[1];
   assert.deepEqual(submit.model_override, { model: 'gpt-5.6-luna', provider: 'openai-codex' });
-  const entry = ctx.chat.$lists.get()['main-1'][0];
-  assert.equal(entry.model, 'gpt-5.6-luna');
-  assert.equal(entry.provider, 'openai-codex');
+  assert.equal(entryOf(ctx).model, 'gpt-5.6-luna');
+  assert.equal(entryOf(ctx).provider, 'openai-codex');
 });
 
 test('a model with no provider sends only the model', async () => {
@@ -219,36 +320,37 @@ test('a model with no provider sends only the model', async () => {
   assert.deepEqual(submit.model_override, { model: 'm1' });
 });
 
-test('a busy error shows the busy message and sends no prompt.submit', async () => {
-  const error = Object.assign(new Error('session busy'), { code: 4009 });
+test('a session_busy refusal (canonical mutation shape) shows the busy message, no prompt.submit', async () => {
+  const error = Object.assign(new Error('session_busy'), { code: 4001, data: { reason: 'session_busy' } });
   const ctx = setup({ host: fakeHost({ branchError: error }) });
   await ask(ctx, 'q');
   assert.deepEqual(methods(ctx.host), ['session.branch_whole']);
-  assert.equal(ctx.chat.$notices.get()['main-1'], BUSY_TEXT);
+  assert.equal(ctx.chat.$status.get()['st-main'].notice, BUSY_TEXT);
   assert.match(textOf(expand(ctx.pane.render())), /The main chat is busy/);
-  assert.equal(ctx.chat.$lists.get()['main-1'], undefined);
+  assert.equal(entryOf(ctx), undefined);
 });
 
 test('another fork error shows its own text', async () => {
   const ctx = setup({ host: fakeHost({ branchError: new Error('nothing to branch — send a message first') }) });
   await ask(ctx, 'q');
   assert.deepEqual(methods(ctx.host), ['session.branch_whole']);
-  assert.match(ctx.chat.$notices.get()['main-1'], /nothing to branch/);
+  assert.match(ctx.chat.$status.get()['st-main'].notice, /nothing to branch/);
 });
 
 test('a submit error marks the entry and stops', async () => {
   const ctx = setup({ host: fakeHost({ submitError: new Error('bad model') }) });
   await ask(ctx, 'q', { model: 'nope' });
-  const entry = ctx.chat.$lists.get()['main-1'][0];
-  assert.equal(entry.status, 'error');
-  assert.match(entry.error, /bad model/);
-  assert.ok(!methods(ctx.host).includes('session.transcript'));
+  assert.equal(entryOf(ctx).status, 'error');
+  assert.match(entryOf(ctx).error, /bad model/);
+  await ctx.clock.tick(POLL_MS * 5);
+  assert.equal(ctx.clock.pending(), 0);
 });
 
 test('the poll stops at the answer', async () => {
   const ctx = setup();
   await ask(ctx, 'q');
-  await ctx.clock.tick(POLL_MS);
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
   const reads = methods(ctx.host).filter((m) => m === 'session.transcript').length;
   assert.equal(ctx.clock.pending(), 0);
   await ctx.clock.tick(POLL_MS * 10);
@@ -256,63 +358,141 @@ test('the poll stops at the answer', async () => {
 });
 
 test('the poll stops at the timeout with the timeout message', async () => {
-  const ctx = setup({ host: fakeHost({ answer: null, answerAfter: Infinity }) });
+  const ctx = setup({ host: fakeHost({ script: () => {} }) });
   await ask(ctx, 'q');
   await ctx.clock.tick(TIMEOUT_MS - POLL_MS);
-  assert.equal(ctx.chat.$lists.get()['main-1'][0].status, 'asking');
+  assert.equal(entryOf(ctx).status, 'asking');
   await ctx.clock.tick(POLL_MS * 2);
-  assert.equal(ctx.chat.$lists.get()['main-1'][0].status, 'timeout');
+  assert.equal(entryOf(ctx).status, 'timeout');
   assert.equal(ctx.clock.pending(), 0);
   const reads = methods(ctx.host).filter((m) => m === 'session.transcript').length;
-  assert.ok(reads > 100 && reads <= TIMEOUT_MS / POLL_MS + 1, `reads ${reads}`);
+  assert.ok(reads > 100 && reads <= TIMEOUT_MS / POLL_MS + 2, `reads ${reads}`);
   assert.match(textOf(expand(ctx.pane.render())), new RegExp(TIMEOUT_TEXT.replace('.', '\\.')));
 });
 
-test('reset restarts the read and drops the question seen before it', async () => {
-  const host = fakeHost();
-  let n = 0;
+test('reset restarts the read, drops copied rows by row_id, and finds the new answer', async () => {
+  const host = fakeHost({ script: () => {} });
   const base = host.request;
+  let polls = 0;
   host.request = async (method, params) => {
-    if (method !== 'session.transcript') return base.call(host, method, params);
+    if (method !== 'session.transcript' || !host.branches.get(params.session_id)?.submitted) return base(method, params);
     host.calls.push([method, params]);
-    n += 1;
-    if (n === 1) return { rows: [{ role: 'user', text: 'q' }], next_cursor: 'c1', reset: false };
-    // A rewind replaced the rows: the old question is gone, then an assistant row with no question before it.
-    if (n === 2) return { rows: [...copied], next_cursor: 'r1', reset: true };
-    return { rows: [{ role: 'user', text: 'q' }, { role: 'assistant', text: 'after reset' }], next_cursor: 'r2', reset: false };
+    polls += 1;
+    if (polls === 1) return { rows: [{ role: 'user', text: 'q', row_id: 200 }], next_cursor: 'c1', reset: false };
+    // A rewrite: the reply starts from the first page again, copied rows included.
+    if (polls === 2) {
+      return {
+        rows: [
+          { role: 'user', text: 'q', row_id: 101 },
+          { role: 'assistant', text: 'copied old', row_id: 102 },
+        ],
+        next_cursor: 'r1',
+        reset: true,
+      };
+    }
+    return {
+      rows: [
+        { role: 'user', text: 'q', row_id: 200 },
+        { role: 'assistant', text: 'after reset', row_id: 201 },
+      ],
+      next_cursor: 'r2',
+      reset: false,
+    };
   };
   const ctx = setup({ host });
   await ask(ctx, 'q');
   await ctx.clock.tick(POLL_MS);
-  assert.equal(ctx.chat.$lists.get()['main-1'][0].status, 'asking');
-  await ctx.clock.tick(POLL_MS);
-  assert.equal(ctx.chat.$lists.get()['main-1'][0].answer, 'after reset');
-  const cursors = host.calls.filter(([m]) => m === 'session.transcript').map(([, p]) => p.cursor);
-  assert.deepEqual(cursors, [undefined, 'c1', 'r1']);
+  assert.equal(entryOf(ctx).status, 'asking');
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).answer, 'after reset');
+  const cursors = host.calls
+    .filter(([m]) => m === 'session.transcript')
+    .slice(1)
+    .map(([, p]) => p.cursor);
+  assert.deepEqual(cursors.slice(0, 3), ['2', 'c1', 'r1']);
+});
+
+test('the fence reads every page of a long copied history', async () => {
+  const mainRows = Array.from({ length: PAGE_LIMIT + 10 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', text: `m${i}` }));
+  const ctx = setup({ host: fakeHost({ mainRows }) });
+  await ask(ctx, 'q');
+  const fenceReads = ctx.host.calls.slice(1, ctx.host.calls.findIndex(([m]) => m === 'prompt.submit'));
+  assert.equal(fenceReads.length, 2);
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).answer, 'side answer');
 });
 
 test('lists are separate per main chat and keep 50 entries at most', async () => {
   const ctx = setup();
   for (let i = 0; i < MAX_ENTRIES + 5; i++) await ask(ctx, `q${i}`);
-  ctx.host.state.focusedSessionId.set('main-2');
-  ctx.chat.$form.set({ question: 'other', model: '', provider: '' });
-  await ctx.chat.ask('main-2');
-  await flush();
+  await ask(ctx, 'other', { chatId: 'st-two', runtimeId: 'rt-two' });
   const lists = ctx.chat.$lists.get();
-  assert.equal(lists['main-1'].length, MAX_ENTRIES);
-  assert.equal(lists['main-1'][0].question, `q${MAX_ENTRIES + 4}`);
-  assert.equal(lists['main-2'].length, 1);
-  assert.equal(lists['main-2'][0].question, 'other');
-  assert.equal(ctx.storage.data[listKey('main-1')].length, MAX_ENTRIES);
-  assert.equal(ctx.storage.data[listKey('main-2')].length, 1);
-  ctx.chat.dispose();
+  assert.equal(lists['st-main'].length, MAX_ENTRIES);
+  assert.equal(lists['st-main'][0].question, `q${MAX_ENTRIES + 4}`);
+  assert.equal(lists['st-two'].length, 1);
+  assert.equal(lists['st-two'][0].question, 'other');
+  assert.equal(ctx.storage.data[listKey('st-main')].length, MAX_ENTRIES);
+  assert.equal(ctx.storage.data[listKey('st-two')].length, 1);
+  ctx.unload();
 });
 
-test('the pane shows only the list of the focused chat and loads it from storage', async () => {
-  const stored = [{ id: 'b9', question: 'old q', session_id: 'b9', stored_session_id: 's9', status: 'answered', answer: 'old a', at: 5 }];
-  const storage = memoryStorage({ [listKey('main-1')]: stored, [listKey('main-2')]: [{ ...stored[0], id: 'x', question: 'other chat q' }] });
+test('lists are keyed by the stored session id, which survives a reload', async () => {
+  const storage = syncStorage();
+  const first = setup({ storage });
+  await ask(first, 'q');
+  await first.clock.tick(POLL_MS * 3);
+  first.unload();
+  assert.ok(storage.data[listKey('st-main')]);
+  assert.equal(storage.data[listKey('rt-main')], undefined);
+  // After a restart the runtime id is new; the stored id is the same.
+  const second = setup({ storage, host: fakeHost({ runtime: 'rt-new' }) });
+  assert.match(textOf(expand(second.pane.render())), /side answer/);
+  // The fork still goes to the runtime id.
+  await ask(second, 'q2', { runtimeId: 'rt-new' });
+  assert.equal(second.host.calls[0][1].session_id, 'rt-new');
+  second.unload();
+});
+
+test('unload stops polls and later writes; timers come from ctx.setTimeout', async () => {
+  const storage = syncStorage();
+  const ctx = setup({ storage, host: fakeHost({ script: () => {} }) });
+  await ask(ctx, 'q');
+  assert.ok(ctx.clock.pending() > 0);
+  ctx.unload();
+  assert.equal(ctx.clock.pending(), 0);
+  const before = JSON.stringify(storage.data);
+  const reads = methods(ctx.host).length;
+  await ctx.clock.tick(TIMEOUT_MS * 2);
+  assert.equal(methods(ctx.host).length, reads);
+  assert.equal(JSON.stringify(storage.data), before);
+  // Focus listeners are removed too.
+  assert.equal(ctx.host.state.focusedStoredSessionId.listeners(), 0);
+});
+
+test('render never writes state; the list loads on focus change', async () => {
+  const storage = syncStorage({
+    [listKey('st-two')]: [{ id: 'b9', question: 'two q', session_id: 'b9', status: 'answered', answer: 'a', at: 5 }],
+  });
   const ctx = setup({ storage });
-  ctx.pane.render();
+  let sets = 0;
+  const orig = ctx.chat.$lists.set;
+  ctx.chat.$lists.set = (v) => {
+    sets += 1;
+    orig(v);
+  };
+  ctx.host.state.focusedStoredSessionId.set('st-two');
+  assert.equal(sets, 1);
+  sets = 0;
+  const text = textOf(expand(ctx.pane.render()));
+  assert.equal(sets, 0);
+  assert.match(text, /two q/);
+  ctx.unload();
+});
+
+test('the pane shows only the list of the focused chat', async () => {
+  const stored = [{ id: 'b9', question: 'old q', session_id: 'b9', stored_session_id: 's9', status: 'answered', answer: 'old a', at: 5 }];
+  const storage = asyncStorage({ [listKey('st-main')]: stored, [listKey('st-two')]: [{ ...stored[0], id: 'x', question: 'other chat q' }] });
+  const ctx = setup({ storage });
   await flush();
   const text = textOf(expand(ctx.pane.render()));
   assert.match(text, /old q/);
@@ -320,27 +500,96 @@ test('the pane shows only the list of the focused chat and loads it from storage
   assert.doesNotMatch(text, /other chat q/);
 });
 
+test('corrupt stored entries are dropped, not rendered', async () => {
+  const storage = syncStorage({
+    [listKey('st-main')]: [
+      { id: 'a', question: { bad: 1 }, session_id: 'a', status: 'answered', at: 3 },
+      null,
+      'junk',
+      { id: 'b', question: 'good', session_id: 'b', status: 'answered', answer: { x: 1 }, at: 'x' },
+    ],
+  });
+  const ctx = setup({ storage });
+  const list = ctx.chat.$lists.get()['st-main'];
+  assert.equal(list.length, 1);
+  assert.equal(list[0].question, 'good');
+  assert.equal(list[0].answer, null);
+  // No plain object (a non-element) is ever rendered as a child.
+  for (const n of findAll(expand(ctx.pane.render()), () => true)) {
+    const c = n.props?.children;
+    if (c && typeof c === 'object' && !Array.isArray(c)) assert.ok('type' in c, `object child: ${JSON.stringify(c)}`);
+  }
+});
+
 test('a stored entry left asking with no live poll reads as timed out', async () => {
   const stored = [{ id: 'b1', question: 'q', session_id: 'b1', stored_session_id: 's1', status: 'asking', at: 5 }];
-  const ctx = setup({ storage: memoryStorage({ [listKey('main-1')]: stored }) });
-  ctx.pane.render();
+  const ctx = setup({ storage: asyncStorage({ [listKey('st-main')]: stored }) });
   await flush();
-  assert.equal(ctx.chat.$lists.get()['main-1'][0].status, 'timeout');
+  assert.equal(entryOf(ctx).status, 'timeout');
+});
+
+test('Ask is disabled while a fork is in flight, and a second ask makes no second branch', async () => {
+  const host = fakeHost();
+  const base = host.request;
+  let release;
+  host.request = (method, params) => {
+    if (method === 'session.branch_whole') {
+      host.calls.push([method, params]);
+      return new Promise((resolve) => {
+        release = () => resolve({ session_id: 'branch-x', stored_session_id: 'branch-x' });
+      });
+    }
+    return base(method, params);
+  };
+  host.branches.set('branch-x', { rows: [], reads: 0, submitted: false });
+  const ctx = setup({ host });
+  ctx.chat.$form.set({ question: 'q', model: '', provider: '' });
+  const first = ctx.chat.ask('st-main', 'rt-main');
+  const askButton = () => findAll(ctx.pane.render(), (n) => n.type === 'Button' && n.props.children === 'Ask')[0];
+  assert.equal(askButton().props.disabled, true);
+  await ctx.chat.ask('st-main', 'rt-main');
+  release();
+  await first;
+  await flush();
+  assert.equal(methods(host).filter((m) => m === 'session.branch_whole').length, 1);
+  assert.equal(askButton().props.disabled, false);
+  ctx.unload();
+});
+
+test('text typed during the fork is kept', async () => {
+  const host = fakeHost();
+  const base = host.request;
+  let ctx;
+  host.request = async (method, params) => {
+    if (method === 'session.branch_whole') ctx.chat.$form.set({ ...ctx.chat.$form.get(), question: 'next question' });
+    return base(method, params);
+  };
+  ctx = setup({ host });
+  await ask(ctx, 'first');
+  assert.equal(ctx.chat.$form.get().question, 'next question');
+  assert.equal(entryOf(ctx).question, 'first');
+  ctx.unload();
+});
+
+test('the asked text is cleared when nothing new was typed', async () => {
+  const ctx = setup();
+  await ask(ctx, 'first');
+  assert.equal(ctx.chat.$form.get().question, '');
+  ctx.unload();
 });
 
 test('Open calls host.openSession with the stored id and intent tab', async () => {
   const ctx = setup();
   await ask(ctx, 'q');
-  const tree = expand(ctx.pane.render());
-  const open = findAll(tree, (n) => n.type === 'Button' && n.props.children === 'Open')[0];
+  const open = findAll(expand(ctx.pane.render()), (n) => n.type === 'Button' && n.props.children === 'Open')[0];
   open.props.onClick();
   await flush();
-  assert.deepEqual(ctx.host.opened, [['stored-1', { intent: 'tab' }]]);
-  ctx.chat.dispose();
+  assert.deepEqual(ctx.host.opened, [['branch-1', { intent: 'tab' }]]);
+  ctx.unload();
 });
 
 test('model settings persist under sideChat:model and load on register', async () => {
-  const storage = memoryStorage({ [MODEL_KEY]: { model: 'm', provider: 'p' } });
+  const storage = asyncStorage({ [MODEL_KEY]: { model: 'm', provider: 'p' } });
   const ctx = setup({ storage });
   await flush();
   assert.equal(ctx.chat.$form.get().model, 'm');
@@ -355,12 +604,11 @@ test('all pane text allows selection', async () => {
   const ctx = setup();
   await ask(ctx, 'q');
   const tree = expand(ctx.pane.render());
-  const root = tree.props.children;
-  assert.equal(root.props.style.userSelect, 'text');
+  assert.equal(tree.props.children.props.style.userSelect, 'text');
   const rows = findAll(tree, (n) => n.type === 'pre');
   assert.ok(rows.length > 0);
   for (const row of rows) assert.equal(row.props.style.userSelect, 'text');
-  ctx.chat.dispose();
+  ctx.unload();
 });
 
 test('each render calls the same hooks in the same order (React error 300)', async () => {
@@ -369,7 +617,7 @@ test('each render calls the same hooks in the same order (React error 300)', asy
     log.push(a);
     return a.get();
   };
-  const host = fakeHost({ focused: null });
+  const host = fakeHost({ runtime: null, stored: null });
   const ctx = setup({ host, useValue });
   const order = () => {
     log.length = 0;
@@ -379,19 +627,21 @@ test('each render calls the same hooks in the same order (React error 300)', asy
   };
   const states = [];
   states.push(order()); // no chat
-  host.state.focusedSessionId.set('main-1');
+  host.state.focusedSessionId.set('rt-main');
+  host.state.focusedStoredSessionId.set('st-main');
   states.push(order()); // empty list
   await ask(ctx, 'q');
   states.push(order()); // one entry, asking
-  await ctx.clock.tick(POLL_MS);
+  await ctx.clock.tick(POLL_MS * 3);
   states.push(order()); // answered
-  ctx.chat.$notices.set({ 'main-1': BUSY_TEXT });
-  states.push(order()); // with a notice
+  ctx.chat.$status.set({ 'st-main': { notice: BUSY_TEXT, pending: true } });
+  states.push(order()); // notice, pending
+  ctx.chat.$status.set({});
   for (let i = 0; i < 3; i++) await ask(ctx, `more ${i}`);
   states.push(order()); // several entries
   for (const s of states) {
-    assert.equal(s.length, 5);
+    assert.equal(s.length, 6);
     assert.deepEqual(s, states[0]);
   }
-  ctx.chat.dispose();
+  ctx.unload();
 });
