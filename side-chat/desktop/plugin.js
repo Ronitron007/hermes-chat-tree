@@ -13,6 +13,7 @@ const useValue = sdk.useValue
 const Button = sdk.Button || 'button'
 const Input = sdk.Input || 'input'
 const ScrollArea = sdk.ScrollArea || 'div'
+const MessageTextContent = sdk.MessageTextContent
 
 // Side chat pane: asks a side question in a fork of the focused chat, on the side model,
 // and shows the answer here. The main chat gets no new message.
@@ -81,7 +82,7 @@ function cleanEntry(e) {
 }
 
 function createSideChat(deps) {
-  const { host, jsx, jsxs, atom, useValue, Button, Input, ScrollArea } = deps;
+  const { host, jsx, jsxs, atom, useValue, Button, Input, ScrollArea, MessageTextContent } = deps;
   const now = deps.now ?? (() => Date.now());
 
   // stored main chat id -> entries, newest first.
@@ -358,7 +359,10 @@ function createSideChat(deps) {
       children: [
         jsx('p', { className: 'text-sm font-semibold', style: PRE_STYLE, children: entry.question }),
         jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: `${modelText} · ${when}` }),
-        jsx('pre', { className: 'text-sm', style: PRE_STYLE, children: statusText(entry) }),
+        // Answers use the chat's own markdown renderer when the SDK has it.
+        entry.status === 'answered' && MessageTextContent
+          ? jsx('div', { className: 'text-sm', style: SELECTABLE, children: jsx(MessageTextContent, { text: entry.answer ?? '' }) })
+          : jsx('pre', { className: 'text-sm', style: PRE_STYLE, children: statusText(entry) }),
         entry.diag && (entry.status === 'asking' || entry.status === 'answered' || entry.status === 'timeout')
           ? jsx('p', { className: 'text-xs opacity-60', style: SELECTABLE, children: diagText(entry.diag) })
           : null,
@@ -489,6 +493,7 @@ const _plugin = createSideChat({
   Button,
   Input,
   ScrollArea,
+  MessageTextContent,
   setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
   clearTimeout: (id) => globalThis.clearTimeout(id),
   now: () => Date.now(),

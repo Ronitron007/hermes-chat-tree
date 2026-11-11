@@ -147,7 +147,7 @@ function defaultScript(n, b, { add }) {
   if (n === 2) add({ role: 'assistant', text: 'side answer' });
 }
 
-function setup({ host = fakeHost(), storage = asyncStorage(), clock = fakeClock(), useValue } = {}) {
+function setup({ host = fakeHost(), storage = asyncStorage(), clock = fakeClock(), useValue, MessageTextContent } = {}) {
   const registered = [];
   const disposers = [];
   const chat = createSideChat({
@@ -159,6 +159,7 @@ function setup({ host = fakeHost(), storage = asyncStorage(), clock = fakeClock(
     Button: 'Button',
     Input: 'Input',
     ScrollArea: 'ScrollArea',
+    MessageTextContent,
     now: clock.now,
   });
   chat.register({
@@ -715,4 +716,20 @@ test('each entry shows a muted, selectable poll readout', async () => {
   await slow.clock.tick(TIMEOUT_MS + POLL_MS);
   assert.match(readout(slow)[0].props.children, /done by: timeout$/);
   slow.unload();
+});
+
+test('an answer renders through MessageTextContent when the SDK has it, else as plain text', async () => {
+  const stored = [{ id: 'b9', question: 'q', session_id: 'b9', stored_session_id: 's9', status: 'answered', answer: '**bold**', at: 5 }];
+  const MessageTextContent = 'MessageTextContent';
+  const rich = setup({ storage: asyncStorage({ [listKey('st-main')]: stored }), MessageTextContent });
+  await flush();
+  const md = findAll(expand(rich.pane.render()), (n) => n.type === MessageTextContent);
+  assert.equal(md.length, 1);
+  assert.equal(md[0].props.text, '**bold**');
+
+  const plain = setup({ storage: asyncStorage({ [listKey('st-main')]: stored }) });
+  await flush();
+  const tree = expand(plain.pane.render());
+  assert.equal(findAll(tree, (n) => n.type === MessageTextContent).length, 0);
+  assert.ok(findAll(tree, (n) => n.type === 'pre' && n.props.children === '**bold**').length === 1);
 });
