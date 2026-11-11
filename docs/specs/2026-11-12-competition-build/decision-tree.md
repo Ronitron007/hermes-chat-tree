@@ -1,6 +1,6 @@
 # Decision tree: the competition build
 
-Updated: 2026-11-12 00:30 IST. Green is chosen. Grey is dropped. Yellow is open.
+Updated: 2026-11-12 01:00 IST. Green is chosen. Grey is dropped. Yellow is open.
 
 ```mermaid
 flowchart TD
@@ -30,8 +30,12 @@ flowchart TD
   M1 --> M2[Full text, default]
   M1 --> M3[Merge record]
   M1 --> M4{Digest source}
-  M4 -->|chosen| M5[Question plus final answer, no model call]
-  M4 -->|deferred| M6[Model-written summary]
+  M4 -->|dropped 00:58| M5[Question plus final answer, no model call]
+  M4 -->|chosen, Rohan 00:58| M6[Model-written, ctx.llm.complete_structured]
+  M1 --> MS[One merge section for the open chat: Merge as-is, Digest]
+  MS --> MT{Merge target}
+  MT -->|chosen, Rohan| MT1[Any ancestor, chips, target lane lights up]
+  MT -->|dropped| MT2[Direct parent only]
   M1 --> M7{Merge header}
   M7 -->|chosen 00:13| M9[From side chat: side question]
   M7 -->|dropped 00:13| M10[From side chat: title, cut to 50 chars and renamed by Hermes]
@@ -57,13 +61,20 @@ flowchart TD
 
   W1 --> F{Branch point}
   F -->|chosen| F2[Any exchange of the open chat: session.branch with count]
+  F2 --> NM{Branch names}
+  NM -->|chosen, Rohan 00:58| NM1[Hermes names chats, the plugin never passes name]
+  NM -->|dropped| NM2[Plugin names branches]
+  F2 --> FD[Fork digest: the part above the fork, via ctx.llm]
+  G --> LN{Lane columns}
+  LN -->|chosen| LN1[Lanes stay put, from PR 27]
+  LN -->|deferred| LN2[Port VS Code lane code]
 
   classDef chosen fill:#d1fae5,stroke:#059669,color:#064e3b
   classDef dropped fill:#f3f4f6,stroke:#9ca3af,color:#6b7280
   classDef open fill:#fef3c7,stroke:#d97706,color:#78350f
-  class B1,H1,T1,V1,O,C,M1,M2,M3,M5,M9,M8,P1,Q1,W1,RV1,F2 chosen
-  class B2,H2,T2,T3,V2,M6,M10,P2,R2,W2,RV2 dropped
+  class B1,H1,T1,V1,O,C,M1,M2,M6,M9,M8,P1,Q1,W1,RV1,F2,MS,MT1,NM1,FD,LN1 chosen
+  class B2,H2,T2,T3,V2,M3,M5,M10,P2,R2,W2,RV2,MT2,NM2 dropped
   class Q2 open
   classDef deferred fill:#e0e7ff,stroke:#6366f1,color:#312e81
-  class R1,TC deferred
+  class R1,TC,LN2 deferred
 ```
