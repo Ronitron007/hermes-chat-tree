@@ -44,6 +44,22 @@ const errorText = (error) => str(error?.message) || str(error) || 'Unknown error
 // (hermes_state_mutation_guards.py busy_refusal); the desktop sends branch_whole as that mutation.
 const isBusy = (error) => /busy/i.test(`${error?.data?.reason ?? ''} ${errorText(error)}`);
 
+// Poll readout, shown under each entry so a manual run can tell whether the host reports the
+// branch as busy (finding 2 of the review on PR #10).
+const DONE_BY = new Set(['busy-signal', 'two-reads', 'timeout']);
+function cleanDiag(d) {
+  if (!d || typeof d !== 'object') return null;
+  return {
+    busySeen: d.busySeen === true,
+    reads: Number.isInteger(d.reads) && d.reads >= 0 ? d.reads : 0,
+    doneBy: DONE_BY.has(d.doneBy) ? d.doneBy : null,
+  };
+}
+function diagText(diag) {
+  if (!diag) return '';
+  return `busy seen: ${diag.busySeen ? 'yes' : 'no'} · reads: ${diag.reads} · done by: ${diag.doneBy ?? '-'}`;
+}
+
 // Stored entries are untrusted (old versions, hand edits): keep only well-typed ones.
 function cleanEntry(e) {
   if (!e || typeof e !== 'object') return null;
@@ -60,6 +76,7 @@ function cleanEntry(e) {
     error: opt(e.error),
     status: STATUSES.has(e.status) ? e.status : 'timeout',
     at: typeof e.at === 'number' && Number.isFinite(e.at) ? e.at : 0,
+    diag: cleanDiag(e.diag),
   };
 }
 
@@ -163,7 +180,8 @@ function createSideChat(deps) {
   const page = (sessionId, cursor) =>
     request({ session_id: sessionId, order: 'oldest', limit: PAGE_LIMIT, ...(cursor ? { cursor } : {}) });
 
-  // Reads the copied history to its end before the question goes in. The poll then starts from
+  // Reads the copied history to its end before the question goes in. Only an EMPTY page means
+  // caught up: the gateway also cuts pages at 2 MiB and between tool groups (session_stored_reads.py). The poll then starts from
   // that cursor, and a reset page drops rows at or below the highest copied row_id, so an old
   // identical question in the main chat can never answer this one.
   async function fence(sessionId) {
@@ -174,7 +192,7 @@ function createSideChat(deps) {
       const rows = Array.isArray(result?.rows) ? result.rows : [];
       for (const row of rows) if (Number.isFinite(row?.row_id)) maxRowId = Math.max(maxRowId ?? row.row_id, row.row_id);
       cursor = result?.next_cursor ?? cursor;
-      if (rows.length < PAGE_LIMIT) break;
+      if (rows.length === 0) break;
     }
     return { cursor, maxRowId };
   }
@@ -189,6 +207,8 @@ function createSideChat(deps) {
     let questionSeen = false;
     let tail = []; // assistant and tool rows after the question
     let seenBusy = false;
+    let reads = 0;
+    const diag = (doneBy = null) => ({ busySeen: seenBusy, reads, doneBy });
     let previous = null;
 
     const live = () => polls.has(entry.id) && !disposed;
@@ -200,9 +220,10 @@ function createSideChat(deps) {
 
     const step = async () => {
       if (!live()) return;
-      if (now() - started >= TIMEOUT_MS) return finish({ status: 'timeout' });
+      if (now() - started >= TIMEOUT_MS) return finish({ status: 'timeout', diag: diag('timeout') });
       let result = null;
       try {
+        reads += 1;
         result = await page(entry.session_id, cursor);
       } catch {
         // A failed read is retried on the next tick until the timeout.
@@ -233,9 +254,10 @@ function createSideChat(deps) {
       const last = tail[tail.length - 1];
       const candidate = last?.role === 'assistant' ? str(last.text) || null : null;
       if (candidate && !busy && (seenBusy || candidate === previous)) {
-        return finish({ status: 'answered', answer: candidate });
+        return finish({ status: 'answered', answer: candidate, diag: diag(seenBusy ? 'busy-signal' : 'two-reads') });
       }
       previous = candidate;
+      updateEntry(chatId, entry.id, { diag: diag() });
       polls.set(entry.id, schedule(step, POLL_MS));
     };
 
@@ -337,13 +359,16 @@ function createSideChat(deps) {
         jsx('p', { className: 'text-sm font-semibold', style: PRE_STYLE, children: entry.question }),
         jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: `${modelText} · ${when}` }),
         jsx('pre', { className: 'text-sm', style: PRE_STYLE, children: statusText(entry) }),
+        entry.diag && (entry.status === 'asking' || entry.status === 'answered' || entry.status === 'timeout')
+          ? jsx('p', { className: 'text-xs opacity-60', style: SELECTABLE, children: diagText(entry.diag) })
+          : null,
         jsx(Button, {
           type: 'button',
           disabled: !entry.stored_session_id,
           onClick: () => openBranch(entry),
           children: 'Open',
         }),
-      ],
+      ].filter(Boolean),
     });
   }
 

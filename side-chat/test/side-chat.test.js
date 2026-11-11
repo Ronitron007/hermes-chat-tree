@@ -227,8 +227,13 @@ test('a question forks, submits on the branch, and polls the transcript until th
   assert.ok(branchCall[1].idempotency_key);
   const submit = ctx.host.calls.find(([m]) => m === 'prompt.submit');
   assert.deepEqual(submit, ['prompt.submit', { session_id: 'branch-1', text: 'what is a monad?' }]);
-  // Fence read, then submit, then polls; all on the branch, oldest order.
-  assert.deepEqual(methods(ctx.host).slice(0, 3), ['session.branch_whole', 'session.transcript', 'prompt.submit']);
+  // Fence reads until an empty page, then submit, then polls; all on the branch, oldest order.
+  assert.deepEqual(methods(ctx.host).slice(0, 4), [
+    'session.branch_whole',
+    'session.transcript',
+    'session.transcript',
+    'prompt.submit',
+  ]);
   for (const [, p] of ctx.host.calls.filter(([m]) => m === 'session.transcript')) {
     assert.equal(p.session_id, 'branch-1');
     assert.equal(p.order, 'oldest');
@@ -238,7 +243,7 @@ test('a question forks, submits on the branch, and polls the transcript until th
   assert.equal(entry.status, 'answered');
   assert.equal(entry.answer, 'side answer');
   // The first poll starts at the fence cursor (after the 2 copied rows).
-  const polls = ctx.host.calls.filter(([m]) => m === 'session.transcript').slice(1);
+  const polls = ctx.host.calls.slice(ctx.host.calls.findIndex(([m]) => m === 'prompt.submit') + 1);
   assert.equal(polls[0][1].cursor, '2');
   assert.ok(!ctx.host.calls.some(([m, p]) => m === 'prompt.submit' && p.session_id === 'rt-main'));
 });
@@ -406,8 +411,7 @@ test('reset restarts the read, drops copied rows by row_id, and finds the new an
   await ctx.clock.tick(POLL_MS * 3);
   assert.equal(entryOf(ctx).answer, 'after reset');
   const cursors = host.calls
-    .filter(([m]) => m === 'session.transcript')
-    .slice(1)
+    .slice(host.calls.findIndex(([m]) => m === 'prompt.submit') + 1)
     .map(([, p]) => p.cursor);
   assert.deepEqual(cursors.slice(0, 3), ['2', 'c1', 'r1']);
 });
@@ -417,7 +421,8 @@ test('the fence reads every page of a long copied history', async () => {
   const ctx = setup({ host: fakeHost({ mainRows }) });
   await ask(ctx, 'q');
   const fenceReads = ctx.host.calls.slice(1, ctx.host.calls.findIndex(([m]) => m === 'prompt.submit'));
-  assert.equal(fenceReads.length, 2);
+  // A full page, a short page, then the empty page that ends the fence.
+  assert.equal(fenceReads.length, 3);
   await ctx.clock.tick(POLL_MS * 3);
   assert.equal(entryOf(ctx).answer, 'side answer');
 });
@@ -644,4 +649,70 @@ test('each render calls the same hooks in the same order (React error 300)', asy
     assert.deepEqual(s, states[0]);
   }
   ctx.unload();
+});
+
+test('the fence reads on past a short page until an empty page (old same question later in the copy)', async () => {
+  // Pages of one row each: a short page is not the end (pages are cut at 2 MiB and by store work).
+  const mainRows = [
+    { role: 'user', text: 'big' },
+    { role: 'user', text: 'why?' },
+    { role: 'assistant', text: 'OLD' },
+  ];
+  // The question row lands late, so a fence that stopped early would settle on "OLD" first.
+  const script = (n, b, { add }) => {
+    if (n === 4) add({ role: 'user', text: b.question });
+    if (n === 5) add({ role: 'assistant', text: 'side answer' });
+  };
+  const host = fakeHost({ mainRows, script });
+  const base = host.request;
+  host.request = async (method, params) => {
+    const b = host.branches.get(params?.session_id);
+    if (method === 'session.transcript' && b && !b.submitted) {
+      host.calls.push([method, params]);
+      const offset = params.cursor ? Number(params.cursor) : 0;
+      const rows = b.rows.slice(offset, offset + 1);
+      return { rows, next_cursor: String(offset + rows.length), reset: false };
+    }
+    return base(method, params);
+  };
+  const ctx = setup({ host });
+  await ask(ctx, 'why?');
+  await ctx.clock.tick(POLL_MS * 8);
+  assert.equal(entryOf(ctx).answer, 'side answer');
+  ctx.unload();
+});
+
+test('each entry shows a muted, selectable poll readout', async () => {
+  const busyScript = (n, b, { add, state }) => {
+    if (n === 1) {
+      add({ role: 'user', text: b.question });
+      state.busyBySession.set({ 'branch-1': true });
+    }
+    if (n === 2) {
+      add({ role: 'assistant', text: 'busy answer' });
+      state.busyBySession.set({});
+    }
+  };
+  const busy = setup({ host: fakeHost({ script: busyScript }) });
+  await ask(busy, 'q');
+  const readout = (ctx) => findAll(expand(ctx.pane.render()), (n) => n.type === 'p' && /^busy seen:/.test(n.props.children));
+  assert.match(readout(busy)[0].props.children, /^busy seen: yes · reads: 1 · done by: -$/);
+  await busy.clock.tick(POLL_MS * 3);
+  const [line] = readout(busy);
+  assert.equal(line.props.children, 'busy seen: yes · reads: 2 · done by: busy-signal');
+  assert.equal(line.props.style.userSelect, 'text');
+  assert.match(line.props.className, /opacity/);
+  busy.unload();
+
+  const quiet = setup();
+  await ask(quiet, 'q');
+  await quiet.clock.tick(POLL_MS * 3);
+  assert.equal(readout(quiet)[0].props.children, 'busy seen: no · reads: 3 · done by: two-reads');
+  quiet.unload();
+
+  const slow = setup({ host: fakeHost({ script: () => {} }) });
+  await ask(slow, 'q');
+  await slow.clock.tick(TIMEOUT_MS + POLL_MS);
+  assert.match(readout(slow)[0].props.children, /done by: timeout$/);
+  slow.unload();
 });
