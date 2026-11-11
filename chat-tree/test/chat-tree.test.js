@@ -232,6 +232,8 @@ function fakeHost({
           }
           return { histories, missing };
         }
+        case 'config.set':
+          return answer(method, host.configSet, params);
         case 'session.usage':
           return answer(method, host.usage, params);
         case 'session.stats':
@@ -3187,5 +3189,56 @@ test('name rows and the Branches view keep the hook order (React error 300)', as
     assert.equal(s.length, 8);
     assert.deepEqual(s, states[0]);
   }
+  ctx.unload();
+});
+
+test('a level edit whose row names no model keeps the picked model', async () => {
+  const ctx = setup();
+  await flush();
+  branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+  typeInto(ctx, 'question', 'q?');
+  pickRow(ctx, 'claude-x', 'anthropic');
+  controllerOf(ctx).setOptions({ effort: 'high' }, { isActive: true });
+  controllerOf(ctx).setOptions({ effort: 'low' }, undefined);
+  await submitForm(ctx);
+  await flush();
+  assert.deepEqual(promptOf(ctx.host).model_override, { model: 'claude-x', provider: 'anthropic', reasoning: 'low' });
+  ctx.unload();
+});
+
+test('a picked model becomes the branch model through config.set, with or without a question', async () => {
+  for (const question of ['', 'q?']) {
+    const host = fakeHost();
+    host.configSet = () => ({ ok: true });
+    const ctx = setup({ host });
+    await flush();
+    branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+    if (question) typeInto(ctx, 'question', question);
+    pickRow(ctx, 'claude-x', 'anthropic');
+    controllerOf(ctx).setOptions({ effort: 'high' }, { isActive: true, model: 'claude-x', provider: 'anthropic' });
+    await submitForm(ctx);
+    await flush();
+    const sets = host.calls.filter(([m]) => m === 'config.set').map(([, p]) => p);
+    assert.equal(sets.length, 2);
+    assert.deepEqual({ ...sets[0], session_id: undefined }, { key: 'model', session_id: undefined, value: 'claude-x --provider anthropic --session' });
+    assert.deepEqual({ ...sets[1], session_id: undefined }, { key: 'reasoning', session_id: undefined, value: 'high' });
+    assert.ok(sets.every((p) => p.session_id && p.session_id !== 'rt-b2'), 'set on the new branch, not the open chat');
+    const prompt = host.order.find(([k]) => k === 'prompt');
+    if (question) assert.equal(prompt[1].model_override, undefined);
+    else assert.equal(prompt, undefined);
+    assert.ok(host.opened.length >= 1);
+    ctx.unload();
+  }
+});
+
+test('without config.set and without a question, a picked model shows a notice and the branch still opens', async () => {
+  const ctx = setup();
+  await flush();
+  branchButton(ctx, 'b2:3').props.onClick(fakeEvent());
+  pickRow(ctx, 'claude-x', 'anthropic');
+  await submitForm(ctx);
+  await flush();
+  assert.ok(ctx.host.opened.length >= 1);
+  assert.match(textOf(ctx.pane.render()), /did not take its model/);
   ctx.unload();
 });

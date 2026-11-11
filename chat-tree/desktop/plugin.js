@@ -114,6 +114,8 @@ const MERGE_NO_COMPOSER_TEXT = 'The composer draft API is missing. Nothing was w
 const MERGE_ROOT_TEXT = 'This is the root chat. It has no parent chat to merge into.';
 const UNLISTED_FOCUS_TEXT =
   "This chat is not in Hermes's session list (a subagent's chat is hidden there). The tree shows the chat you had open before, read-only.";
+const BRANCH_MODEL_NOT_SET_TEXT =
+  "The branch was made, but Hermes did not take its model. It uses this chat's model. Pick a model in the branch's own model menu.";
 const MERGE_PARENT_MISSING_TEXT = 'The parent of this chat is not loaded. There is no chat to merge into.';
 const MERGE_NOTHING_TEXT = 'Nothing to merge: this chat has no question and answer of its own after its fork point.';
 const DIGEST_MISSING_TEXT = 'The digest backend is not available (the chat-tree Python half is not enabled). Nothing was staged.';
@@ -2272,6 +2274,19 @@ function createChatTree(deps) {
 
   // Submit of the Branch here form. Forks the open chat after the form's exchange, asks the branch
   // the question on the form's model, and opens the branch in place. Never throws. Errors stay in the form.
+  // Sets the branch session's model (and level) the way Hermes Desktop's picker does. true when both
+  // calls answered without an error.
+  async function setBranchSessionModel(sessionId, override) {
+    try {
+      const value = `${override.model}${override.provider ? ` --provider ${override.provider}` : ''} --session`;
+      await host.request('config.set', { key: 'model', session_id: sessionId, value });
+      if (override.reasoning) await host.request('config.set', { key: 'reasoning', session_id: sessionId, value: override.reasoning });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async function submitBranch() {
     const form = $ui.get().branch;
     if (!form || form.busy) return;
@@ -2315,10 +2330,21 @@ function createChatTree(deps) {
     // The new fork shows at once: its stub node until its first exchange lands.
     reload();
 
+    // The picked model becomes the branch's own model, so every turn uses it, with or without a
+    // question: config.set with session scope, the call Hermes Desktop's model picker makes
+    // (app/session/hooks/use-model-controls.ts:280-284, lib/reasoning-step.ts:69-71). If it fails,
+    // the question still goes out with a one-turn model_override.
+    const override = modelOverride(form.model);
+    let modelSet = false;
+    if (override) modelSet = await setBranchSessionModel(sessionId, override);
+    if (!alive()) return;
+    if (override && !modelSet && !question) {
+      setUi({ branch: null, forkNotice: BRANCH_MODEL_NOT_SET_TEXT });
+      openChat(storedId, 'in-place');
+      return;
+    }
     if (question) {
-      // Nothing picked keeps the chat's own model: no override at all.
-      const override = modelOverride(form.model);
-      const submit = { session_id: sessionId, text: question, ...(override ? { model_override: override } : {}) };
+      const submit = { session_id: sessionId, text: question, ...(override && !modelSet ? { model_override: override } : {}) };
       try {
         await host.request('prompt.submit', submit);
       } catch (error) {
@@ -2903,7 +2929,9 @@ function createChatTree(deps) {
       select: (model, provider) => setBranchModel({ ...latest(), model, provider }),
       setOptions: (patch, row) => {
         if (patch?.effort === undefined) return;
-        setBranchModel({ effort: patch.effort, model: row?.model, provider: row?.provider });
+        // A level edit can arrive with a row that names no model: keep the picked model then.
+        const now = latest();
+        setBranchModel({ effort: patch.effort, model: str(row?.model) || now.model, provider: str(row?.provider) || now.provider });
       },
     };
     const menu = jsx(picker.Menu, { controller, profile: profileKey(atomOf('profile').get()) }, 'menu');
