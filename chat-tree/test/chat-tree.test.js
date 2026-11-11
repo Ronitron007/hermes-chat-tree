@@ -175,7 +175,7 @@ function fakeHost({
     branchResult: { session_id: 'nb-rt', stored_session_id: 'nb', title: 'b2 (branch)' },
     submitResult: { status: 'queued' },
     // session.resume result: a value, a function of the params, or an Error. The default attaches.
-    resumeResult: (params) => ({ session_id: params.session_id, revision: 1, execution_generation: 0 }),
+    resumeResult: (params) => ({ session_id: `${params.session_id}-live`, stored_session_id: params.session_id, revision: 1, execution_generation: 0 }),
     // true: an open moves focus to the opened chat, as the desktop does.
     moveFocusOnOpen: false,
     // plugin.chat-tree.digest.write: digestError throws; else it answers { job } and, when
@@ -2216,8 +2216,9 @@ test('Branch here: session.branch with the count and no name, prompt.submit with
   const branch = ctx.host.order.find(([k]) => k === 'branch');
   assert.deepEqual(branch[1], { session_id: 'rt-b2', count: 4 });
   assert.equal('name' in branch[1], false);
+  // The question goes to the id the session.resume reply names (fakeHost: nb-live).
   assert.deepEqual(promptOf(ctx.host), {
-    session_id: 'nb-rt',
+    session_id: 'nb-live',
     text: 'why q2?',
     model_override: { model: 'claude-x', provider: 'anthropic', reasoning: 'high' },
   });
@@ -3397,14 +3398,16 @@ test('a picked model: session.resume on the stored branch id comes before config
     const kinds = host.order.map(([k]) => k).filter((k) => ['branch', 'resume', 'config', 'prompt'].includes(k));
     assert.deepEqual(kinds, ['branch', 'resume', 'config', 'config', ...(question ? ['prompt'] : [])]);
     assert.deepEqual(host.order.find(([k]) => k === 'resume')[1], { session_id: 'nb', source: 'desktop', omit_messages: true });
+    // config.set and the question go to the runtime id of the resume reply (nb-live), not the
+    // branch receipt's id (nb-rt): Desktop keys the revision by the reply's session_id.
     assert.deepEqual(
       host.order.filter(([k]) => k === 'config').map(([, p]) => p),
       [
-        { key: 'model', session_id: 'nb-rt', value: 'claude-x --provider anthropic --session' },
-        { key: 'reasoning', session_id: 'nb-rt', value: 'high' },
+        { key: 'model', session_id: 'nb-live', value: 'claude-x --provider anthropic --session' },
+        { key: 'reasoning', session_id: 'nb-live', value: 'high' },
       ],
     );
-    if (question) assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+    if (question) assert.deepEqual(promptOf(host), { session_id: 'nb-live', text: 'q?' });
     assert.equal(heldModelNotice(ctx), undefined);
     assert.deepEqual(host.opened, [['nb', OPEN_HERE]]);
     ctx.unload();
@@ -3420,12 +3423,44 @@ test('a picked model: session.resume on the stored branch id comes before config
   plain.unload();
 });
 
+// The Desktop canonical wire: the branch receipt names the child by its stored id
+// (canonical-protocol.ts mutationReceipt), the resume reply names the id Desktop keys the revision
+// by (adoptRevision), and config.set finds no revision under any other id (retainedMutation).
+test('on the canonical wire config.set and the first question go to the id the resume reply names; with none, the branch id', async () => {
+  const host = fakeHost();
+  host.branchResult = { session_id: 'nb', stored_session_id: 'nb', title: 'b2 (branch)' };
+  const revisions = new Set();
+  host.resumeResult = (p) => {
+    revisions.add(`rt-${p.session_id}`);
+    return { session_id: `rt-${p.session_id}`, stored_session_id: p.session_id, revision: 1, execution_generation: 0 };
+  };
+  host.configSet = (p) => {
+    if (!revisions.has(p.session_id)) throw new Error('Session revision unavailable; reopen the session before editing metadata');
+    return { ok: true };
+  };
+  const ctx = await branchWithModel({ host });
+  assert.deepEqual(host.order.filter(([k]) => k === 'config').map(([, p]) => p.session_id), ['rt-nb', 'rt-nb']);
+  assert.deepEqual(promptOf(host), { session_id: 'rt-nb', text: 'q?' });
+  assert.equal(heldModelNotice(ctx), undefined);
+  assert.deepEqual(host.opened, [['nb', OPEN_HERE]]);
+  ctx.unload();
+
+  // A resume reply with no session_id: config.set and the question fall back to the branch's id.
+  const bare = fakeHost();
+  bare.resumeResult = { ok: true };
+  bare.configSet = () => ({ ok: true });
+  const fallback = await branchWithModel({ host: bare });
+  assert.deepEqual(bare.order.filter(([k]) => k === 'config').map(([, p]) => p.session_id), ['nb-rt', 'nb-rt']);
+  assert.deepEqual(promptOf(bare), { session_id: 'nb-rt', text: 'q?' });
+  fallback.unload();
+});
+
 test('a failed config.set sends the model_override on the first question and shows the error in the branch notice', async () => {
   const host = fakeHost();
   host.configSet = new Error('Session revision unavailable; reopen the session before editing metadata');
   const ctx = await branchWithModel({ host });
   assert.deepEqual(promptOf(host), {
-    session_id: 'nb-rt',
+    session_id: 'nb-live',
     text: 'q?',
     model_override: { model: 'claude-x', provider: 'anthropic', reasoning: 'high' },
   });
@@ -3460,6 +3495,9 @@ test('a failed session.resume still tries config.set; the notice names the resum
   host.configSet = new Error('Session revision unavailable');
   const ctx = await branchWithModel({ host });
   assert.deepEqual(host.order.filter(([k]) => ['resume', 'config', 'prompt'].includes(k)).map(([k]) => k), ['resume', 'config', 'prompt']);
+  // No resume reply: config.set and the question go to the branch's id.
+  assert.equal(host.order.find(([k]) => k === 'config')[1].session_id, 'nb-rt');
+  assert.equal(promptOf(host).session_id, 'nb-rt');
   assert.ok(promptOf(host).model_override);
   assert.match(textOf(heldModelNotice(ctx)), /Error: session\.resume failed \(session not found\)\. Session revision unavailable/);
   ctx.unload();
@@ -3504,15 +3542,15 @@ test('a confirm_required answer opens the SDK confirm; the model counts as set o
     const sets = host.order.filter(([k]) => k === 'config').map(([, p]) => p);
     if (accept) {
       assert.deepEqual(sets.slice(1), [
-        { key: 'model', session_id: 'nb-rt', value: 'claude-x --provider anthropic --session', confirm_expensive_model: true },
-        { key: 'reasoning', session_id: 'nb-rt', value: 'high' },
+        { key: 'model', session_id: 'nb-live', value: 'claude-x --provider anthropic --session', confirm_expensive_model: true },
+        { key: 'reasoning', session_id: 'nb-live', value: 'high' },
       ]);
-      assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+      assert.deepEqual(promptOf(host), { session_id: 'nb-live', text: 'q?' });
       assert.equal(heldModelNotice(ctx), undefined);
     } else {
       // Declined: nothing was applied, and no override side-steps the refused switch.
       assert.equal(sets.length, 1);
-      assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+      assert.deepEqual(promptOf(host), { session_id: 'nb-live', text: 'q?' });
       assert.equal(textOf(heldModelNotice(ctx)), `${mod.BRANCH_MODEL_DECLINED_TEXT}\nDismiss`);
     }
     assert.deepEqual(host.opened, [['nb', OPEN_HERE]]);
@@ -3523,9 +3561,58 @@ test('a confirm_required answer opens the SDK confirm; the model counts as set o
   const host = fakeHost();
   host.configSet = (p) => (p.key === 'model' ? { confirm_required: true, confirm_message: 'Costly model' } : { ok: true });
   const ctx = await branchWithModel({ host });
-  assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+  assert.deepEqual(promptOf(host), { session_id: 'nb-live', text: 'q?' });
   assert.equal(textOf(heldModelNotice(ctx)), `${mod.BRANCH_MODEL_DECLINED_TEXT} ${mod.BRANCH_MODEL_CONFIRM_MISSING_TEXT} Costly model\nDismiss`);
   ctx.unload();
+});
+
+// The SDK confirm as lib/guarded-model-switch.ts runs it once the user confirms: a resend that
+// throws, or answers confirm_required again, calls rollback and resolves false, as a decline does.
+const confirmedSwitch = async (options) => {
+  try {
+    const result = await options.requestConfirmed();
+    if (result?.confirm_required) throw new Error(result.confirm_message || options.failureMessage);
+    options.finish?.(result);
+    return true;
+  } catch {
+    options.rollback?.();
+    return false;
+  }
+};
+
+test('a confirmed guarded model whose resend fails counts as a failed config.set: the error shows and the first question keeps the override', async () => {
+  const host = fakeHost();
+  host.configSet = (p) =>
+    p.key === 'model' && !p.confirm_expensive_model
+      ? { confirm_required: true, confirm_message: 'Costly model' }
+      : p.confirm_expensive_model
+        ? Promise.reject(new Error('gateway refused the switch'))
+        : { ok: true };
+  const ctx = await branchWithModel({ host, deps: { surfaceModelSwitchConfirm: confirmedSwitch } });
+  assert.equal(
+    textOf(heldModelNotice(ctx)),
+    `${mod.BRANCH_MODEL_FIRST_TURN_TEXT} Error: ${mod.BRANCH_MODEL_FAILED_TEXT} gateway refused the switch\nDismiss`,
+  );
+  assert.deepEqual(promptOf(host).model_override, { model: 'claude-x', provider: 'anthropic', reasoning: 'high' });
+  // No level after a failed model switch.
+  assert.equal(host.order.some(([k, p]) => k === 'config' && p.key === 'reasoning'), false);
+  ctx.unload();
+
+  // A resend that asks to confirm again: its confirm_message is the reason.
+  const twice = fakeHost();
+  twice.configSet = (p) => (p.key === 'model' ? { confirm_required: true, confirm_message: p.confirm_expensive_model ? 'Asked twice' : 'Costly model' } : { ok: true });
+  const again = await branchWithModel({ host: twice, deps: { surfaceModelSwitchConfirm: confirmedSwitch } });
+  assert.ok(textOf(heldModelNotice(again)).includes(`Error: ${mod.BRANCH_MODEL_FAILED_TEXT} Asked twice`));
+  assert.ok(promptOf(twice).model_override);
+  again.unload();
+
+  // A decline calls no rollback: the declined text, and no override.
+  const no = fakeHost();
+  no.configSet = (p) => (p.key === 'model' && !p.confirm_expensive_model ? { confirm_required: true } : { ok: true });
+  const declined = await branchWithModel({ host: no, deps: { surfaceModelSwitchConfirm: async () => false } });
+  assert.equal(textOf(heldModelNotice(declined)), `${mod.BRANCH_MODEL_DECLINED_TEXT}\nDismiss`);
+  assert.equal(promptOf(no).model_override, undefined);
+  declined.unload();
 });
 
 test('a failed fork digest adds to the model notice and does not replace it', async () => {
@@ -3746,15 +3833,45 @@ test('chat status: a lineage id (compression root or segment) matches its lane, 
   ctx.unload();
 });
 
-test('chat status: a failed or missing RPC shows no marks and no error; the rows and lines stay as they were', async () => {
+test('chat status: one failed read keeps the last good marks and the 3 s read, with no error', async () => {
+  const host = fakeHost();
+  host.activeList = activeReply({ root: 'working' });
+  const ctx = setup({ host });
+  await flush();
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'root:2': 'working' });
+  const r0 = statusReads(host);
+  host.activeList = new Error('gateway gone');
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.equal(statusReads(host), r0 + 1);
+  const kept = ctx.pane.render();
+  assert.deepEqual(marksOf(kept), { 'root:2': 'working' });
+  assert.equal(ctx.tree.$status.get().error, null);
+  assert.doesNotMatch(textOf(kept), /gateway gone/);
+  // The 3 s read is armed again (with the 15 s refresh): one more read.
+  assert.equal(ctx.clock.pending(), 2);
+  // That read lands: the marks follow it, and the failure count starts again.
+  host.activeList = activeReply({ root: 'waiting' });
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.equal(statusReads(host), r0 + 2);
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'root:2': 'waiting' });
+  host.activeList = new Error('gateway gone');
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.deepEqual(marksOf(ctx.pane.render()), { 'root:2': 'waiting' });
+  assert.equal(ctx.clock.pending(), 2);
+  ctx.unload();
+});
+
+test('chat status: two failed reads in a row clear the marks with no error and stop the 3 s read; the rows and lines stay as they were', async () => {
   const host = fakeHost();
   host.activeList = activeReply({ root: 'working' });
   const ctx = setup({ host });
   await flush();
   const withMarks = ctx.pane.render();
   assert.deepEqual(marksOf(withMarks), { 'root:2': 'working' });
+  const r0 = statusReads(host);
   host.activeList = new Error('gateway gone');
-  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  await ctx.clock.tick(mod.STATUS_POLL_MS * mod.STATUS_FAILS_TO_CLEAR);
+  assert.equal(statusReads(host), r0 + 2);
   const without = ctx.pane.render();
   assert.deepEqual(marksOf(without), {});
   assert.equal(byAttr(without, 'data-status-slot').length, 0);
@@ -3763,14 +3880,18 @@ test('chat status: a failed or missing RPC shows no marks and no error; the rows
   assert.deepEqual(nodeKeys(without), MAIN_KEYS);
   // A mark never moves the lane lines: the graph is the same with and without marks.
   assert.deepEqual(byAttr(without, 'data-graph', 'true')[0], byAttr(withMarks, 'data-graph', 'true')[0]);
-  // No live chat after the failure: the 3 s read stopped (the 15 s refresh is the one timer left).
+  // No live chat after the second failure: the 3 s read stopped (the 15 s refresh is the one timer left).
   assert.equal(ctx.clock.pending(), 1);
-  // An unknown method (an older Hermes) and a reply with no sessions list: no marks either.
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
+  assert.equal(statusReads(host), r0 + 2);
+  // An unknown method (an older Hermes) and a reply with no sessions list are failed reads too.
   for (const reply of [undefined, { sessions: 'nope' }]) {
     host.activeList = activeReply({ root: 'working' });
     await refresh(ctx);
     assert.deepEqual(marksOf(ctx.pane.render()), { 'root:2': 'working' });
     host.activeList = reply;
+    await refresh(ctx);
+    assert.deepEqual(marksOf(ctx.pane.render()), { 'root:2': 'working' });
     await refresh(ctx);
     assert.deepEqual(marksOf(ctx.pane.render()), {});
     assert.equal(ctx.tree.$status.get().error, null);
@@ -3926,8 +4047,10 @@ test('chat status marks keep the hook order (React error 300)', async () => {
   states.push(order()); // the branches view with words
   host.activeList = new Error('x');
   await ctx.clock.tick(mod.STATUS_POLL_MS);
+  states.push(order()); // one failed read: the last good marks
+  await ctx.clock.tick(mod.STATUS_POLL_MS);
   assert.deepEqual(marksOf(ctx.pane.render()), {});
-  states.push(order()); // a failed read
+  states.push(order()); // two failed reads: no marks
   for (const s of states) {
     assert.equal(s.length, 8);
     assert.deepEqual(s, states[0]);
