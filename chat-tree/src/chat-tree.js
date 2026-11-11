@@ -2540,13 +2540,17 @@ export function createChatTree(deps) {
   // them (api/canonical-protocol.ts retainedMutation; the resume reply primes both in snapshotResult).
   // Desktop resumes a chat it opens the same way (use-session-actions/resume-owner.ts
   // primaryResumeParams). session_id is the STORED id (tui_gateway/contracts/sessions.py
-  // SessionResumeParams). null, or the error text.
+  // SessionResumeParams). The reply's session_id is the id Desktop keys the revision by
+  // (canonical-protocol.ts adoptRevision): the runtime id on the legacy wire, the owner's resolved
+  // id on the canonical wire (gateway/session_controls.py resume). config.set and prompt.submit
+  // go to it, as Desktop's own picker and composer use the live id (use-model-controls.ts
+  // selectModel, submit.ts). { runtime: the reply's id or null, error: null or the error text }.
   async function primeBranchSession(storedId) {
     try {
-      await host.request('session.resume', { session_id: storedId, source: 'desktop', omit_messages: true });
-      return null;
+      const resumed = await host.request('session.resume', { session_id: storedId, source: 'desktop', omit_messages: true });
+      return { runtime: str(resumed?.session_id) || null, error: null };
     } catch (error) {
-      return errorText(error);
+      return { runtime: null, error: errorText(error) };
     }
   }
 
@@ -2632,17 +2636,20 @@ export function createChatTree(deps) {
     // The picked model becomes the branch's own model, so every turn uses it, with or without a
     // question: session.resume first (primeBranchSession), then config.set with session scope, the
     // call Hermes Desktop's model picker makes (app/session/hooks/use-model-controls.ts,
-    // lib/reasoning-step.ts:69-71). Only when config.set fails does the question go out with a
-    // one-turn model_override. A guarded model the user did not confirm gets none: the chat's model
-    // answers. The branch notice keeps Hermes's error text.
+    // lib/reasoning-step.ts:69-71). config.set and the first question go to the id the resume
+    // reply names, else to the branch's id. Only when config.set fails does the question go out
+    // with a one-turn model_override. A guarded model the user did not confirm gets none: the
+    // chat's model answers. The branch notice keeps Hermes's error text.
     const override = modelOverride(form.model);
     let outcome = null;
+    let liveId = sessionId;
     if (override) {
-      const primeError = await primeBranchSession(storedId);
+      const primed = await primeBranchSession(storedId);
       if (!alive()) return;
-      outcome = await setBranchSessionModel(sessionId, override, alive);
+      liveId = primed.runtime ?? sessionId;
+      outcome = await setBranchSessionModel(liveId, override, alive);
       // A failed resume is shown only when the model did not stick: an older wire takes config.set without it.
-      if (primeError && outcome.error) outcome = { error: `session.resume failed (${primeError}). ${outcome.error}` };
+      if (primed.error && outcome.error) outcome = { error: `session.resume failed (${primed.error}). ${outcome.error}` };
     }
     if (!alive()) return;
     const notice = branchModelNotice(outcome, Boolean(question));
@@ -2654,7 +2661,7 @@ export function createChatTree(deps) {
     }
     if (question) {
       const oneTurn = Boolean(override && outcome?.error);
-      const submit = { session_id: sessionId, text: question, ...(oneTurn ? { model_override: override } : {}) };
+      const submit = { session_id: liveId, text: question, ...(oneTurn ? { model_override: override } : {}) };
       try {
         await host.request('prompt.submit', submit);
       } catch (error) {

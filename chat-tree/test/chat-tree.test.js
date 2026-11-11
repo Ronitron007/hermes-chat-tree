@@ -175,7 +175,7 @@ function fakeHost({
     branchResult: { session_id: 'nb-rt', stored_session_id: 'nb', title: 'b2 (branch)' },
     submitResult: { status: 'queued' },
     // session.resume result: a value, a function of the params, or an Error. The default attaches.
-    resumeResult: (params) => ({ session_id: params.session_id, revision: 1, execution_generation: 0 }),
+    resumeResult: (params) => ({ session_id: `${params.session_id}-live`, stored_session_id: params.session_id, revision: 1, execution_generation: 0 }),
     // true: an open moves focus to the opened chat, as the desktop does.
     moveFocusOnOpen: false,
     // plugin.chat-tree.digest.write: digestError throws; else it answers { job } and, when
@@ -2216,8 +2216,9 @@ test('Branch here: session.branch with the count and no name, prompt.submit with
   const branch = ctx.host.order.find(([k]) => k === 'branch');
   assert.deepEqual(branch[1], { session_id: 'rt-b2', count: 4 });
   assert.equal('name' in branch[1], false);
+  // The question goes to the id the session.resume reply names (fakeHost: nb-live).
   assert.deepEqual(promptOf(ctx.host), {
-    session_id: 'nb-rt',
+    session_id: 'nb-live',
     text: 'why q2?',
     model_override: { model: 'claude-x', provider: 'anthropic', reasoning: 'high' },
   });
@@ -3397,14 +3398,16 @@ test('a picked model: session.resume on the stored branch id comes before config
     const kinds = host.order.map(([k]) => k).filter((k) => ['branch', 'resume', 'config', 'prompt'].includes(k));
     assert.deepEqual(kinds, ['branch', 'resume', 'config', 'config', ...(question ? ['prompt'] : [])]);
     assert.deepEqual(host.order.find(([k]) => k === 'resume')[1], { session_id: 'nb', source: 'desktop', omit_messages: true });
+    // config.set and the question go to the runtime id of the resume reply (nb-live), not the
+    // branch receipt's id (nb-rt): Desktop keys the revision by the reply's session_id.
     assert.deepEqual(
       host.order.filter(([k]) => k === 'config').map(([, p]) => p),
       [
-        { key: 'model', session_id: 'nb-rt', value: 'claude-x --provider anthropic --session' },
-        { key: 'reasoning', session_id: 'nb-rt', value: 'high' },
+        { key: 'model', session_id: 'nb-live', value: 'claude-x --provider anthropic --session' },
+        { key: 'reasoning', session_id: 'nb-live', value: 'high' },
       ],
     );
-    if (question) assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+    if (question) assert.deepEqual(promptOf(host), { session_id: 'nb-live', text: 'q?' });
     assert.equal(heldModelNotice(ctx), undefined);
     assert.deepEqual(host.opened, [['nb', OPEN_HERE]]);
     ctx.unload();
@@ -3420,12 +3423,44 @@ test('a picked model: session.resume on the stored branch id comes before config
   plain.unload();
 });
 
+// The Desktop canonical wire: the branch receipt names the child by its stored id
+// (canonical-protocol.ts mutationReceipt), the resume reply names the id Desktop keys the revision
+// by (adoptRevision), and config.set finds no revision under any other id (retainedMutation).
+test('on the canonical wire config.set and the first question go to the id the resume reply names; with none, the branch id', async () => {
+  const host = fakeHost();
+  host.branchResult = { session_id: 'nb', stored_session_id: 'nb', title: 'b2 (branch)' };
+  const revisions = new Set();
+  host.resumeResult = (p) => {
+    revisions.add(`rt-${p.session_id}`);
+    return { session_id: `rt-${p.session_id}`, stored_session_id: p.session_id, revision: 1, execution_generation: 0 };
+  };
+  host.configSet = (p) => {
+    if (!revisions.has(p.session_id)) throw new Error('Session revision unavailable; reopen the session before editing metadata');
+    return { ok: true };
+  };
+  const ctx = await branchWithModel({ host });
+  assert.deepEqual(host.order.filter(([k]) => k === 'config').map(([, p]) => p.session_id), ['rt-nb', 'rt-nb']);
+  assert.deepEqual(promptOf(host), { session_id: 'rt-nb', text: 'q?' });
+  assert.equal(heldModelNotice(ctx), undefined);
+  assert.deepEqual(host.opened, [['nb', OPEN_HERE]]);
+  ctx.unload();
+
+  // A resume reply with no session_id: config.set and the question fall back to the branch's id.
+  const bare = fakeHost();
+  bare.resumeResult = { ok: true };
+  bare.configSet = () => ({ ok: true });
+  const fallback = await branchWithModel({ host: bare });
+  assert.deepEqual(bare.order.filter(([k]) => k === 'config').map(([, p]) => p.session_id), ['nb-rt', 'nb-rt']);
+  assert.deepEqual(promptOf(bare), { session_id: 'nb-rt', text: 'q?' });
+  fallback.unload();
+});
+
 test('a failed config.set sends the model_override on the first question and shows the error in the branch notice', async () => {
   const host = fakeHost();
   host.configSet = new Error('Session revision unavailable; reopen the session before editing metadata');
   const ctx = await branchWithModel({ host });
   assert.deepEqual(promptOf(host), {
-    session_id: 'nb-rt',
+    session_id: 'nb-live',
     text: 'q?',
     model_override: { model: 'claude-x', provider: 'anthropic', reasoning: 'high' },
   });
@@ -3460,6 +3495,9 @@ test('a failed session.resume still tries config.set; the notice names the resum
   host.configSet = new Error('Session revision unavailable');
   const ctx = await branchWithModel({ host });
   assert.deepEqual(host.order.filter(([k]) => ['resume', 'config', 'prompt'].includes(k)).map(([k]) => k), ['resume', 'config', 'prompt']);
+  // No resume reply: config.set and the question go to the branch's id.
+  assert.equal(host.order.find(([k]) => k === 'config')[1].session_id, 'nb-rt');
+  assert.equal(promptOf(host).session_id, 'nb-rt');
   assert.ok(promptOf(host).model_override);
   assert.match(textOf(heldModelNotice(ctx)), /Error: session\.resume failed \(session not found\)\. Session revision unavailable/);
   ctx.unload();
@@ -3504,15 +3542,15 @@ test('a confirm_required answer opens the SDK confirm; the model counts as set o
     const sets = host.order.filter(([k]) => k === 'config').map(([, p]) => p);
     if (accept) {
       assert.deepEqual(sets.slice(1), [
-        { key: 'model', session_id: 'nb-rt', value: 'claude-x --provider anthropic --session', confirm_expensive_model: true },
-        { key: 'reasoning', session_id: 'nb-rt', value: 'high' },
+        { key: 'model', session_id: 'nb-live', value: 'claude-x --provider anthropic --session', confirm_expensive_model: true },
+        { key: 'reasoning', session_id: 'nb-live', value: 'high' },
       ]);
-      assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+      assert.deepEqual(promptOf(host), { session_id: 'nb-live', text: 'q?' });
       assert.equal(heldModelNotice(ctx), undefined);
     } else {
       // Declined: nothing was applied, and no override side-steps the refused switch.
       assert.equal(sets.length, 1);
-      assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+      assert.deepEqual(promptOf(host), { session_id: 'nb-live', text: 'q?' });
       assert.equal(textOf(heldModelNotice(ctx)), `${mod.BRANCH_MODEL_DECLINED_TEXT}\nDismiss`);
     }
     assert.deepEqual(host.opened, [['nb', OPEN_HERE]]);
@@ -3523,7 +3561,7 @@ test('a confirm_required answer opens the SDK confirm; the model counts as set o
   const host = fakeHost();
   host.configSet = (p) => (p.key === 'model' ? { confirm_required: true, confirm_message: 'Costly model' } : { ok: true });
   const ctx = await branchWithModel({ host });
-  assert.deepEqual(promptOf(host), { session_id: 'nb-rt', text: 'q?' });
+  assert.deepEqual(promptOf(host), { session_id: 'nb-live', text: 'q?' });
   assert.equal(textOf(heldModelNotice(ctx)), `${mod.BRANCH_MODEL_DECLINED_TEXT} ${mod.BRANCH_MODEL_CONFIRM_MISSING_TEXT} Costly model\nDismiss`);
   ctx.unload();
 });
