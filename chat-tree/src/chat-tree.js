@@ -603,6 +603,11 @@ export function sharedExchangeCount(child, parent) {
 // row). Counted: an assistant row before the first user row, because the gateway keeps it.
 // Example: [user q1, assistant a1, user q2, assistant (tool call, no text), tool, assistant a2]
 // gives exchange 0 -> count 2, exchange 1 -> count 4.
+// That rule counts only the rows the pane reads. The gateway also counts rows that no history shows,
+// such as `[System:` notes and hidden rows, so the count can come out short. A history.read row
+// carries branch_index, its position in the gateway's own list. When the last answer row of the
+// exchange has one, count = branch_index + 1, exactly. Such a row counts as an answer even when the
+// reply cap of history.read emptied its text.
 // null when the exchange does not exist or has no answer yet: the branch would end on a question.
 export function branchCount(rows, index) {
   if (!Number.isInteger(index) || index < 0) return null;
@@ -620,7 +625,10 @@ export function branchCount(rows, index) {
     if ((role === 'user' || role === 'assistant') && text) visible += 1;
     if (exchange !== index) continue;
     if (Number.isInteger(row?.row_id) && row.row_id > maxId) maxId = row.row_id;
-    if (role === 'assistant' && text) found = { count: visible, through: maxId > 0 ? maxId : null };
+    const at = Number.isInteger(row?.branch_index) && row.branch_index >= 0 ? row.branch_index : null;
+    if (role === 'assistant' && (text || at !== null)) {
+      found = { count: at === null ? visible : at + 1, through: maxId > 0 ? maxId : null };
+    }
   }
   return found;
 }
@@ -1635,6 +1643,17 @@ export function createChatTree(deps) {
     }
   }
 
+  // The open chat's rows for Branch here. history.read rows carry branch_index (see branchCount), so
+  // they come first. Without the Python half, or when it does not return the chat, readOpenRows.
+  async function readBranchRows(openId) {
+    if ($status.get().note !== BACKEND_NOTE_TEXT) {
+      const stored = await readStored([openId]);
+      const rows = stored.ok ? stored.histories.get(openId) : undefined;
+      if (Array.isArray(rows)) return rows;
+    }
+    return readOpenRows(openId);
+  }
+
   // This Hermes (v0.23) has no session.transcript: fall back to session.history, a complete snapshot.
   async function readRows(sessionId) {
     try {
@@ -1957,7 +1976,7 @@ export function createChatTree(deps) {
 
     let rows;
     try {
-      rows = await readOpenRows(open.id);
+      rows = await readBranchRows(open.id);
     } catch (error) {
       return fail(`Could not read this chat: ${errorText(error)}`);
     }
