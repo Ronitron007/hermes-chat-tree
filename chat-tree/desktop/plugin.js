@@ -2595,6 +2595,9 @@ function createChatTree(deps) {
   // the model, { declined: true, note? } when a guarded model was not confirmed (nothing was
   // applied), or { error } with the failure text. A guarded model answers confirm_required: the
   // SDK's confirm asks the user, and only a confirmed resend (confirm_expensive_model) applies it.
+  // The confirm resolves false on a decline and on a failed confirmed resend alike. Only a failure
+  // calls rollback (lib/guarded-model-switch.ts), so rollback tells the two apart: a failure is a
+  // failed config.set, with the resend's error (or its second confirm_message) when there is one.
   async function setBranchSessionModel(sessionId, override, alive) {
     const value = `${override.model}${override.provider ? ` --provider ${override.provider}` : ''} --session`;
     const switchModel = (confirmed) =>
@@ -2603,14 +2606,29 @@ function createChatTree(deps) {
       const result = await switchModel(false);
       if (result?.confirm_required) {
         if (!confirmModelSwitch) return { declined: true, note: [BRANCH_MODEL_CONFIRM_MISSING_TEXT, str(result.confirm_message)].filter(Boolean).join(' ') };
+        let failed = false;
+        let reason = '';
+        const resend = async () => {
+          try {
+            const again = await switchModel(true);
+            if (again?.confirm_required) reason = str(again.confirm_message);
+            return again;
+          } catch (error) {
+            reason = errorText(error);
+            throw error;
+          }
+        };
         const confirmed = await confirmModelSwitch({
           confirmMessage: str(result.confirm_message) || undefined,
           failureMessage: BRANCH_MODEL_FAILED_TEXT,
           isStale: () => !alive(),
           model: override.model,
-          requestConfirmed: () => switchModel(true),
+          requestConfirmed: resend,
+          rollback: () => {
+            failed = true;
+          },
         });
-        if (!confirmed) return { declined: true };
+        if (!confirmed) return failed ? { error: [BRANCH_MODEL_FAILED_TEXT, reason].filter(Boolean).join(' ') } : { declined: true };
       }
     } catch (error) {
       return { error: errorText(error) };

@@ -3566,6 +3566,55 @@ test('a confirm_required answer opens the SDK confirm; the model counts as set o
   ctx.unload();
 });
 
+// The SDK confirm as lib/guarded-model-switch.ts runs it once the user confirms: a resend that
+// throws, or answers confirm_required again, calls rollback and resolves false, as a decline does.
+const confirmedSwitch = async (options) => {
+  try {
+    const result = await options.requestConfirmed();
+    if (result?.confirm_required) throw new Error(result.confirm_message || options.failureMessage);
+    options.finish?.(result);
+    return true;
+  } catch {
+    options.rollback?.();
+    return false;
+  }
+};
+
+test('a confirmed guarded model whose resend fails counts as a failed config.set: the error shows and the first question keeps the override', async () => {
+  const host = fakeHost();
+  host.configSet = (p) =>
+    p.key === 'model' && !p.confirm_expensive_model
+      ? { confirm_required: true, confirm_message: 'Costly model' }
+      : p.confirm_expensive_model
+        ? Promise.reject(new Error('gateway refused the switch'))
+        : { ok: true };
+  const ctx = await branchWithModel({ host, deps: { surfaceModelSwitchConfirm: confirmedSwitch } });
+  assert.equal(
+    textOf(heldModelNotice(ctx)),
+    `${mod.BRANCH_MODEL_FIRST_TURN_TEXT} Error: ${mod.BRANCH_MODEL_FAILED_TEXT} gateway refused the switch\nDismiss`,
+  );
+  assert.deepEqual(promptOf(host).model_override, { model: 'claude-x', provider: 'anthropic', reasoning: 'high' });
+  // No level after a failed model switch.
+  assert.equal(host.order.some(([k, p]) => k === 'config' && p.key === 'reasoning'), false);
+  ctx.unload();
+
+  // A resend that asks to confirm again: its confirm_message is the reason.
+  const twice = fakeHost();
+  twice.configSet = (p) => (p.key === 'model' ? { confirm_required: true, confirm_message: p.confirm_expensive_model ? 'Asked twice' : 'Costly model' } : { ok: true });
+  const again = await branchWithModel({ host: twice, deps: { surfaceModelSwitchConfirm: confirmedSwitch } });
+  assert.ok(textOf(heldModelNotice(again)).includes(`Error: ${mod.BRANCH_MODEL_FAILED_TEXT} Asked twice`));
+  assert.ok(promptOf(twice).model_override);
+  again.unload();
+
+  // A decline calls no rollback: the declined text, and no override.
+  const no = fakeHost();
+  no.configSet = (p) => (p.key === 'model' && !p.confirm_expensive_model ? { confirm_required: true } : { ok: true });
+  const declined = await branchWithModel({ host: no, deps: { surfaceModelSwitchConfirm: async () => false } });
+  assert.equal(textOf(heldModelNotice(declined)), `${mod.BRANCH_MODEL_DECLINED_TEXT}\nDismiss`);
+  assert.equal(promptOf(no).model_override, undefined);
+  declined.unload();
+});
+
 test('a failed fork digest adds to the model notice and does not replace it', async () => {
   const host = fakeHost();
   host.configSet = new Error('no revision');
