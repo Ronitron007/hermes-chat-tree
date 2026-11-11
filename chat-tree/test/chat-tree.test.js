@@ -1086,8 +1086,9 @@ test('the pointer on a row draws its path to the root in the hover colour; leavi
   const fork = findAll(svg, (n) => n.key === 'fork:b3')[0];
   assert.equal(fork.props.stroke, HOVER);
   assert.equal(fork.props['data-role'], 'hover');
-  // Only the SVG changed: the rows are the same (b3:1 has no Branch button), and nothing was read.
-  assert.equal(JSON.stringify(nodeRows(ctx.pane.render())), rowsBefore);
+  // Only the SVG and the hovered row (its Branch button shows) changed, and nothing was read.
+  const others = (rows) => JSON.stringify(rows.filter((r) => r.props['data-node'] !== 'b3:1'));
+  assert.equal(others(nodeRows(ctx.pane.render())), others(JSON.parse(rowsBefore)));
   // A leave from another row keeps the hover; a leave from the hovered row clears it.
   nodeOf(ctx.pane.render(), 'root:2').props.onMouseLeave();
   assert.deepEqual(circleColours(ctx.pane.render()), hovered);
@@ -1542,7 +1543,8 @@ async function mergeCtx({ rows = MERGE_ROWS, stored = 'sd', runtime = 'rt-sd', p
 }
 const section = (ctx) => byAttr(ctx.pane.render(), 'data-merge-section')[0];
 const mergeButton = (ctx, kind = 'asis') => byAttr(section(ctx), 'data-merge', kind)[0];
-const chip = (ctx, id) => byAttr(section(ctx), 'data-merge-target', id)[0];
+const targetSelect = (ctx) => byAttr(section(ctx), 'data-merge-target-select')[0];
+const pickTarget = (ctx, id) => targetSelect(ctx).props.onChange({ target: { value: id } });
 const fitOf = (ctx) => byAttr(ctx.pane.render(), 'data-token-fit')[0];
 // session.* calls since the merge context was ready, so the tree's own history reads do not count.
 const sessionCalls = (ctx) => ctx.host.calls.slice(ctx.mark).filter(([m]) => m.startsWith('session.'));
@@ -1564,19 +1566,19 @@ test('one merge section for the open chat: two buttons, ancestor chips, the pare
   assert.ok(byAttr(sections[0], 'data-merge').every((b) => b.type === 'Button' && b.props.disabled === false));
   assert.doesNotMatch(textOf(tree), /Merge record|Digest \(later\)/);
   // into: <parent> <grandparent>, the parent pressed.
-  const chips = byAttr(sections[0], 'data-merge-target');
-  assert.deepEqual(chips.map((c) => [c.props['data-merge-target'], textOf(c), c.props['aria-pressed']]), [
-    ['b1', 'b1', true],
-    ['root', 'root', false],
+  const options = byAttr(sections[0], 'data-merge-target');
+  assert.deepEqual(options.map((o) => [o.props['data-merge-target'], textOf(o)]), [
+    ['b1', 'Parent · b1'],
+    ['root', 'Root · root'],
   ]);
+  assert.equal(byAttr(sections[0], 'data-merge-target-select')[0].props.value, 'b1');
   assert.match(textOf(byAttr(sections[0], 'data-merge-targets')[0]), /^into:/);
   // The old per-side-chat rows are gone.
   assert.equal(byAttr(tree, 'data-side-entry').length, 0);
   assert.equal(byAttr(tree, 'data-side-chats').length, 0);
   // A chip click picks that ancestor.
-  chip(ctx, 'root').props.onClick(fakeEvent());
-  assert.deepEqual(chip(ctx, 'root').props['aria-pressed'], true);
-  assert.deepEqual(chip(ctx, 'b1').props['aria-pressed'], false);
+  pickTarget(ctx, 'root');
+  assert.equal(targetSelect(ctx).props.value, 'root');
   ctx.unload();
 });
 
@@ -1596,47 +1598,31 @@ test('mergeTargets lists the ancestors parent first; selectedTarget defaults to 
   assert.equal(mod.selectedTarget([], null, 'root'), null);
 });
 
-test('the merge target lane lights up in the plan and the geometry, dashed, in the accent role', async () => {
+test('the merge target lights up in the hover colour only while the dropdown is in use', async () => {
+  // planGraph still marks a target lane when asked (the option stays for callers and tests).
   const { plan } = planFor(ROWS, 'b2', HIST, { target: 'root' });
-  assert.deepEqual(plan.rows.filter((r) => r.target).map((r) => r.key), ['root:0', 'root:1', 'root:2']);
   assert.deepEqual(plan.lanes.filter((l) => l.target).map((l) => l.id), ['root']);
-  const geo = mod.graphGeometry(plan);
-  assert.deepEqual(geo.paths.filter((p) => p.target).map((p) => p.key), ['lane:root:0', 'lane:root:2']);
-  assert.deepEqual(geo.circles.filter((c) => c.target).map((c) => c.key), ['root:0', 'root:1', 'root:2']);
-  // The whole target lane is accent, also off the open path (root:2 and the line to it).
-  assert.ok([...geo.paths, ...geo.circles].filter((s) => s.target).every((s) => s.role === 'active'));
-  assert.equal(geo.circles.find((c) => c.key === 'root:2').role, 'active');
-  // A hover path that crosses the target lane still wins there.
-  const crossed = mod.graphGeometry(planFor(ROWS, 'b2', HIST, { target: 'root', hovered: 'b3:1' }).plan);
-  assert.equal(crossed.circles.find((c) => c.key === 'root:0').role, 'hover');
-  assert.equal(crossed.circles.find((c) => c.key === 'root:2').role, 'active');
-  // No target, or an unknown one: nothing lights up.
-  assert.equal(planFor(ROWS, 'b2', HIST).plan.rows.some((r) => r.target), false);
   assert.equal(planFor(ROWS, 'b2', HIST, { target: 'nope' }).plan.rows.some((r) => r.target), false);
 
-  // The pane: the parent lane by default, then the picked chip's lane. Dashed, thicker, and accent.
+  // The pane: no standing highlight; focus or pointer on the dropdown draws the target's path in
+  // the hover colour, a pick moves it, and leaving the dropdown clears it.
   const ctx = setup();
   await flush();
-  const lit = () => {
+  const roles = () => {
     const svg = byAttr(ctx.pane.render(), 'data-graph', 'true')[0];
-    return findAll(svg, (n) => n.props?.['data-target'] === 'true');
+    return Object.fromEntries(findAll(svg, (n) => n.type === 'circle').map((c) => [c.key, c.props['data-role']]));
   };
-  const keys = (shapes) => shapes.map((n) => n.key);
-  assert.deepEqual(keys(lit()), ['fork:b1', 'c:b1:2']);
-  chip(ctx, 'root').props.onClick(fakeEvent());
-  const shapes = lit();
-  assert.deepEqual(keys(shapes), ['lane:root:0', 'lane:root:2', 'c:root:0', 'c:root:1', 'c:root:2']);
-  for (const p of shapes.filter((n) => n.type === 'path')) {
-    assert.equal(p.props.strokeDasharray, '4 3');
-    assert.ok(p.props.strokeWidth > 2);
-  }
-  for (const c of shapes.filter((n) => n.type === 'circle')) assert.equal(c.props.strokeWidth, 2.5);
-  for (const n of shapes) assert.equal(n.props.stroke, ACCENT);
-  const svg = byAttr(ctx.pane.render(), 'data-graph', 'true')[0];
-  const colours = new Set(findAll(svg, (n) => n.type === 'path' || n.type === 'circle').map((n) => n.props.stroke));
-  assert.deepEqual([...colours].sort(), [ACCENT, MUTED].sort());
-  // The node rows of that lane say so too.
-  assert.deepEqual(nodeRows(ctx.pane.render()).filter((n) => n.props['data-target-lane']).map((n) => n.props['data-node']), ['root:0', 'root:1', 'root:2']);
+  const lit = () => findAll(byAttr(ctx.pane.render(), 'data-graph', 'true')[0], (n) => n.props?.['data-target'] === 'true');
+  const idle = roles();
+  assert.equal(lit().length, 0);
+  assert.ok(!Object.values(idle).includes('hover'));
+  targetSelect(ctx).props.onFocus();
+  assert.equal(roles()['c:b1:2'], 'hover'); // the parent (default target) path is in the hover colour
+  pickTarget(ctx, 'root');
+  assert.equal(targetSelect(ctx).props.value, 'root');
+  assert.equal(roles()['c:root:2'], 'hover');
+  targetSelect(ctx).props.onBlur();
+  assert.deepEqual(roles(), idle);
   ctx.unload();
 });
 
@@ -1690,7 +1676,7 @@ test('a merge into a grandparent uses the open chat own part and the grandparent
   const ctx = setup({ host });
   await flush();
   ctx.mark = host.calls.length;
-  chip(ctx, 'root').props.onClick(fakeEvent());
+  pickTarget(ctx, 'root');
   await mergeButton(ctx).props.onClick(fakeEvent());
   // b2 shares three exchanges with b1, so its own part is b2q only.
   assert.deepEqual(host.order, [
@@ -2020,12 +2006,22 @@ const pickRow = (ctx, model, provider) => {
 };
 const promptOf = (host) => host.order.find(([k]) => k === 'prompt')[1];
 
-test('Branch here sits on the answered exchanges of the open chat only', async () => {
+test('Branch here sits on every answered exchange; another chat opens before its form', async () => {
   const ctx = setup({ host: fakeHost({ history: { ...HIST, b2: [...HIST.b2, { role: 'user', text: 'pending' }] } }) });
   await flush();
   const tree = ctx.pane.render();
-  // b2 is open: its exchanges are drawn on root, b1 and b2. b3 and root:2 are not b2's.
-  assert.deepEqual(branchRows(tree), ['root:0', 'root:1', 'b1:2', 'b2:3']);
+  const rows = branchRows(tree);
+  // b2 is open: its own path (root, b1, b2) plus the answered nodes of other chats (b3, root:2).
+  for (const key of ['root:0', 'root:1', 'b1:2', 'b2:3']) assert.ok(rows.includes(key), key);
+  assert.ok(rows.includes('b3:1') && rows.includes('root:2'));
+  assert.ok(!rows.includes('b2:4'), 'the unanswered question is not branchable');
+  // A node of another chat: the click opens that chat in place and shows no form yet.
+  const other = fakeEvent();
+  branchButton(ctx, 'b3:1').props.onClick(other);
+  await flush();
+  assert.ok(ctx.host.opened.some((o) => (Array.isArray(o) ? o[0] : o?.id ?? o) === 'b3' || JSON.stringify(o).includes('"b3"')), JSON.stringify(ctx.host.opened));
+  assert.equal(byAttr(ctx.pane.render(), 'data-branch-form').length, 0);
+  ctx.host.opened.length = 0;
   // A click opens the form and does not open the node's chat.
   const event = fakeEvent();
   branchButton(ctx, 'root:1').props.onClick(event);
@@ -2042,19 +2038,20 @@ test('Branch shows on the open row and on the row under the pointer or keyboard 
   await flush();
   const shown = () => byAttr(ctx.pane.render(), 'data-branch-here').map((n) => n.props['data-branch-here']);
   const hidden = () => byAttr(ctx.pane.render(), 'data-branch-slot').map((n) => n.props['data-branch-slot']);
+  const all = branchRows(ctx.pane.render());
   // No hover: only the open row has a Branch button.
   assert.deepEqual(shown(), ['b2:3']);
-  assert.deepEqual(hidden(), ['root:0', 'root:1', 'b1:2']);
+  assert.deepEqual(hidden(), all.filter((k) => k !== 'b2:3'));
   // The pointer on another branchable row shows exactly one more.
   nodeOf(ctx.pane.render(), 'root:1').props.onMouseEnter();
   assert.deepEqual(shown(), ['root:1', 'b2:3']);
-  assert.deepEqual(hidden(), ['root:0', 'b1:2']);
+  assert.deepEqual(hidden(), all.filter((k) => k !== 'root:1' && k !== 'b2:3'));
   // A hidden button keeps its place: the same element and style, only hidden and inert.
   const slot = byAttr(nodeOf(ctx.pane.render(), 'root:0'), 'data-branch-slot')[0];
   const button = byAttr(nodeOf(ctx.pane.render(), 'root:1'), 'data-branch-here')[0];
   assert.equal(slot.type, button.type);
   assert.equal(slot.key, button.key);
-  assert.equal(slot.props.children, button.props.children);
+  assert.equal(textOf(slot), textOf(button));
   assert.deepEqual({ ...slot.props.style, visibility: undefined }, { ...button.props.style, visibility: undefined });
   assert.equal(slot.props.style.visibility, 'hidden');
   assert.equal(button.props.style.visibility, undefined);
@@ -2062,10 +2059,11 @@ test('Branch shows on the open row and on the row under the pointer or keyboard 
   assert.equal(slot.props['aria-hidden'], 'true');
   assert.equal(slot.props.disabled, true);
   assert.equal(slot.props.onClick, undefined);
-  // A row that cannot branch reserves nothing, hovered or not.
+  // A node of another chat is branchable too: hovering it shows its button.
+  nodeOf(ctx.pane.render(), 'root:1').props.onMouseLeave();
   nodeOf(ctx.pane.render(), 'b3:1').props.onMouseEnter();
-  assert.deepEqual(branchRows(ctx.pane.render()), ['root:0', 'root:1', 'b1:2', 'b2:3']);
-  assert.deepEqual(shown(), ['b2:3']);
+  assert.deepEqual(branchRows(ctx.pane.render()), all);
+  assert.deepEqual(shown(), ['b3:1', 'b2:3']);
   nodeOf(ctx.pane.render(), 'b3:1').props.onMouseLeave();
   // Keyboard focus shows it too, and draws no hover path.
   const before = circleColours(ctx.pane.render());
@@ -2264,13 +2262,15 @@ test('a failed session.branch shows its error in the form; nothing is asked or o
     assert.deepEqual(host.opened, []);
     ctx.unload();
   }
-  // An empty question never reaches the gateway.
+  // An empty question is allowed: the branch is made and opened, and nothing is asked.
   const empty = setup();
   await flush();
   branchButton(empty, 'b2:3').props.onClick(fakeEvent());
   await submitForm(empty);
-  assert.equal(empty.host.order.some(([k]) => k === 'branch'), false);
-  assert.match(textOf(form(empty)), /Type a question/);
+  await flush();
+  assert.equal(empty.host.order.some(([k]) => k === 'branch'), true);
+  assert.equal(empty.host.order.some(([k]) => k === 'prompt'), false);
+  assert.ok(empty.host.opened.length >= 1);
   empty.unload();
 });
 
@@ -2381,7 +2381,8 @@ test('selectable text covers the nodes, pills, the branch form, the merge sectio
   const ctx = await mergeCtx({ prepare: (host) => (host.usage = { context_used: 127990, context_max: 128000 }) });
   await mergeButton(ctx).props.onClick(fakeEvent());
   branchButton(ctx, 'sd:1').props.onClick(fakeEvent());
-  await submitForm(ctx); // empty question: an error line in the form
+  ctx.host.branchResult = new Error('nothing to branch');
+  await submitForm(ctx); // a failed branch: an error line in the form
   const tree = ctx.pane.render();
   const holders = findAll(
     tree,
