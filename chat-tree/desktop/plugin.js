@@ -25,6 +25,9 @@ const ScrollArea = sdk.ScrollArea || 'div'
 // parent or any older ancestor. It never sends. Digests come from this plugin's Python half: the
 // plugin RPC plugin.chat-tree.digest.write answers { job }, and the gateway event
 // plugin.chat-tree.digest.written brings { job, digest } or { job, error }. Live subagents show below the graph.
+// Histories come from the same Python half: one plugin.chat-tree.history.read per refresh reads the
+// stored chats of the tree from the local session store, because session.history answers only for
+// chats loaded in gateway memory. Without the Python half the pane falls back to session.history.
 // Plain ESM with no imports: the SDK pieces and timers are injected so it runs under node --test.
 // Spec: docs/specs/2026-11-12-competition-build/spec.md (unit.tree_view, unit.tree_actions)
 
@@ -67,6 +70,11 @@ const digestKey = (chatId, index) => `digest:${chatId}:${index}`;
 const DIGEST_METHOD = 'plugin.chat-tree.digest.write';
 const DIGEST_EVENT = 'plugin.chat-tree.digest.written';
 const DIGEST_TIMEOUT_MS = 60_000;
+// The history contract with the Python half: { session_ids: stored ids (at most MAX_CHATS),
+// session_id?: the open chat's runtime id } answers { histories: { id: [{ role, text, row_id? }] },
+// missing: [ids not in the store] }. Read-only, local, no model call.
+const HISTORY_METHOD = 'plugin.chat-tree.history.read';
+const BACKEND_NOTE_TEXT = 'Enable the chat-tree plugin backend to see other chats (hermes plugins enable chat-tree).';
 // side-chat's saved side model, read raw: the branch form's default before this pane saves its own.
 const SIDE_CHAT_MODEL_STORAGE = 'hermes.plugin.side-chat.sideChat:model';
 
@@ -81,6 +89,8 @@ const isThenable = (v) => v != null && typeof v.then === 'function';
 // Copied from side-chat: the gateway refuses a mutation it cannot run now as reason `session_busy`
 // (hermes_state_mutation_guards.py busy_refusal; a branch needs an idle chat, hermes_state_mutation_branch.py:58).
 const isBusy = (error) => /busy/i.test(`${error?.data?.reason ?? ''} ${errorText(error)}`);
+// -32601 (method not found): a plugin method whose Python half is not enabled.
+const isMissingMethod = (error) => error?.code === -32601 || /method not found|unknown method/i.test(errorText(error));
 
 // ── Pure tree logic (ported from apps/desktop/src/lib/session-branch-tree.ts) ──────────────
 
@@ -667,6 +677,17 @@ function digestResult(event) {
   return { job, ok: false, error: str(p?.error) || 'The digest backend sent no digest.' };
 }
 
+// The history.read reply, checked: { histories: Map(id -> rows), missing: Set(id) }, or null when
+// the reply has no histories object. A history that is not a list is left out (read as not answered).
+function parseHistoryReply(result) {
+  const raw = result?.histories;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const histories = new Map();
+  for (const [id, rows] of Object.entries(raw)) if (Array.isArray(rows)) histories.set(id, rows);
+  const missing = new Set((Array.isArray(result?.missing) ? result.missing : []).filter((id) => typeof id === 'string'));
+  return { histories, missing };
+}
+
 // A history is read again only when its chat's message count or last activity moved.
 // null (no metadata) means: always read.
 function historyKey(row) {
@@ -1151,7 +1172,9 @@ function createChatTree(deps) {
   }
 
   // Exchanges of every chat in the focused tree. A cached history is used while its chat's
-  // message count and last activity hold; a failed read keeps the last good one.
+  // message count and last activity hold; a failed read keeps the last good one. The stale chats
+  // go in one history.read (stored ids). A chat it does not answer, or every stale chat when it
+  // fails, is read the old way, one session.history each. backendMissing: history.read is unknown.
   async function loadExchanges(rows, focusedId) {
     const chats = lineageChats(buildTree(rows, focusedId));
     const exchanges = {};
@@ -1163,12 +1186,30 @@ function createChatTree(deps) {
       if (hit && key !== null && hit.key === key) exchanges[row.id] = hit.exchanges;
       else stale.push(row);
     }
-    await eachLimited(stale, HISTORY_CONCURRENCY, async (row) => {
+    const keep = (row, list) => {
+      historyCache.delete(row.id);
+      historyCache.set(row.id, { key: historyKey(row), exchanges: list });
+      exchanges[row.id] = list;
+    };
+    let live = stale;
+    let backendMissing = false;
+    if (stale.length) {
+      const batch = await readStored(stale.map((row) => row.id));
+      if (batch.ok) {
+        live = [];
+        for (const row of stale) {
+          const list = batch.histories.get(row.id);
+          if (list) keep(row, exchangesFromRows(list));
+          else live.push(row);
+        }
+      } else if (batch.missing) backendMissing = true;
+      else errors.push(`Stored histories: ${batch.error}`);
+    }
+    // session.history knows the open chat by its runtime id on some gateways: readOpenRows tries both.
+    const openStored = atomOf('focusedStoredSessionId').get();
+    await eachLimited(live, HISTORY_CONCURRENCY, async (row) => {
       try {
-        const list = exchangesFromRows(await readRows(row.id));
-        historyCache.delete(row.id);
-        historyCache.set(row.id, { key: historyKey(row), exchanges: list });
-        exchanges[row.id] = list;
+        keep(row, exchangesFromRows(await (row.id === openStored ? readOpenRows(row.id) : readRows(row.id))));
       } catch (error) {
         const old = historyCache.get(row.id);
         if (old) exchanges[row.id] = old.exchanges;
@@ -1176,7 +1217,7 @@ function createChatTree(deps) {
       }
     });
     while (historyCache.size > HISTORY_CACHE_MAX) historyCache.delete(historyCache.keys().next().value);
-    return { exchanges, errors };
+    return { exchanges, errors, backendMissing };
   }
 
   async function loadOnce(mine) {
@@ -1211,11 +1252,13 @@ function createChatTree(deps) {
       next.agentsFor = runtime;
     } else errors.push(`Subagents: ${errorText(live.reason)}`);
     // Histories only from the active backend: host.request cannot reach another owner.
+    let backendMissing = false;
     if (agentsOk) {
       const histories = await loadExchanges(next.rows, stored ?? runtime);
       if (disposed || mine !== generation) return;
       next.exchanges = histories.exchanges;
       errors.push(...histories.errors);
+      backendMissing = histories.backendMissing;
     }
     // A branch or a fork digest may have landed while the reads ran: keep the newest.
     const now = $data.get();
@@ -1225,7 +1268,11 @@ function createChatTree(deps) {
     $status.set({
       loading: false,
       error: errors.length ? errors.join('\n') : null,
-      note: agentsOk ? null : 'Messages and subagents are unavailable for a chat of another profile or connection.',
+      note: !agentsOk
+        ? 'Messages and subagents are unavailable for a chat of another profile or connection.'
+        : backendMissing
+          ? BACKEND_NOTE_TEXT
+          : null,
     });
   }
 
@@ -1324,6 +1371,19 @@ function createChatTree(deps) {
 
   // ── Reads ─────────────────────────────────────────────────────────────────────────────────
 
+  // One history.read for the stored ids. It names the open chat's runtime id, if any, as the call's
+  // session; the Python half reads the store either way. Never throws: { ok: true, histories, missing }
+  // or { ok: false, missing, error } (missing: the Python half is not enabled).
+  async function readStored(ids) {
+    const runtime = runtimeId();
+    try {
+      const reply = parseHistoryReply(await host.request(HISTORY_METHOD, { session_ids: ids, ...(runtime ? { session_id: runtime } : {}) }));
+      return reply ? { ok: true, ...reply } : { ok: false, missing: false, error: 'The history backend sent no histories.' };
+    } catch (error) {
+      return { ok: false, missing: isMissingMethod(error), error: errorText(error) };
+    }
+  }
+
   // This Hermes (v0.23) has no session.transcript: fall back to session.history, a complete snapshot.
   async function readRows(sessionId) {
     try {
@@ -1397,7 +1457,7 @@ function createChatTree(deps) {
       job = digestJob((await host.request(DIGEST_METHOD, { session_id: sessionId, ...digestRequest(purpose, title, exchanges) }))?.job);
     } catch (error) {
       // -32601 (method not found): the plugin's Python half is not enabled.
-      const missing = error?.code === -32601 || /method not found|unknown method/i.test(errorText(error));
+      const missing = isMissingMethod(error);
       return { ok: false, missing, error: missing ? DIGEST_MISSING_TEXT : errorText(error) };
     }
     if (!job) return { ok: false, error: 'The digest backend returned no job.' };

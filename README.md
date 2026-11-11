@@ -72,6 +72,8 @@ The script copies files only. It runs no `hermes` command. It writes these files
 
 The Python half of chat-tree serves one plugin RPC method, `plugin.chat-tree.digest.write`. Hermes loads the Python half only for a plugin in `plugins.enabled`. The command `hermes plugins enable chat-tree` puts it there.
 
+Privacy: the plugin reads the messages of the chats in the lineage of the open chat. It reads them read-only from the local session store of Hermes, to draw the tree (`plugin.chat-tree.history.read`). Nothing leaves the machine.
+
 ## How to use
 
 1. Open a chat.
