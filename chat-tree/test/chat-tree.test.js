@@ -2701,3 +2701,27 @@ test('the active colour is the theme primary, not the neutral --ui-accent', () =
   assert.equal(mod.ACCENT, 'var(--dt-primary, #3B82F6)');
   assert.notEqual(mod.ACCENT, mod.ROLE_COLOURS.hover);
 });
+
+test('treeFocus keeps the last listed chat when the focused chat is not in the session list', () => {
+  const rows = [{ id: 'a', title: 'A' }, { id: 'b', title: 'B', parent_session_id: 'a' }];
+  assert.equal(mod.treeFocus(rows, 'b', 'a'), 'b');
+  assert.equal(mod.treeFocus(rows, 'sub', 'b'), 'b'); // a subagent's chat: hidden from the list
+  assert.equal(mod.treeFocus(rows, 'sub', null), 'sub');
+  assert.equal(mod.treeFocus(rows, 'sub', 'gone'), 'sub');
+});
+
+test('opening a subagent chat (not in the session list) keeps the last tree, read-only, with a note', async () => {
+  const ctx = setup();
+  await flush();
+  const before = nodeKeys(ctx.pane.render());
+  assert.ok(before.length > 0);
+  ctx.host.state.focusedStoredSessionId.set('subagent-child');
+  ctx.host.state.focusedSessionId.set('rt-subagent-child');
+  await flush();
+  await flush();
+  const tree = ctx.pane.render();
+  assert.deepEqual(nodeKeys(tree), before);
+  assert.equal(byAttr(tree, 'data-unlisted-focus').length, 1);
+  assert.equal(byAttr(tree, 'data-merge-section').length, 0);
+  ctx.unload();
+});

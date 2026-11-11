@@ -71,6 +71,8 @@ export const MERGE_STAGED_TEXT =
 export const MERGE_HIDDEN_TEXT = "The main chat's composer is not visible. Open the main chat and try again.";
 export const MERGE_NO_COMPOSER_TEXT = 'The composer draft API is missing. Nothing was written.';
 export const MERGE_ROOT_TEXT = 'This is the root chat. It has no parent chat to merge into.';
+export const UNLISTED_FOCUS_TEXT =
+  "This chat is not in Hermes's session list (a subagent's chat is hidden there). The tree shows the chat you had open before, read-only.";
 export const MERGE_PARENT_MISSING_TEXT = 'The parent of this chat is not loaded. There is no chat to merge into.';
 export const MERGE_NOTHING_TEXT = 'Nothing to merge: this chat has no question and answer of its own after its fork point.';
 export const DIGEST_MISSING_TEXT = 'The digest backend is not available (the chat-tree Python half is not enabled). Nothing was staged.';
@@ -189,6 +191,15 @@ export function findRoot(row, byId) {
 
 // Builds { root, focused, partial } where each node is { row, children }. Each row is visited once.
 // Returns null when the focused id is not in the list.
+// The chat the tree centres on: the focused chat when the session list holds it, else the last
+// listed chat that was focused. Hermes hides a subagent's chat from that list (is_internal_child,
+// apps/desktop/src/types/hermes.ts:671), so opening one must not empty the tree.
+export function treeFocus(rows, want, last) {
+  if (want && buildTree(rows, want)) return want;
+  if (last && buildTree(rows, last)) return last;
+  return want ?? null;
+}
+
 export function buildTree(input, focusedId) {
   const all = (Array.isArray(input) ? input : []).filter((row) => row && typeof row.id === 'string' && row.id);
   const rows = collapseLineages(all);
@@ -1425,7 +1436,10 @@ export function createChatTree(deps) {
     const asked = [...named];
     if (agentsOk) {
       const fresh = new Set([stored, runtime, ...asked].filter(Boolean));
-      const histories = await loadExchanges(next.rows, stored ?? runtime, fresh);
+      const want = stored ?? runtime;
+      const centre = treeFocus(next.rows, want, $data.get().lastFocus);
+      if (centre === want && buildTree(next.rows, want)) next.lastFocus = want;
+      const histories = await loadExchanges(next.rows, centre, fresh);
       if (disposed || mine !== generation) return;
       for (const id of asked) named.delete(id);
       next.exchanges = histories.exchanges;
@@ -1435,6 +1449,7 @@ export function createChatTree(deps) {
     // A branch or a fork digest may have landed while the reads ran: keep the newest.
     const now = $data.get();
     next.branchIds = now.branchIds;
+    if (next.lastFocus === undefined) next.lastFocus = now.lastFocus;
     next.digests = storage ? { ...now.digests, ...readDigests(next.exchanges) } : now.digests;
     $data.set(next);
     settlePendingBranch();
@@ -1618,9 +1633,12 @@ export function createChatTree(deps) {
   // The tree as the pane draws it now, for the click handlers (render never runs an action).
   function currentView() {
     const data = $data.get();
-    const tree = buildTree(data.rows, atomOf('focusedStoredSessionId').get() ?? runtimeId());
+    const want = atomOf('focusedStoredSessionId').get() ?? runtimeId();
+    const centre = treeFocus(data.rows, want, data.lastFocus);
+    const tree = buildTree(data.rows, centre);
     const lanes = buildLanes(lineageChats(tree), data.exchanges, data.branchIds);
-    const open = tree ? (lanes.find((lane) => lane.id === tree.focused.id) ?? null) : null;
+    // A fallback tree is read-only: its chat is not the one open in Hermes, so nothing acts on it.
+    const open = tree && centre === want ? (lanes.find((lane) => lane.id === tree.focused.id) ?? null) : null;
     return { lanes, open };
   }
 
@@ -2590,10 +2608,13 @@ export function createChatTree(deps) {
     const hover = useValue($hover);
 
     const runtime = focused ?? active ?? null;
-    const tree = buildTree(data.rows, stored ?? runtime);
+    const want = stored ?? runtime;
+    const centre = treeFocus(data.rows, want, data.lastFocus);
+    const fellBack = Boolean(want) && centre !== want;
+    const tree = buildTree(data.rows, centre);
     const chats = lineageChats(tree);
     const lanes = buildLanes(chats, data.exchanges, data.branchIds);
-    const open = tree ? (lanes.find((lane) => lane.id === tree.focused.id) ?? null) : null;
+    const open = tree && !fellBack ? (lanes.find((lane) => lane.id === tree.focused.id) ?? null) : null;
     const targets = open ? mergeTargets(lanes, open.id) : [];
     const target = open ? selectedTarget(targets, ui.target, open.id) : null;
     // The target lights up only while the dropdown is in use: its last exchange takes the hover path.
@@ -2644,6 +2665,7 @@ export function createChatTree(deps) {
           notice ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: notice }) : null,
           capped ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: capped }) : null,
           status.note ? jsx('p', { className: 'text-xs opacity-70', style: SELECTABLE, children: status.note }) : null,
+          fellBack ? jsx('p', { className: 'text-xs opacity-70', style: { ...SELECTABLE, whiteSpace: 'normal', overflowWrap: 'anywhere' }, 'data-selectable-text': 'true', 'data-unlisted-focus': 'true', children: UNLISTED_FOCUS_TEXT }) : null,
           plan.rows.length ? graphView(plan, lanes, { openId: open?.id ?? null, busy, model: open?.model ?? '', hover }) : null,
           form ? branchForm(form, busy) : null,
           !form && busy && plan.rows.some((row) => row.branchable) ? note(BRANCH_BUSY_TEXT, { 'data-branch-busy': 'true' }, 'busy') : null,
