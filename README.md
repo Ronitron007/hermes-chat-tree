@@ -6,7 +6,7 @@ The entry uses only the public plugin framework of Hermes. It changes no Hermes 
 
 ## What the entry does
 
-- **Branch here.** Start a branch from a node of the tree. The branch is a new chat that continues after that exchange. Hermes names the branch. The new branch shows at its fork point at once.
+- **Branch here.** Start a branch from a node of the tree. The branch is a new chat that continues after that exchange. Hermes names the branch. The new branch shows at its fork point at once. **Branch here** shows on each answered node. The question is optional. Without a question, the pane makes the branch and opens it.
 
 - **Ask on a cheaper model.** A branch can use a cheaper model. A side question then costs less, and the main chat stays on topic.
 
@@ -20,7 +20,7 @@ The entry uses only the public plugin framework of Hermes. It changes no Hermes 
 
 - **Lanes and colours.** Each chat has its own lane. A branch leaves its parent lane at the exchange where it starts. A merge curves back into a node on the ancestor lane. The tree uses the colours of the Hermes theme:
 
-  - The path from the first exchange to the open node has the theme accent (`--ui-accent`).
+  - The path from the first exchange to the open node has the primary theme colour (`--dt-primary`).
 
   - When you point to a node, its path to the first exchange has the theme text colour (`--dt-foreground`).
 
@@ -90,9 +90,9 @@ Privacy: to draw the tree, `plugin.chat-tree.history.read` opens the local sessi
 
 4. Click a node to open its chat at that exchange. Click a `+N` row to show the exchanges in it.
 
-5. To ask a side question, choose **Branch here** on a node. The button shows on the node that you point to and on the open node. To use a cheaper model, choose it for the branch.
+5. To ask a side question, choose **Branch here** on an answered node. To use a cheaper model, choose it for the branch.
 
-6. To bring the branch back, choose the ancestor chat and the mode, **Merge as-is** or **Digest**.
+6. To bring the branch back, choose the ancestor chat in the target list. Then choose the mode, **Merge as-is** or **Digest**. While you use the list, the path to the target has the hover colour.
 
 ### Preview the pane without Hermes
 

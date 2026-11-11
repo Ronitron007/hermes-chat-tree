@@ -13,8 +13,9 @@ description: >-
   reads up to 500 persisted session summaries (host.listPersistedSessions),
   the messages of the chats in the open lineage (session.transcript,
   session.history), context sizes (session.usage, session.stats,
-  session.context_breakdown) and subagent.list. It calls session.branch and
-  prompt.submit only when you click Branch. A merge goes into the composer of
+  session.context_breakdown) and subagent.list. It calls session.branch only
+  when you click Branch, and prompt.submit only to send the question that you
+  typed for that branch. A merge goes into the composer of
   the ancestor chat as a draft (host.composer.setDraft), and the plugin never
   sends it. A node click sends the app event hermes:timeline-reveal to the
   main chat viewport and scrolls the exchange into view. It finds the

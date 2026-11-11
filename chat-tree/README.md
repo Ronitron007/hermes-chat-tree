@@ -6,13 +6,15 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
 
 - Each node is one exchange, one user message and its replies.
 
-- **Branch here** starts a branch from a node. The branch is a new chat that continues after that exchange. Hermes names the branch. The button shows on the node that you point to and on the open node.
+- **Branch here** starts a branch from a node. The branch is a new chat that continues after that exchange. Hermes names the branch. The button shows on each answered node. A node of another chat opens that chat first, because Hermes branches only a loaded chat.
+
+- A branch needs no question. Without a question, the pane makes the branch and opens it.
 
 - A new branch shows at its fork point at once.
 
 - A branch can use a cheaper model for a side question.
 
-- A merge brings a branch back into any ancestor chat on its path. Choose the mode:
+- A merge brings a branch back into any ancestor chat on its path. Choose the ancestor chat in the target list. While you use the list, the path to the target has the hover colour. Then choose the mode:
 
   - **Merge as-is** copies the questions and answers.
 
@@ -22,7 +24,7 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
 
 - The tree uses the colours of the Hermes theme:
 
-  - The path from the first exchange to the open node has the theme accent (`--ui-accent`).
+  - The path from the first exchange to the open node has the primary theme colour (`--dt-primary`).
 
   - When you point to a node, its path to the first exchange has the theme text colour (`--dt-foreground`).
 
