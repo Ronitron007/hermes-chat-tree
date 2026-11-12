@@ -436,6 +436,8 @@ export function createSideChat(deps) {
   }
 
   function register(ctx) {
+    // The loader calls register again on the same module after a disable and enable.
+    disposed = false;
     storage = ctx?.storage ?? null;
     if (typeof ctx?.setTimeout === 'function') scopedTimeout = (fn, ms) => ctx.setTimeout(fn, ms);
     if (typeof ctx?.onDispose === 'function') ctx.onDispose(dispose);

@@ -734,3 +734,17 @@ test('an answer renders through MessageTextContent when the SDK has it, else as 
   assert.equal(findAll(tree, (n) => n.type === MessageTextContent).length, 0);
   assert.ok(findAll(tree, (n) => n.type === 'pre' && n.props.children === '**bold**').length === 1);
 });
+
+test('after dispose and a second register (disable, then enable), a question still gets its answer', async () => {
+  const ctx = setup();
+  ctx.unload();
+  ctx.chat.register({
+    register: () => {},
+    storage: ctx.storage,
+    setTimeout: ctx.clock.setTimeout,
+    onDispose: () => {},
+  });
+  await ask(ctx, 'still alive?');
+  await ctx.clock.tick(POLL_MS * 3);
+  assert.equal(entryOf(ctx).status, 'answered');
+});
