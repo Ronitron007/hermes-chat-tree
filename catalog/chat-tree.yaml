@@ -39,7 +39,7 @@ maintainer: Ronitron007
 tier: community
 category: desktop
 requires_hermes: ">=0.23"
-version: "0.1.0"
+version: "0.2.0"
 docs_url: https://github.com/Ronitron007/hermes-chat-tree/tree/outbox/competition-entry/chat-tree#readme
 readme: true
 platforms: []
