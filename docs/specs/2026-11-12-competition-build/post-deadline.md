@@ -174,6 +174,26 @@ The branch name is bigger than the node text (Rohan, 2026-11-12 04:50: "branch n
 
 Check: `npm test` and `npm run assemble:chat-tree` exit 0, and a test reads the font size of a name row and of a node row.
 
+## Unit `unit.sdk_only`
+
+The catalog review of 2026-11-12 asks for this change (NousResearch/hermes-agent PR 154034, review by teknium1, changes requested at `e9c1d79`). The plugin must use only the plugin SDK. App markup changes without notice. Files: `chat-tree/src/chat-tree.js`, `chat-tree/test/chat-tree.test.js`, `chat-tree/desktop/plugin.js` (assembled), `chat-tree/README.md`, `catalog/chat-tree.yaml`.
+
+- Remove `revealExchange`, the `data-session-switching` wait, and `scrollToTurn`.
+
+- Remove every query of app markup: `[data-slot="aui_thread-viewport"]`, `[data-slot="aui_turn-pair"]`, `[data-message-id]`, `[data-session-anchor]`, and `[data-chat-surface]`.
+
+- Remove the dispatch of the app event `hermes:timeline-reveal`.
+
+- A node click opens the chat of the node with `host.openSession`. It does not scroll to the exchange. This replaces `unit.navigate_exact`.
+
+- Remove the tests of the removed code. Add a test that a node click calls `host.openSession` and touches no document query.
+
+- Remove the markup item from `known_issues` in the catalog draft, and from the README.
+
+- Do not open a hermes-agent PR for an SDK scroll option. Rohan's rule is to use only the plugin framework of today and to open no upstream code PRs.
+
+Check: `npm test` and `npm run assemble:chat-tree` exit 0. `grep` finds no `data-slot`, `data-message-id`, `data-session-anchor`, `data-chat-surface`, `data-session-switching`, or `timeline-reveal` in `chat-tree/src` and `chat-tree/desktop/plugin.js`. The catalog pinned-entry check gives no rule 8 warning.
+
 ## Process `post.process`
 
 - Opus implements each unit in its own worktree from `eb94f10`. The three units run at the same time. They change different functions of `chat-tree.js`: the marks and the status read, `submitBranch`, and the reveal. Merge them one at a time into `outbox/competition-entry`, and assemble `desktop/plugin.js` again after each merge.
