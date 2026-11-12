@@ -92,7 +92,7 @@ Privacy: to draw the tree, `plugin.chat-tree.history.read` opens the local sessi
 
 3. Point to a node to see the chat title and its model.
 
-4. Click a node to open its chat at that exchange. Click a `+N` row to show the exchanges in it.
+4. Click a node to open its chat. Click a `+N` row to show the exchanges in it.
 
 5. To ask a side question, choose **Branch here** on an answered node. To use a cheaper model, choose it for the branch.
 
@@ -122,9 +122,7 @@ The Python tests import `agent.redact`, `agent.plugin_llm`, and `hermes_state` f
 
 ## Limits
 
-- A click on a node opens its chat and scrolls the main chat to that exchange. The Desktop SDK has no scroll API. Thus the pane sends the app event `hermes:timeline-reveal` to the main chat, as the timeline rail of the chat does. It finds the chat and the exchange through the markup of the app (`data-session-anchor`, `data-slot`, `data-message-id`).
-
-- Catalog rule 8 keeps a listed plugin inside the SDK surface, and the scroll goes outside it. We chose this on purpose, and `hermes plugins validate` warns about it for the reviewer. A Desktop update can break the scroll without notice. Then a click only opens the chat.
+- A click on a node opens its chat with `host.openSession`. The main chat does not move to that exchange, because the Desktop SDK has no scroll function.
 
 - The tree reads the newest 500 chats and at most 30 chats of one lineage.
 

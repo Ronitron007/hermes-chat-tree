@@ -36,7 +36,7 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
 
 - A long run of exchanges folds into one `+N` row. Click the row to show the exchanges in it.
 
-- Point to a node to see the chat title and its model. Click a node to open its chat at that exchange.
+- Point to a node to see the chat title and its model. Click a node to open its chat.
 
 - **Chat status.** Each chat in the tree shows its status on its last row. A pulsing dot in the primary colour shows a chat that runs now. An amber dot shows a chat that needs you, and a hollow dot shows a chat that starts. A chat with no dot is idle. The Branches view also shows the status as a word after the number of exchanges. The pane reads the status from the gateway method `session.active_list`. If one read fails, the pane keeps the last status. After two failed reads in a row, the pane shows no status and no error.
 
@@ -152,9 +152,7 @@ The digest tests import `agent.redact` and `agent.plugin_llm` from the Hermes so
 
 ## Limits
 
-- A click on a node opens its chat and scrolls the main chat to that exchange. The Desktop SDK has no scroll API. Thus the pane sends the app event `hermes:timeline-reveal` to the main chat, as the timeline rail of the chat does. It finds the chat and the exchange through the markup of the app (`data-session-anchor`, `data-slot`, `data-message-id`).
-
-- Catalog rule 8 keeps a listed plugin inside the SDK surface, and the scroll goes outside it. We chose this on purpose, and `hermes plugins validate` warns about it for the reviewer. A Desktop update can break the scroll without notice. Then a click only opens the chat.
+- A click on a node opens its chat with `host.openSession`. The main chat does not move to that exchange, because the Desktop SDK has no scroll function.
 
 - The tree reads the newest 500 chats and at most 30 chats of one lineage.
 

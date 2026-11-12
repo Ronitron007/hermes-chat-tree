@@ -70,25 +70,6 @@ const NEW_BRANCH_TEXT = 'New branch';
 const LIST_LIMIT = 500;
 const MAX_CHATS = 30;
 const SIDE_PREFIX = 'Side: ';
-// Scroll to a clicked exchange through the chat's own reveal event (see revealExchange).
-const REVEAL_EVENT = 'hermes:timeline-reveal';
-const WORKSPACE_VIEWPORT = '[data-session-anchor="workspace"] [data-slot="aui_thread-viewport"]';
-const TURN_PAIR = '[data-slot="aui_turn-pair"]';
-const REVEAL_POLL_MS = 100;
-const REVEAL_WAIT_MS = 5_000;
-// Hermes sets this attribute on the chat surface while a chat switch places its transcript
-// (components/assistant-ui/thread/session-switching.ts:1-38). The reveal waits for it to go, at
-// most REVEAL_SWITCH_WAIT_MS, then sends anyway.
-const CHAT_SURFACE = '[data-chat-surface]';
-const SWITCHING_ATTR = 'data-session-switching';
-const REVEAL_SWITCH_WAIT_MS = 5_000;
-// After the scroll, each animation frame measures the turn again and corrects the scroll. It
-// stops after REVEAL_STABLE_FRAMES frames with no change, or after REVEAL_FRAMES frames.
-const REVEAL_STABLE_FRAMES = 2;
-const REVEAL_FRAMES = 20;
-const REVEAL_RETRY_MS = 400;
-const REVEAL_RETRIES = 2;
-const REVEAL_TIMEOUT_MS = 15_000;
 const MERGE_HEADER = 'From side chat: ';
 const LABEL_MAX = 60;
 // Graph geometry in px. A row is one exchange; lanes are columns inside the graph column.
@@ -670,8 +651,6 @@ function exchangesFromRows(rows) {
       const header = mergeHeader(user);
       const merge = header === null ? null : normalizeText(header);
       current = { user, reply: '', label: shortLabel(merge === null ? user : `Merged: ${merge || 'side chat'}`), merge };
-      // The user row's durable id: the scroll to this exchange reveals it by row.
-      if (Number.isInteger(row.row_id)) current.rowId = row.row_id;
       out.push(current);
     } else if (row?.role === 'assistant' && current) {
       const text = rowText(row);
@@ -1630,14 +1609,6 @@ function createChatTree(deps) {
     return () => clear(id);
   }
 
-  // One animation frame (deps.requestAnimationFrame in tests). ctx has no frame timer; callers
-  // check that they are still live when the frame runs.
-  function nextFrame(fn) {
-    if (typeof deps.requestAnimationFrame === 'function') return void deps.requestAnimationFrame(fn);
-    if (typeof globalThis.requestAnimationFrame === 'function') return void globalThis.requestAnimationFrame(fn);
-    schedule(fn, 16);
-  }
-
   // ── ctx.storage (write copied from side-chat; best effort, a store that throws never breaks the pane) ──
 
   const write = (key, value) => {
@@ -1974,116 +1945,8 @@ function createChatTree(deps) {
   function selectNode(chatId, index) {
     setUi({ open: { chatId, index } });
     openChat(chatId, 'in-place');
-    revealExchange(chatId, index);
   }
 
-  // ── Scroll to the clicked exchange ────────────────────────────────────────────────────────
-  //
-  // Not SDK surface. The SDK has no scroll API, so this sends the event the chat's own timeline
-  // rail sends (components/assistant-ui/thread/timeline.tsx:148-230) to the main chat's viewport.
-  // Its listener (use-timeline-reveal.ts) finds the row by rowId, loads older rows when needed, and
-  // answers through `complete`. Then this scrolls the turn into view, as the rail does. Rohan
-  // accepted the catalog risk on 2026-11-12. Anything missing (no viewport, no row id, a Hermes
-  // that renamed the event) leaves the chat opened and nothing else.
-  let revealing = null; // the AbortController of the reveal in flight
-  function revealExchange(chatId, index) {
-    revealing?.abort();
-    revealing = null;
-    const rowId = $data.get().exchanges?.[chatId]?.[index]?.rowId;
-    const doc = deps.document ?? globalThis.document;
-    if (!Number.isInteger(rowId) || typeof doc?.querySelector !== 'function') return;
-    if (typeof CustomEvent !== 'function' || typeof AbortController !== 'function') return;
-    const controller = new AbortController();
-    revealing = controller;
-    const live = () => !disposed && !controller.signal.aborted;
-    let waits = 0;
-    let holds = 0;
-    let misses = 0;
-    // Wait for the main chat to show the clicked chat; openSession settles before it renders.
-    // Then wait while its surface is switching: the scroll restore of a switch runs up to 15
-    // frames and can end with a scroll to the bottom (thread/list.tsx:1140-1146), after a reveal.
-    const attempt = () => {
-      if (!live()) return;
-      const viewport = atomOf('focusedStoredSessionId').get() === chatId ? doc.querySelector(WORKSPACE_VIEWPORT) : null;
-      if (!viewport) {
-        if (++waits < REVEAL_WAIT_MS / REVEAL_POLL_MS) schedule(attempt, REVEAL_POLL_MS);
-        return;
-      }
-      if (switching(viewport) && ++holds < REVEAL_SWITCH_WAIT_MS / REVEAL_POLL_MS) {
-        schedule(attempt, REVEAL_POLL_MS);
-        return;
-      }
-      send(viewport);
-    };
-    const send = (viewport) => {
-      let settled = false;
-      const complete = (revealed) => {
-        if (settled || !live()) return;
-        settled = true;
-        if (revealed) return scrollToTurn(viewport, revealed, live);
-        // A miss right after the switch can be the old chat's rows: try again a little later.
-        if (++misses <= REVEAL_RETRIES) schedule(attempt, REVEAL_RETRY_MS);
-      };
-      schedule(() => {
-        if (!settled) controller.abort();
-      }, REVEAL_TIMEOUT_MS);
-      try {
-        viewport.dispatchEvent(new CustomEvent(REVEAL_EVENT, { detail: { id: `history:${rowId}`, rowId, signal: controller.signal, complete } }));
-      } catch {
-        // A viewport that throws on dispatch: the chat stays opened.
-      }
-    };
-    attempt();
-  }
-
-  // True while the viewport's chat surface holds the switching attribute.
-  const switching = (viewport) => {
-    try {
-      return Boolean(viewport.closest?.(CHAT_SURFACE)?.hasAttribute?.(SWITCHING_ATTR));
-    } catch {
-      return false;
-    }
-  };
-
-  // Puts the turn 8px under the top of the viewport. A direct scrollTop write, never a smooth
-  // scroll: a later write stops a smooth scroll short. Turns not drawn yet keep a 37.5rem
-  // placeholder height (thread/list.tsx:468-473), so the turn moves when they draw. Each frame
-  // after the write measures the turn again and corrects scrollTop by its offset.
-  function scrollToTurn(viewport, revealedId, live) {
-    const escape = globalThis.CSS?.escape ?? ((s) => String(s).replace(/["\\]/g, '\\$&'));
-    // Measures the turn and corrects scrollTop. true: scrollTop moved 1px or more. false: no
-    // change. null: the turn is gone.
-    const correct = () => {
-      const node = viewport.querySelector(`[data-message-id="${escape(revealedId)}"]`);
-      const turn = node?.closest?.(TURN_PAIR) ?? node;
-      if (!turn?.getBoundingClientRect) return null;
-      const offset = turn.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 8;
-      const before = viewport.scrollTop;
-      if (Math.abs(offset) >= 1) viewport.scrollTop = Math.max(0, before + offset);
-      // At the end of the chat the write moves nothing: that counts as no change.
-      return Math.abs(viewport.scrollTop - before) >= 1;
-    };
-    let frames = 0;
-    let stable = 0;
-    const frame = () => {
-      if (!live()) return;
-      try {
-        const moved = correct();
-        if (moved === null) return;
-        stable = moved ? 0 : stable + 1;
-      } catch {
-        return;
-      }
-      if (stable < REVEAL_STABLE_FRAMES && ++frames < REVEAL_FRAMES) nextFrame(frame);
-    };
-    try {
-      if (correct() === null) return;
-    } catch {
-      // Markup that changed under us: the chat stays opened.
-      return;
-    }
-    nextFrame(frame);
-  }
   // The view toggle: remembered in $ui and in ctx.storage (best effort).
   const setMode = (mode) => {
     if ($ui.get().mode === mode) return;
@@ -3826,8 +3689,6 @@ function createChatTree(deps) {
   // Stops the timer and every store listener. Wired to ctx.onDispose.
   function dispose() {
     disposed = true;
-    revealing?.abort();
-    revealing = null;
     if (typeof cancelSoon === 'function') cancelSoon();
     cancelSoon = null;
     generation += 1;
