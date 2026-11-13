@@ -387,6 +387,8 @@ def read_histories(ids, open_id=None):
     try:
         rows, roots = {}, {}
         anchor = lineage_root(db, open_id, rows, roots) if open_id and _stored(db, open_id, rows) else None
+        if open_id and anchor is None and _stored(db, open_id, rows) is not None:
+            LOGGER.warning("chat-tree.history.read: lineage_root returned None for open_id %s (cycle or depth exceeded)", open_id)
         for sid in ids:
             row = _stored(db, sid, rows)
             if row is None:

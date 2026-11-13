@@ -1,0 +1,927 @@
+diff --git a/README.md b/README.md
+index c1a0e88..bd71c7c 100644
+--- a/README.md
++++ b/README.md
+@@ -6,7 +6,7 @@ The entry uses only the public plugin framework of Hermes. It changes no Hermes
+ 
+ ## What the entry does
+ 
+-- **Branch here.** Start a branch from a node of the tree. The branch is a new chat that continues after that exchange. Hermes names the branch.
++- **Branch here.** Start a branch from a node of the tree. The branch is a new chat that continues after that exchange. Hermes names the branch. The new branch shows at its fork point at once. **Branch here** shows on each answered node. The question is optional. Without a question, the pane makes the branch and opens it.
+ 
+ - **Ask on a cheaper model.** A branch can use a cheaper model. A side question then costs less, and the main chat stays on topic.
+ 
+@@ -18,7 +18,13 @@ The entry uses only the public plugin framework of Hermes. It changes no Hermes
+ 
+ - **Digests by the model.** The model writes each digest through the plugin LLM access of Hermes (`ctx.llm.complete_structured`). At a fork, the model also writes a short digest of the chat up to the fork. A digest uses only facts from the exchanges.
+ 
+-- **Lanes and colours.** Each chat has its own lane. A branch leaves its parent lane at the exchange where it starts. A merge curves back into a node on the ancestor lane. Blue marks the path from the first exchange to the open node. Grey marks all other nodes.
++- **Lanes and colours.** Each chat has its own lane. A branch leaves its parent lane at the exchange where it starts. A merge curves back into a node on the ancestor lane. The tree uses the colours of the Hermes theme:
++
++  - The path from the first exchange to the open node has the primary theme colour (`--dt-primary`).
++
++  - When you point to a node, its path to the first exchange has the theme text colour (`--dt-foreground`).
++
++  - All other nodes have the muted text colour (`--dt-muted-foreground`).
+ 
+ - **Folded runs.** A long run of exchanges folds into one `+N` row. A click on the row opens the run.
+ 
+@@ -70,9 +76,9 @@ The script copies files only. It runs no `hermes` command. It writes these files
+ | chat-tree | `desktop-plugins/chat-tree/plugin.js`, `plugins/chat-tree/` (`plugin.yaml`, `__init__.py`) |
+ | concept-links | `desktop-plugins/concept-links/plugin.js`, `plugins/concept-links/`, `skills/concept-links/SKILL.md` |
+ 
+-The Python half of chat-tree serves one plugin RPC method, `plugin.chat-tree.digest.write`. Hermes loads the Python half only for a plugin in `plugins.enabled`. The command `hermes plugins enable chat-tree` puts it there.
++The Python half of chat-tree serves two plugin RPC methods, `plugin.chat-tree.digest.write` and `plugin.chat-tree.history.read`. Hermes loads the Python half only for a plugin in `plugins.enabled`. The command `hermes plugins enable chat-tree` puts it there.
+ 
+-Privacy: the plugin reads the messages of the chats in the lineage of the open chat. It reads them read-only from the local session store of Hermes, to draw the tree (`plugin.chat-tree.history.read`). Nothing leaves the machine.
++Privacy: to draw the tree, `plugin.chat-tree.history.read` opens the local session store of Hermes (`state.db` in the profile home) read-only. It reads only the chats in the lineage of the open chat. It never reads a hidden or archived chat. This text stays on the machine, and no model gets it. Only a digest sends text to your model.
+ 
+ ## How to use
+ 
+@@ -82,11 +88,11 @@ Privacy: the plugin reads the messages of the chats in the lineage of the open c
+ 
+ 3. Point to a node to see the chat title and its model.
+ 
+-4. Click a node to open its chat. Click a `+N` row to show the exchanges in it.
++4. Click a node to open its chat at that exchange. Click a `+N` row to show the exchanges in it.
+ 
+-5. To ask a side question, choose **Branch here** on a node. To use a cheaper model, choose it for the branch.
++5. To ask a side question, choose **Branch here** on an answered node. To use a cheaper model, choose it for the branch.
+ 
+-6. To bring the branch back, choose the ancestor chat and the mode, **Merge as-is** or **Digest**.
++6. To bring the branch back, choose the ancestor chat in the target list. Then choose the mode, **Merge as-is** or **Digest**. While you use the list, the path to the target has the hover colour.
+ 
+ ### Preview the pane without Hermes
+ 
+@@ -105,16 +111,21 @@ Open the files in a browser. `render:png` needs Google Chrome in `/Applications`
+ ```bash
+ npm test
+ <hermes venv>/bin/python chat-tree/tests_py/test_digest.py
++<hermes venv>/bin/python chat-tree/tests_py/test_history.py
+ ```
+ 
+-The Python tests import `agent.redact` and `agent.plugin_llm` from the Hermes source. No test calls a model.
++The Python tests import `agent.redact`, `agent.plugin_llm`, and `hermes_state` from the Hermes source. No test calls a model, and no test opens a real Hermes home.
+ 
+ ## Limits
+ 
+-- Hermes has no API to scroll a chat to one message. A click on a node opens the chat of that node, at its usual scroll position.
++- A click on a node opens its chat and scrolls the main chat to that exchange. The Desktop SDK has no scroll API. Thus the pane sends the app event `hermes:timeline-reveal` to the main chat, as the timeline rail of the chat does. It finds the chat and the exchange through the markup of the app (`data-session-anchor`, `data-slot`, `data-message-id`).
++
++- Catalog rule 8 keeps a listed plugin inside the SDK surface, and the scroll goes outside it. We chose this on purpose, and `hermes plugins validate` warns about it for the reviewer. A Desktop update can break the scroll without notice. Then a click only opens the chat.
+ 
+ - The tree reads the newest 500 chats and at most 30 chats of one lineage.
+ 
++- One `plugin.chat-tree.history.read` reply holds at most 400,000 characters of text. Past that, the oldest exchanges lose their text first, and the reply says `truncated`.
++
+ - Hermes refuses to branch a busy chat. Wait until the chat is idle.
+ 
+ - A digest needs a model call. If the call fails, the pane gets an error and no digest. The backend never writes a digest of its own.
+@@ -128,7 +139,7 @@ The Python tests import `agent.redact` and `agent.plugin_llm` from the Hermes so
+ | | study-tree | This entry |
+ |---|---|---|
+ | Where you ask | In the main chat, through an agent tool | On a branch, from the tree pane |
+-| Parts | Agent tools, hooks, a skill, and a Desktop half | A Desktop pane and a Python RPC method |
++| Parts | Agent tools, hooks, a skill, and a Desktop half | A Desktop pane and two Python RPC methods |
+ | What comes back | The plugin adds one checked takeaway | Merge as-is or a model Digest, into any ancestor chat |
+ | Tree | Side threads as a tree | One node for each exchange, with exact fork points and merge curves |
+ 
+diff --git a/catalog/chat-tree.yaml b/catalog/chat-tree.yaml
+index f64a40a..57589f2 100644
+--- a/catalog/chat-tree.yaml
++++ b/catalog/chat-tree.yaml
+@@ -9,13 +9,31 @@ description: >-
+   from a node, ask on a cheaper model, and merge back into any ancestor chat
+   with Merge as-is or Digest. The model writes each digest through ctx.llm
+   (auxiliary task chat_tree_digest, which follows the title generation model
+-  unless you set auxiliary.chat_tree_digest). Disclosure: reads up to 500
+-  persisted session summaries and the history of each chat in the focused
+-  lineage through the public Desktop SDK. The Python half serves one plugin
+-  RPC method, plugin.chat-tree.digest.write, which sends the exchanges of one
+-  chat (at most 24,000 characters, secrets redacted) to your configured model
+-  and returns the digest as a session event. No
+-  other external services, credentials, filesystem access, shell, telemetry
++  unless you set auxiliary.chat_tree_digest). Disclosure: the desktop half
++  reads up to 500 persisted session summaries (host.listPersistedSessions),
++  the messages of the chats in the open lineage (session.transcript,
++  session.history), context sizes (session.usage, session.stats,
++  session.context_breakdown) and subagent.list. It calls session.branch only
++  when you click Branch, and prompt.submit only to send the question that you
++  typed for that branch. A merge goes into the composer of
++  the ancestor chat as a draft (host.composer.setDraft), and the plugin never
++  sends it. A node click sends the app event hermes:timeline-reveal to the
++  main chat viewport and scrolls the exchange into view. It finds the
++  viewport and the exchange through app markup (data-session-anchor,
++  data-slot, data-message-id). This is outside the Desktop SDK surface
++  (catalog rule 8), because the SDK has no scroll API. The pane keeps its
++  branch ids, digests and branch model in its plugin storage. It also shares
++  its list of branch ids with the side-chat plugin (localStorage key
++  __hermesSideChatBranchIds) and reads the side model that side-chat saved.
++  The Python half serves two plugin RPC methods.
++  plugin.chat-tree.digest.write sends the exchanges of one chat (at most
++  24,000 characters, secrets redacted) to your configured model and returns
++  the digest as a session event. plugin.chat-tree.history.read opens the
++  local session store of Hermes (state.db in the profile home) read-only
++  through hermes_state.SessionDB. It returns the messages of at most 30 chats
++  of the open chat's lineage, never a hidden or archived chat, and at most
++  400,000 characters of text. That text stays on the machine and goes to no
++  model. No other network calls, credentials, file writes, shell, telemetry
+   or self-updater.
+ maintainer: Ronitron007
+ tier: community
+@@ -27,8 +45,14 @@ readme: true
+ platforms: []
+ known_issues:
+   - Requires Hermes Desktop.
+-  - A click opens the chat of a node. Hermes has no API to scroll to one message.
+-  - Digests need hermes plugins enable chat-tree and a gateway restart.
++  - >-
++    A node click scrolls the main chat to that exchange through the app event
++    hermes:timeline-reveal and the app markup (data-session-anchor, data-slot,
++    data-message-id). Neither is Desktop SDK surface (catalog rule 8), and
++    hermes plugins validate warns about the markup selector. We chose this on
++    purpose, because the SDK has no scroll API. A Desktop update can break it
++    without notice. Then a click only opens the chat of the node.
++  - Digests and stored histories need hermes plugins enable chat-tree and a gateway restart.
+ capabilities:
+   provides_tools: []
+   provides_hooks: []
+diff --git a/chat-tree/README.md b/chat-tree/README.md
+index 45e41eb..7163c35 100644
+--- a/chat-tree/README.md
++++ b/chat-tree/README.md
+@@ -6,11 +6,15 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
+ 
+ - Each node is one exchange, one user message and its replies.
+ 
+-- **Branch here** starts a branch from a node. The branch is a new chat that continues after that exchange. Hermes names the branch.
++- **Branch here** starts a branch from a node. The branch is a new chat that continues after that exchange. Hermes names the branch. The button shows on each answered node. A node of another chat opens that chat first, because Hermes branches only a loaded chat.
++
++- A branch needs no question. Without a question, the pane makes the branch and opens it.
++
++- A new branch shows at its fork point at once.
+ 
+ - A branch can use a cheaper model for a side question.
+ 
+-- A merge brings a branch back into any ancestor chat on its path. Choose the mode:
++- A merge brings a branch back into any ancestor chat on its path. Choose the ancestor chat in the target list. While you use the list, the path to the target has the hover colour. Then choose the mode:
+ 
+   - **Merge as-is** copies the questions and answers.
+ 
+@@ -18,11 +22,17 @@ Chat Tree is a Hermes Desktop plugin. It is one window, a side pane that draws t
+ 
+ - Each chat has its own lane. A branch leaves its parent lane at the exchange where it starts. A merge curves back into a node on the ancestor lane.
+ 
+-- Blue marks the path from the first exchange to the open node. Grey marks all other nodes.
++- The tree uses the colours of the Hermes theme:
++
++  - The path from the first exchange to the open node has the primary theme colour (`--dt-primary`).
++
++  - When you point to a node, its path to the first exchange has the theme text colour (`--dt-foreground`).
++
++  - All other nodes have the muted text colour (`--dt-muted-foreground`).
+ 
+ - A long run of exchanges folds into one `+N` row. Click the row to show the exchanges in it.
+ 
+-- Point to a node to see the chat title and its model. Click a node to open its chat.
++- Point to a node to see the chat title and its model. Click a node to open its chat at that exchange.
+ 
+ ## Parts
+ 
+@@ -61,7 +71,7 @@ The method sends at most 24,000 characters of exchanges to the model. It cuts ea
+ 
+ The pane draws the tree from the messages of each chat in the lineage of the open chat. The `session.history` method of Hermes answers only for a chat that the gateway holds in memory. Thus the Python half reads the other chats from the local session store of Hermes.
+ 
+-Privacy: the plugin reads the messages of the chats in the lineage of the open chat. It reads them from the local session store of Hermes, to draw the tree. It reads only. Nothing leaves the machine, and no model gets this text.
++Privacy: the method opens the local session store of Hermes (`state.db` in the profile home) read-only. It reads only the chats in the lineage of the open chat. It never reads a hidden or archived chat. Nothing leaves the machine, and no model gets this text.
+ 
+ On each refresh, the pane sends one call for all chats with new messages:
+ 
+@@ -71,11 +81,19 @@ host.request('plugin.chat-tree.history.read', { session_ids, session_id })
+ 
+ - `session_ids` is a list of stored chat ids. The method reads the first 30 different ids. It ignores an item that is not a string.
+ 
+-- `session_id` is the runtime id of the open chat. The call can also come without it.
++- `session_id` is the id of the open chat. The call can also come without it.
+ 
+-- The call answers `{ histories, missing }`. `histories` maps each stored id to its rows, oldest first. Each row is `{ role, text, row_id }`, and `role` is `user` or `assistant`. `missing` lists the ids that are not in the store.
++- The method reads only the chats of one lineage. Two chats are in one lineage when their parent links go up to the same first chat. A `/new` reset starts a new lineage. With `session_id`, it is the lineage of the open chat. Without `session_id`, it is the lineage of the first chat that the method can read.
+ 
+-- The method opens the store of the profile of the call one time, read-only (`hermes_state.SessionDB(read_only=True)`). It reads the active rows with `get_messages_as_conversation`, as `session.history` does.
++- The method skips hidden and archived chats. If `session_id` is not in the store, it reads no chat.
++
++- The call answers `{ histories, missing, skipped, truncated }`. The `histories` object maps each stored id to its rows, oldest first. Each row is `{ role, text, branch_index, row_id }`, and `role` is `user` or `assistant`. The `missing` list holds the ids that are not in the store. The `skipped` list holds the ids that the method did not read.
++
++- The `branch_index` of a row gives its place in the list that `session.branch` cuts with `count`. That list also has rows that the tree does not show, such as `[System:` notes. Thus **Branch here** sends `count` = `branch_index` + 1 of the last answer of the exchange. Without `branch_index`, the pane counts the rows that it reads.
++
++- One reply holds at most 400,000 characters of text. Past that, the oldest exchanges lose their text first, in every chat at the same time, and `truncated` is `true`. The rows stay, so the exchange numbers do not change.
++
++- The method opens the store of the profile of the call one time, read-only (`hermes_state.SessionDB(read_only=True)`). It reads the rows that `session.branch` copies, with `get_resume_conversations`.
+ 
+ - A bad request fails the call with the reason `plugin_rpc_failed`.
+ 
+@@ -128,7 +146,9 @@ The digest tests import `agent.redact` and `agent.plugin_llm` from the Hermes so
+ 
+ ## Limits
+ 
+-- Hermes has no API to scroll a chat to one message. A click on a node opens the chat of that node, at its usual scroll position.
++- A click on a node opens its chat and scrolls the main chat to that exchange. The Desktop SDK has no scroll API. Thus the pane sends the app event `hermes:timeline-reveal` to the main chat, as the timeline rail of the chat does. It finds the chat and the exchange through the markup of the app (`data-session-anchor`, `data-slot`, `data-message-id`).
++
++- Catalog rule 8 keeps a listed plugin inside the SDK surface, and the scroll goes outside it. We chose this on purpose, and `hermes plugins validate` warns about it for the reviewer. A Desktop update can break the scroll without notice. Then a click only opens the chat.
+ 
+ - The tree reads the newest 500 chats and at most 30 chats of one lineage.
+ 
+diff --git a/chat-tree/__init__.py b/chat-tree/__init__.py
+index f64d8f7..3d0db33 100644
+--- a/chat-tree/__init__.py
++++ b/chat-tree/__init__.py
+@@ -9,10 +9,12 @@
+ plugin-llm-access.md:332-414 and website/docs/developer-guide/plugins/index.md:1961-2031 (Hermes 0.23.1).
+ An RPC call holds the client's request lane until it returns, so the model call runs in a thread.
+ 
+-The pane also calls ``plugin.chat-tree.history.read`` with ``{session_ids}`` (stored ids, at most
+-MAX_HISTORY_IDS) and gets ``{"histories": {id: [{role, text, row_id?}]}, "missing": [id]}``. It reads
+-the local session store read-only (hermes_state.SessionDB, a public plugin import), because
+-session.history answers only for chats loaded in gateway memory. No model call. Nothing leaves the machine.
++The pane also calls ``plugin.chat-tree.history.read`` with ``{session_ids, session_id?}`` (stored ids,
++at most MAX_HISTORY_IDS) and gets ``{"histories": {id: [{role, text, row_id?}]}, "missing": [id],
++"skipped": [id], "truncated": bool}``. It reads the local session store read-only
++(hermes_state.SessionDB, a public plugin import), because session.history answers only for chats
++loaded in gateway memory. It reads only chats of the open chat's lineage, never a hidden or archived
++chat, and at most MAX_REPLY_CHARS of text. No model call. Nothing leaves the machine.
+ """
+ 
+ import contextvars
+@@ -45,6 +47,8 @@
+ MAX_HISTORY_IDS = 30  # the pane's MAX_CHATS; ids after the first 30 unique ones are not read
+ MAX_ID_CHARS = 200
+ SYSTEM_MARKER = "[System:"  # gateway notices stored as user rows; the transcript never shows them
++MAX_PARENT_LINKS = 256  # parent links walked up from one chat; a longer walk counts as no lineage
++MAX_REPLY_CHARS = 400_000  # text in one history.read reply; the oldest exchanges lose their text first
+ 
+ SCHEMA = {
+     "type": "object",
+@@ -211,25 +215,69 @@ def _content_text(content):
+     return ""
+ 
+ 
++_TEXT_KINDS = ("text", "input_text", "output_text")
++
++
++def _part_text(part):
++    """The gateway's text for one structured content dict (tui_gateway/session_history.py
++    _history_dict_text). A non-text part gives a placeholder, so it is never empty."""
++    kind = part.get("type")
++    if kind in _TEXT_KINDS:
++        return str(part.get("text") or part.get("content") or "")
++    if kind:
++        return f"[{kind}]"
++    if "text" in part:
++        return str(part.get("text") or "")
++    return "[structured content]"
++
++
++def branch_text(content):
++    """The text that session.branch tests to keep a row (tui_gateway/session_history.py
++    _coerce_message_text). Only whether it is blank matters here, so a placeholder stands for an image."""
++    if isinstance(content, list):
++        chunks = []
++        for part in content:
++            if isinstance(part, str):
++                chunks.append(part)
++            elif isinstance(part, Mapping) and isinstance(part.get("text"), str):
++                chunks.append(part["text"])
++            elif isinstance(part, Mapping) and part.get("type"):
++                chunks.append(_part_text(part))
++        return "".join(chunks)
++    if isinstance(content, Mapping):
++        return _part_text(content)
++    return "" if content is None else str(content)
++
++
+ def project_history(messages):
+-    """User and assistant rows with text, oldest first, as ``{role, text, row_id?}``.
++    """User and assistant rows with text, oldest first, as ``{role, text, branch_index, row_id?}``.
+ 
+     Public surfaces only, so this is a subset of the gateway's transcript projection
+     (tui_gateway/session_history.py _history_to_messages): it drops the rows that projection never
+-    shows as a bubble by the same tests, ``display_kind == "hidden"`` and ``[System:`` user notices."""
++    shows as a bubble by the same tests, ``display_kind == "hidden"`` and ``[System:`` user notices.
++
++    ``branch_index`` is the position of the row in the list that session.branch cuts with ``count``
++    (tui_gateway/methods_session_branch.py _visible_branch_history): every user and assistant row
++    whose text is not blank, the dropped ones too. So ``count = branch_index + 1`` keeps the history
++    up to and including that row."""
+     out = []
++    visible = -1
+     for message in messages if isinstance(messages, list) else []:
+         if not isinstance(message, Mapping):
+             continue
+         role = message.get("role")
+-        if role not in ("user", "assistant") or message.get("display_kind") == "hidden":
++        if role not in ("user", "assistant"):
++            continue
++        if branch_text(message.get("content")).strip():
++            visible += 1
++        if message.get("display_kind") == "hidden":
+             continue
+         text = _content_text(message.get("content"))
+         if role == "user" and text.lstrip().startswith(SYSTEM_MARKER):
+             continue
+         if not text.strip():
+             continue
+-        row = {"role": role, "text": text}
++        row = {"role": role, "text": text, "branch_index": visible}
+         row_id = message.get("_row_id")
+         if isinstance(row_id, int) and not isinstance(row_id, bool):
+             row["row_id"] = row_id
+@@ -237,27 +285,125 @@ def project_history(messages):
+     return out
+ 
+ 
+-def read_histories(ids):
+-    """``{"histories": {id: rows}, "missing": [ids not in the store]}`` from one read-only open.
++def parent_id(row):
++    """The stored id that ``row`` forks or continues from, or None. The pane's rule (forkParentId,
++    from session-branch-tree.ts): a ``_reset_from`` row (/new, idle reset) starts a new conversation,
++    then ``_branched_from``, then ``parent_session_id`` (older forks and compression segments)."""
++    if not isinstance(row, Mapping) or _text(row.get("_reset_from")):
++        return None
++    return _text(row.get("_branched_from")) or _text(row.get("parent_session_id")) or None
++
+ 
+-    SessionDB() with no path opens get_hermes_home()/state.db at call time, so the handler reads the
+-    profile whose scope the RPC runs in. The read is the one session.history makes for a live chat:
+-    active rows only, the compression lineage root to tip, with row ids."""
+-    histories, missing = {}, []
++def _text(value):
++    return value.strip() if isinstance(value, str) else ""
++
++
++def _stored(db, sid, rows):
++    """The stored row of ``sid`` (``SessionDB.get_session``), or None. ``rows`` caches the reads of one call."""
++    if sid not in rows:
++        rows[sid] = db.get_session(sid)
++    return rows[sid]
++
++
++def lineage_root(db, sid, rows, roots):
++    """The stored id at the top of the parent links of ``sid``, or None after a cycle or more than
++    MAX_PARENT_LINKS links. A parent that is not in the store ends the walk, as in the pane.
++    ``roots`` caches the roots of one call, so a shared ancestor is read once."""
++    path, current, root = [], sid, None
++    while True:
++        if current in roots:
++            root = roots[current]
++            break
++        if current in path or len(path) > MAX_PARENT_LINKS:
++            break  # a cycle or a walk too long: no root, so the chat is not read
++        path.append(current)
++        parent = parent_id(_stored(db, current, rows))
++        if parent is None or _stored(db, parent, rows) is None:
++            root = current
++            break
++        current = parent
++    for seen in path:
++        roots[seen] = root
++    return root
++
++
++def _exchange_numbers(rows):
++    """The exchange of each row: a user row starts the next one. Rows before the first user row go with exchange 0."""
++    number, started, out = 0, False, []
++    for row in rows:
++        if row["role"] == "user":
++            number += started
++            started = True
++        out.append(number)
++    return out
++
++
++def cap_histories(histories):
++    """Fit the text of all histories in MAX_REPLY_CHARS. True when text was dropped.
++
++    The text of exchange 0 goes first, in every chat at once, then exchange 1, and so on. A row keeps
++    its role and row id with an empty text, so the exchange numbers do not move (the pane's Branch here
++    counts the full transcript by that number), and a branch still matches the copied exchanges of
++    its parent."""
++    total = sum(len(row["text"]) for rows in histories.values() for row in rows)
++    if total <= MAX_REPLY_CHARS:
++        return False
++    numbered = [(rows, _exchange_numbers(rows)) for rows in histories.values()]
++    size = {}
++    for rows, numbers in numbered:
++        for row, number in zip(rows, numbers):
++            size[number] = size.get(number, 0) + len(row["text"])
++    cut = 0
++    while total > MAX_REPLY_CHARS:
++        total -= size.get(cut, 0)
++        cut += 1
++    for rows, numbers in numbered:
++        for row, number in zip(rows, numbers):
++            if number < cut:
++                row["text"] = ""
++    return True
++
++
++def read_histories(ids, open_id=None):
++    """``{"histories": {id: rows}, "missing": [ids not in the store], "skipped": [ids not read],
++    "truncated": bool}`` from one read-only open.
++
++    Only chats of one lineage are read: the lineage of ``open_id`` (the open chat that the call names),
++    or else the lineage of the first chat it can read. A chat is in a lineage when its parent links end
++    at the same root. Hidden and archived chats are skipped, and so is every chat when ``open_id`` is
++    not in the store. SessionDB() with no path opens get_hermes_home()/state.db at call time, so the
++    handler reads the profile whose scope the RPC runs in.
++
++    The rows are the ones session.branch copies (tui_gateway/methods_session_branch.py
++    _branch_source_history): the display history of ``get_resume_conversations``, the compression
++    lineage root to tip, with the rows of in-place compaction and row ids. The gateway also adds the
++    live chat's turns that are not stored yet, after these rows. A plugin cannot see them, and they
++    come after every stored row, so they do not move a branch_index."""
++    histories, missing, skipped = {}, [], []
+     if not ids:
+-        return {"histories": histories, "missing": missing}
++        return {"histories": histories, "missing": missing, "skipped": skipped, "truncated": False}
+     from hermes_state import SessionDB  # public plugin API (plugins/public-api.md)
+     db = SessionDB(read_only=True)  # no schema init, no write lock (hermes_state.py _open_read_only)
+     try:
++        rows, roots = {}, {}
++        anchor = lineage_root(db, open_id, rows, roots) if open_id and _stored(db, open_id, rows) else None
+         for sid in ids:
+-            if db.get_session_list_row(sid) is None:
++            row = _stored(db, sid, rows)
++            if row is None:
+                 missing.append(sid)
+                 continue
+-            histories[sid] = project_history(
+-                db.get_messages_as_conversation(sid, include_ancestors=True, include_row_ids=True))
++            root = None if row.get("hidden") or row.get("archived") else lineage_root(db, sid, rows, roots)
++            if not open_id and anchor is None:
++                anchor = root  # no open chat named: the lineage of the first chat that can be read
++            if root is None or root != anchor:
++                skipped.append(sid)
++                continue
++            _, display = db.get_resume_conversations(sid)
++            histories[sid] = project_history(display)
+     finally:
+         db.close()
+-    return {"histories": histories, "missing": missing}
++    truncated = cap_histories(histories)
++    return {"histories": histories, "missing": missing, "skipped": skipped, "truncated": truncated}
+ 
+ 
+ def register(ctx):
+@@ -301,9 +447,11 @@ def run():
+         return {"job": job}
+ 
+     def history(params, *, session_id=None, **kwargs):
+-        # session_id: the open chat, or None for a sessionless call. Either way the read is read-only
+-        # and stays in the calling profile's state.db.
+-        return read_histories(parse_history(params))
++        # session_id: the open chat that the call names (the gateway authorized the call for it), or
++        # None for a sessionless call. Either way the read is read-only, stays in the calling
++        # profile's state.db, and returns chats of one lineage only.
++        open_id = session_id.strip() if isinstance(session_id, str) else ""
++        return read_histories(parse_history(params), open_id or None)
+ 
+     ctx.register_rpc(METHOD, write)
+     ctx.register_rpc(HISTORY_METHOD, history)
+diff --git a/chat-tree/desktop/plugin.js b/chat-tree/desktop/plugin.js
+index ba78cdf..b0f61d7 100644
+--- a/chat-tree/desktop/plugin.js
++++ b/chat-tree/desktop/plugin.js
+@@ -627,6 +627,11 @@ function sharedExchangeCount(child, parent) {
+ // row). Counted: an assistant row before the first user row, because the gateway keeps it.
+ // Example: [user q1, assistant a1, user q2, assistant (tool call, no text), tool, assistant a2]
+ // gives exchange 0 -> count 2, exchange 1 -> count 4.
++// That rule counts only the rows the pane reads. The gateway also counts rows that no history shows,
++// such as `[System:` notes and hidden rows, so the count can come out short. A history.read row
++// carries branch_index, its position in the gateway's own list. When the last answer row of the
++// exchange has one, count = branch_index + 1, exactly. Such a row counts as an answer even when the
++// reply cap of history.read emptied its text.
+ // null when the exchange does not exist or has no answer yet: the branch would end on a question.
+ function branchCount(rows, index) {
+   if (!Number.isInteger(index) || index < 0) return null;
+@@ -644,7 +649,10 @@ function branchCount(rows, index) {
+     if ((role === 'user' || role === 'assistant') && text) visible += 1;
+     if (exchange !== index) continue;
+     if (Number.isInteger(row?.row_id) && row.row_id > maxId) maxId = row.row_id;
+-    if (role === 'assistant' && text) found = { count: visible, through: maxId > 0 ? maxId : null };
++    const at = Number.isInteger(row?.branch_index) && row.branch_index >= 0 ? row.branch_index : null;
++    if (role === 'assistant' && (text || at !== null)) {
++      found = { count: at === null ? visible : at + 1, through: maxId > 0 ? maxId : null };
++    }
+   }
+   return found;
+ }
+@@ -1659,6 +1667,17 @@ function createChatTree(deps) {
+     }
+   }
+ 
++  // The open chat's rows for Branch here. history.read rows carry branch_index (see branchCount), so
++  // they come first. Without the Python half, or when it does not return the chat, readOpenRows.
++  async function readBranchRows(openId) {
++    if ($status.get().note !== BACKEND_NOTE_TEXT) {
++      const stored = await readStored([openId]);
++      const rows = stored.ok ? stored.histories.get(openId) : undefined;
++      if (Array.isArray(rows)) return rows;
++    }
++    return readOpenRows(openId);
++  }
++
+   // This Hermes (v0.23) has no session.transcript: fall back to session.history, a complete snapshot.
+   async function readRows(sessionId) {
+     try {
+@@ -1981,7 +2000,7 @@ function createChatTree(deps) {
+ 
+     let rows;
+     try {
+-      rows = await readOpenRows(open.id);
++      rows = await readBranchRows(open.id);
+     } catch (error) {
+       return fail(`Could not read this chat: ${errorText(error)}`);
+     }
+diff --git a/chat-tree/src/chat-tree.js b/chat-tree/src/chat-tree.js
+index 6e68dc5..1c7e620 100644
+--- a/chat-tree/src/chat-tree.js
++++ b/chat-tree/src/chat-tree.js
+@@ -603,6 +603,11 @@ export function sharedExchangeCount(child, parent) {
+ // row). Counted: an assistant row before the first user row, because the gateway keeps it.
+ // Example: [user q1, assistant a1, user q2, assistant (tool call, no text), tool, assistant a2]
+ // gives exchange 0 -> count 2, exchange 1 -> count 4.
++// That rule counts only the rows the pane reads. The gateway also counts rows that no history shows,
++// such as `[System:` notes and hidden rows, so the count can come out short. A history.read row
++// carries branch_index, its position in the gateway's own list. When the last answer row of the
++// exchange has one, count = branch_index + 1, exactly. Such a row counts as an answer even when the
++// reply cap of history.read emptied its text.
+ // null when the exchange does not exist or has no answer yet: the branch would end on a question.
+ export function branchCount(rows, index) {
+   if (!Number.isInteger(index) || index < 0) return null;
+@@ -620,7 +625,10 @@ export function branchCount(rows, index) {
+     if ((role === 'user' || role === 'assistant') && text) visible += 1;
+     if (exchange !== index) continue;
+     if (Number.isInteger(row?.row_id) && row.row_id > maxId) maxId = row.row_id;
+-    if (role === 'assistant' && text) found = { count: visible, through: maxId > 0 ? maxId : null };
++    const at = Number.isInteger(row?.branch_index) && row.branch_index >= 0 ? row.branch_index : null;
++    if (role === 'assistant' && (text || at !== null)) {
++      found = { count: at === null ? visible : at + 1, through: maxId > 0 ? maxId : null };
++    }
+   }
+   return found;
+ }
+@@ -1635,6 +1643,17 @@ export function createChatTree(deps) {
+     }
+   }
+ 
++  // The open chat's rows for Branch here. history.read rows carry branch_index (see branchCount), so
++  // they come first. Without the Python half, or when it does not return the chat, readOpenRows.
++  async function readBranchRows(openId) {
++    if ($status.get().note !== BACKEND_NOTE_TEXT) {
++      const stored = await readStored([openId]);
++      const rows = stored.ok ? stored.histories.get(openId) : undefined;
++      if (Array.isArray(rows)) return rows;
++    }
++    return readOpenRows(openId);
++  }
++
+   // This Hermes (v0.23) has no session.transcript: fall back to session.history, a complete snapshot.
+   async function readRows(sessionId) {
+     try {
+@@ -1957,7 +1976,7 @@ export function createChatTree(deps) {
+ 
+     let rows;
+     try {
+-      rows = await readOpenRows(open.id);
++      rows = await readBranchRows(open.id);
+     } catch (error) {
+       return fail(`Could not read this chat: ${errorText(error)}`);
+     }
+diff --git a/chat-tree/test/chat-tree.test.js b/chat-tree/test/chat-tree.test.js
+index 6beaa1e..b2313df 100644
+--- a/chat-tree/test/chat-tree.test.js
++++ b/chat-tree/test/chat-tree.test.js
+@@ -1516,6 +1516,25 @@ test('branchCount: user and assistant rows with text, through the exchange last
+   assert.deepEqual(mod.branchCount([...msgs(['q', 'a']), { role: 'assistant', text: 'a more' }], 0), { count: 3, through: null });
+ });
+ 
++test('branchCount: a branch_index from history.read gives the exact count; rows without one keep the rule', () => {
++  // history.read leaves out a hidden [System: row that session.branch still counts (branch index 2).
++  const rows = [
++    { role: 'user', text: 'q1', row_id: 11, branch_index: 0 },
++    { role: 'assistant', text: 'a1', row_id: 12, branch_index: 1 },
++    { role: 'user', text: 'q2', row_id: 14, branch_index: 3 },
++    { role: 'assistant', text: 'a2', row_id: 15, branch_index: 4 },
++    { role: 'user', text: 'q3', row_id: 16, branch_index: 5 },
++    { role: 'assistant', text: '', row_id: 17, branch_index: 6 }, // text emptied by the reply cap: still an answer
++  ];
++  assert.deepEqual(mod.branchCount(rows, 0), { count: 2, through: 12 });
++  assert.deepEqual(mod.branchCount(rows, 1), { count: 5, through: 15 });
++  assert.deepEqual(mod.branchCount(rows, 2), { count: 7, through: 17 });
++  // The same rows with no branch_index: the old rule, which comes out one short at exchange 1.
++  const plain = rows.map(({ branch_index, ...rest }) => rest);
++  assert.deepEqual(mod.branchCount(plain, 1), { count: 4, through: 15 });
++  assert.equal(mod.branchCount(plain, 2), null);
++});
++
+ // ── Merge section ───────────────────────────────────────────────────────────────────────────
+ 
+ const SHARED = [
+@@ -2138,6 +2157,26 @@ test('Branch here: session.branch with the count and no name, prompt.submit with
+   again.unload();
+ });
+ 
++test('Branch here counts with the branch_index of history.read rows: a hidden [System: row before the cut', async () => {
++  const host = fakeHost({ backend: true });
++  // b2 in the store: session.branch also counts a [System: row after a1 (branch index 2), which
++  // history.read does not return. So q2 is 3 and a2 is 4.
++  host.store = { ...HIST, b2: HIST.b2.map((r, i) => ({ ...r, branch_index: i < 2 ? i : i + 1 })) };
++  const ctx = setup({ host });
++  await flush();
++  branchButton(ctx, 'root:1').props.onClick(fakeEvent());
++  typeInto(ctx, 'question', 'why q2?');
++  ctx.mark = ctx.host.calls.length;
++  await submitForm(ctx);
++  await flush();
++  const branch = ctx.host.order.find(([k]) => k === 'branch');
++  assert.deepEqual(branch[1], { session_id: 'rt-b2', count: 5 }); // the old rule gives 4
++  const reads = ctx.host.calls.slice(ctx.mark).map(([m]) => m);
++  assert.deepEqual(reads.slice(0, 2), [mod.HISTORY_METHOD, 'session.branch']);
++  assert.equal(reads.includes('session.history'), false);
++  ctx.unload();
++});
++
+ test('Branch here sends through_message_id when the rows carry row ids, and no override for a blank model', async () => {
+   const host = fakeHost();
+   host.transcript = { b2: HIST.b2.map((m, i) => ({ ...m, row_id: 100 + i })) };
+diff --git a/chat-tree/tests_py/test_history.py b/chat-tree/tests_py/test_history.py
+index 60e4a6d..f63b17c 100644
+--- a/chat-tree/tests_py/test_history.py
++++ b/chat-tree/tests_py/test_history.py
+@@ -46,18 +46,31 @@ def handler():
+     return ctx.rpcs["history.read"]
+ 
+ 
+-def seed(home, sessions):
+-    """Write sessions {id: [(role, content, extra)]} to <home>/state.db with SessionDB's own API."""
++def seed(home, sessions, meta=None):
++    """Write sessions {id: [(role, content, extra)]} to <home>/state.db with SessionDB's own API.
++
++    meta: {id: create_session kwargs (parent_session_id, model_config), plus hidden=True or archived=True}.
++    Parents come before their children in ``sessions``."""
+     db = hermes_state.SessionDB(db_path=Path(home) / "state.db")
+     try:
+         for sid, rows in sessions.items():
+-            db.create_session(session_id=sid, source="cli", model="test/model")
+-            for role, content, extra in rows:
+-                db.append_message(session_id=sid, role=role, content=content, **extra)
++            extra = dict((meta or {}).get(sid, {}))
++            hidden, archived = extra.pop("hidden", False), extra.pop("archived", False)
++            db.create_session(session_id=sid, source="cli", model="test/model", **extra)
++            for role, content, kwargs in rows:
++                db.append_message(session_id=sid, role=role, content=content, **kwargs)
++            if hidden:
++                db.set_session_hidden(sid, True)
++            if archived:
++                db.set_session_archived(sid, True, notify=False)
+     finally:
+         db.close()
+ 
+ 
++def branch_of(parent, **flags):
++    return {"parent_session_id": parent, "model_config": {"_branched_from": parent}, **flags}
++
++
+ CALL = {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}
+ CHATS = {
+     "chat-a": [
+@@ -75,13 +88,31 @@ def seed(home, sessions):
+         ("assistant", "Branch answer", {}),
+     ],
+     "chat-empty": [],
++    "chat-c": [("user", "Grandchild question", {}), ("assistant", "Grandchild answer", {})],
++    "chat-hidden": [("user", "Hidden question", {}), ("assistant", "Hidden answer", {})],
++    "chat-archived": [("user", "Archived question", {}), ("assistant", "Archived answer", {})],
++    "chat-reset": [("user", "After /new", {}), ("assistant", "A new conversation", {})],
++    "other": [("user", "Unrelated question", {}), ("assistant", "Unrelated answer", {})],
++    "other-kid": [("user", "Unrelated branch", {}), ("assistant", "Unrelated branch answer", {})],
++}
++# One lineage: chat-a and its branches chat-b, chat-empty, chat-c (an older fork with only
++# parent_session_id), chat-hidden and chat-archived. chat-reset (/new from chat-a) and other with
++# other-kid are other lineages.
++META = {
++    "chat-b": branch_of("chat-a"),
++    "chat-empty": branch_of("chat-a"),
++    "chat-c": {"parent_session_id": "chat-b"},
++    "chat-hidden": branch_of("chat-a", hidden=True),
++    "chat-archived": branch_of("chat-a", archived=True),
++    "chat-reset": {"parent_session_id": "chat-a", "model_config": {"_reset_from": "chat-a"}},
++    "other-kid": branch_of("other"),
+ }
+ 
+ 
+ class HistoryReadTest(unittest.TestCase):
+     def setUp(self):
+         self.home = tempfile.mkdtemp(prefix="chat-tree-history-profile-")
+-        seed(self.home, CHATS)
++        seed(self.home, CHATS, META)
+         self.token = set_hermes_home_override(self.home)  # the profile scope a plugin RPC runs in
+ 
+     def tearDown(self):
+@@ -100,19 +131,65 @@ def test_reads_two_stored_chats_with_user_and_assistant_rows_only(self):
+         ids = [r["row_id"] for r in rows_a]
+         self.assertEqual(ids, sorted(ids))  # oldest first
+         self.assertTrue(all(isinstance(i, int) for i in ids))
++        # session.branch counts the [System: notice (branch index 2) that the tree never shows, so a
++        # branch after "And borrowing?" keeps 4 + 1 = 5 rows, not 4.
++        self.assertEqual([r["branch_index"] for r in rows_a], [0, 1, 3, 4])
+         self.assertEqual([(r["role"], r["text"]) for r in result["histories"]["chat-b"]],
+                          [("user", "Branch question"), ("assistant", "Branch answer")])
+ 
+-    def test_accepts_the_open_chat_session_id(self):
+-        result = handler()({"session_ids": ["chat-b"], "session_id": "local-runtime"}, session_id="local-runtime")
+-        self.assertEqual(len(result["histories"]["chat-b"]), 2)
++    def test_reads_only_the_lineage_of_the_open_chat(self):
++        ids = ["chat-a", "chat-b", "chat-c", "other", "other-kid", "chat-reset"]
++        result = handler()({"session_ids": ids, "session_id": "chat-c"}, session_id="chat-c")
++        self.assertEqual(list(result["histories"]), ["chat-a", "chat-b", "chat-c"])
++        self.assertEqual(result["skipped"], ["other", "other-kid", "chat-reset"])
++        self.assertEqual(result["missing"], [])
++        self.assertFalse(result["truncated"])
++
++    def test_the_lineage_of_another_open_chat(self):
++        ids = ["chat-a", "chat-b", "other", "other-kid"]
++        result = handler()({"session_ids": ids, "session_id": "other"}, session_id="other")
++        self.assertEqual(list(result["histories"]), ["other", "other-kid"])
++        self.assertEqual(result["skipped"], ["chat-a", "chat-b"])
++
++    def test_skips_hidden_and_archived_chats(self):
++        ids = ["chat-hidden", "chat-archived", "chat-b"]
++        result = handler()({"session_ids": ids, "session_id": "chat-a"}, session_id="chat-a")
++        self.assertEqual(list(result["histories"]), ["chat-b"])
++        self.assertEqual(result["skipped"], ["chat-hidden", "chat-archived"])
++
++    def test_an_open_chat_that_is_not_stored_reads_nothing(self):
++        result = handler()({"session_ids": ["chat-a", "chat-b", "nope"], "session_id": "local-runtime"},
++                           session_id="local-runtime")
++        self.assertEqual(result["histories"], {})
++        self.assertEqual(result["skipped"], ["chat-a", "chat-b"])
++        self.assertEqual(result["missing"], ["nope"])
++
++    def test_a_sessionless_call_reads_the_lineage_of_its_first_readable_chat(self):
++        ids = ["nope", "chat-hidden", "other", "chat-a", "other-kid"]
++        result = handler()({"session_ids": ids}, session_id=None)
++        self.assertEqual(list(result["histories"]), ["other", "other-kid"])
++        self.assertEqual(result["skipped"], ["chat-hidden", "chat-a"])
++        self.assertEqual(result["missing"], ["nope"])
+ 
+     def test_reports_missing_ids_and_an_empty_chat(self):
+         result = handler()({"session_ids": ["nope", "chat-empty", "chat-b"]}, session_id=None)
+         self.assertEqual(result["missing"], ["nope"])
++        self.assertEqual(result["skipped"], [])
+         self.assertEqual(result["histories"]["chat-empty"], [])
+         self.assertEqual(sorted(result["histories"]), ["chat-b", "chat-empty"])
+ 
++    def test_the_reply_text_is_capped_and_says_so(self):
++        with mock.patch.object(plugin, "MAX_REPLY_CHARS", 60):
++            result = handler()({"session_ids": ["chat-a", "chat-b"], "session_id": "chat-a"}, session_id="chat-a")
++        self.assertTrue(result["truncated"])
++        rows = [row for chat in result["histories"].values() for row in chat]
++        self.assertLessEqual(sum(len(row["text"]) for row in rows), 60)
++        self.assertEqual(len(result["histories"]["chat-a"]), 4)  # every row stays, with its row id
++        self.assertTrue(all(isinstance(row["row_id"], int) for row in rows))
++        self.assertEqual([row["text"] for row in result["histories"]["chat-a"]],
++                         ["", "", "And borrowing?", "A borrow is a reference."])
++        self.assertEqual([row["text"] for row in result["histories"]["chat-b"]], ["", ""])
++
+     def test_dedupes_ignores_non_strings_and_caps_at_30(self):
+         ids = ["chat-b", "chat-b", 7, None, {"x": 1}, "", "  ", "x" * 201] + [f"gone-{i}" for i in range(40)]
+         result = handler()({"session_ids": ids}, session_id=None)
+@@ -128,14 +205,13 @@ def test_rejects_bad_params(self):
+ 
+     def test_one_read_only_open_per_call_in_the_calling_profile(self):
+         opened = []
+-        real = hermes_state.SessionDB
+ 
+-        def spy(*args, **kwargs):
+-            db = real(*args, **kwargs)
+-            opened.append((args, kwargs, db.db_path))
+-            return db
++        class Spy(hermes_state.SessionDB):  # a subclass: Hermes code reads class helpers off the module name
++            def __init__(self, *args, **kwargs):
++                super().__init__(*args, **kwargs)
++                opened.append((args, kwargs, self.db_path))
+ 
+-        with mock.patch.object(hermes_state, "SessionDB", spy):
++        with mock.patch.object(hermes_state, "SessionDB", Spy):
+             handler()({"session_ids": ["chat-a", "chat-b", "nope"]}, session_id=None)
+         self.assertEqual(len(opened), 1)
+         self.assertEqual(opened[0][:2], ((), {"read_only": True}))
+@@ -160,7 +236,8 @@ def test_the_read_does_not_write_the_store(self):
+ 
+     def test_empty_list_opens_nothing(self):
+         with mock.patch.object(hermes_state, "SessionDB", side_effect=AssertionError("opened")):
+-            self.assertEqual(handler()({"session_ids": []}, session_id=None), {"histories": {}, "missing": []})
++            self.assertEqual(handler()({"session_ids": []}, session_id=None),
++                             {"histories": {}, "missing": [], "skipped": [], "truncated": False})
+ 
+ 
+ class ProjectionTest(unittest.TestCase):
+@@ -172,10 +249,95 @@ def test_hidden_rows_and_bad_shapes_are_dropped(self):
+             "not a row",
+             {"role": "user", "content": None},
+         ])
+-        self.assertEqual(rows, [{"role": "user", "text": "kept", "row_id": 3},
+-                                {"role": "assistant", "text": "dict text"}])
++        self.assertEqual(rows, [{"role": "user", "text": "kept", "branch_index": 0, "row_id": 3},
++                                {"role": "assistant", "text": "dict text", "branch_index": 2}])
+         self.assertEqual(plugin.project_history(None), [])
+ 
++    def test_branch_index_counts_the_rows_that_session_branch_keeps(self):
++        rows = plugin.project_history([
++            {"role": "user", "content": "q1"},  # 0
++            {"role": "assistant", "content": "a1"},  # 1
++            {"role": "assistant", "content": "scaffold", "display_kind": "hidden"},  # 2, not returned
++            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]},  # 3, no text
++            {"role": "tool", "content": "tool output"},  # not a user or assistant row
++            {"role": "user", "content": "[System: model switched]"},  # 4, not returned
++            {"role": "user", "content": "q2"},  # 5
++            {"role": "assistant", "content": "   "},  # blank: session.branch drops it too
++            {"role": "assistant", "content": [{"type": "text", "text": "a2"}]},  # 6
++        ])
++        self.assertEqual([(r["text"], r["branch_index"]) for r in rows], [("q1", 0), ("a1", 1), ("q2", 5), ("a2", 6)])
++
++    def test_branch_text_blank_tests(self):
++        for content, blank in (("", True), ("  ", True), (None, True), ([], True), ({"type": "text", "text": ""}, True),
++                               ("x", False), ([{"type": "input_image"}], False), ({"type": "input_audio"}, False),
++                               ({"note": 1}, False), ([{"text": " "}, {"unknown": 1}], True)):
++            with self.subTest(content=content):
++                self.assertEqual(not plugin.branch_text(content).strip(), blank)
++
++
++class FakeDb:
++    """get_session over a dict, to walk parent links that a real store refuses to hold."""
++
++    def __init__(self, rows):
++        self.rows, self.reads = rows, []
++
++    def get_session(self, sid):
++        self.reads.append(sid)
++        return self.rows.get(sid)
++
++
++class LineageRootTest(unittest.TestCase):
++    def root(self, rows, sid):
++        return plugin.lineage_root(FakeDb(rows), sid, {}, {})
++
++    def test_parent_rules(self):
++        rows = {
++            "root": {},
++            "branch": {"_branched_from": "root", "parent_session_id": "elsewhere"},
++            "old-fork": {"parent_session_id": "branch"},
++            "reset": {"_reset_from": "root", "parent_session_id": "root"},
++            "orphan": {"parent_session_id": "deleted"},
++        }
++        self.assertEqual(self.root(rows, "old-fork"), "root")
++        self.assertEqual(self.root(rows, "reset"), "reset")  # /new starts its own lineage
++        self.assertEqual(self.root(rows, "orphan"), "orphan")  # a parent not in the store ends the walk
++
++    def test_a_cycle_has_no_root(self):
++        rows = {"x": {"parent_session_id": "y"}, "y": {"parent_session_id": "x"}, "z": {"parent_session_id": "x"}}
++        self.assertIsNone(self.root(rows, "z"))
++
++    def test_a_walk_past_the_cap_has_no_root(self):
++        rows = {"n0": {}}
++        for i in range(1, plugin.MAX_PARENT_LINKS + 3):
++            rows[f"n{i}"] = {"parent_session_id": f"n{i - 1}"}
++        self.assertIsNone(self.root(rows, f"n{plugin.MAX_PARENT_LINKS + 2}"))
++        self.assertEqual(self.root(rows, f"n{plugin.MAX_PARENT_LINKS}"), "n0")
++
++    def test_a_shared_ancestor_is_read_once(self):
++        db = FakeDb({"root": {}, "a": {"parent_session_id": "root"}, "b": {"parent_session_id": "root"}})
++        rows, roots = {}, {}
++        self.assertEqual([plugin.lineage_root(db, sid, rows, roots) for sid in ("a", "b")], ["root", "root"])
++        self.assertEqual(sorted(db.reads), ["a", "b", "root"])
++
++
++class CapTest(unittest.TestCase):
++    def test_the_oldest_exchanges_lose_their_text_in_every_chat_at_once(self):
++        def chat(*texts):
++            roles = ("assistant",) + ("user", "assistant") * 3
++            return [{"role": role, "text": text, "row_id": i} for i, (role, text) in enumerate(zip(roles, texts))]
++
++        # 36 characters: exchange 0 holds 24 (the greeting goes with it), exchange 1 holds 8, exchange 2 holds 4.
++        histories = {"parent": chat("greeting", "q0", "a0", "q1", "a1", "q2", "a2"),
++                     "branch": chat("greeting", "q0", "a0", "q1", "b1")}
++        with mock.patch.object(plugin, "MAX_REPLY_CHARS", 11):
++            self.assertTrue(plugin.cap_histories(histories))
++        # A row before the first user row goes with exchange 0. Rows and row ids all stay.
++        self.assertEqual([r["text"] for r in histories["parent"]], ["", "", "", "", "", "q2", "a2"])
++        self.assertEqual([r["text"] for r in histories["branch"]], ["", "", "", "", ""])
++        self.assertEqual([r["row_id"] for r in histories["parent"]], list(range(7)))
++        with mock.patch.object(plugin, "MAX_REPLY_CHARS", 1000):
++            self.assertFalse(plugin.cap_histories(histories))
++
+ 
+ if __name__ == "__main__":
+     unittest.main(verbosity=2)

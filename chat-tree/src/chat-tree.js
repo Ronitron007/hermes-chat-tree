@@ -796,7 +796,7 @@ export function digestResult(event) {
   return { job, ok: false, error: str(p?.error) || 'The digest backend sent no digest.' };
 }
 
-// The history.read reply, checked: { histories: Map(id -> rows), missing: Set(id) }, or null when
+// The history.read reply, checked: { histories: Map(id -> rows), missing: Set(id), truncated: bool }, or null when
 // the reply has no histories object. A history that is not a list is left out (read as not answered).
 export function parseHistoryReply(result) {
   const raw = result?.histories;
@@ -804,7 +804,8 @@ export function parseHistoryReply(result) {
   const histories = new Map();
   for (const [id, rows] of Object.entries(raw)) if (Array.isArray(rows)) histories.set(id, rows);
   const missing = new Set((Array.isArray(result?.missing) ? result.missing : []).filter((id) => typeof id === 'string'));
-  return { histories, missing };
+  const truncated = Boolean(result?.truncated);
+  return { histories, missing, truncated };
 }
 
 // A history is read again only when its chat's message count or last activity moved.
@@ -1650,6 +1651,7 @@ export function createChatTree(deps) {
     };
     let live = stale;
     let backendMissing = false;
+    let truncated = false;
     if (stale.length) {
       const batch = await readStored(stale.map((row) => row.id));
       if (batch.ok) {
@@ -1659,6 +1661,7 @@ export function createChatTree(deps) {
           if (list) keep(row, exchangesFromRows(list));
           else live.push(row);
         }
+        truncated = Boolean(batch.truncated);
       } else if (batch.missing) backendMissing = true;
       else errors.push(`Stored histories: ${batch.error}`);
     }
@@ -1674,7 +1677,7 @@ export function createChatTree(deps) {
       }
     });
     while (historyCache.size > HISTORY_CACHE_MAX) historyCache.delete(historyCache.keys().next().value);
-    return { exchanges, errors, backendMissing };
+    return { exchanges, errors, backendMissing, truncated };
   }
 
   async function loadOnce(mine) {
@@ -1724,6 +1727,7 @@ export function createChatTree(deps) {
       next.exchanges = histories.exchanges;
       errors.push(...histories.errors);
       backendMissing = histories.backendMissing;
+      if (histories.truncated) errors.push('Some chat history was truncated due to length.');
     }
     // A branch, a fork digest or a status read may have landed while the reads ran: keep the newest.
     const now = $data.get();
@@ -1964,7 +1968,8 @@ export function createChatTree(deps) {
     if ($status.get().note !== BACKEND_NOTE_TEXT) {
       const stored = await readStored([openId]);
       const rows = stored.ok ? stored.histories.get(openId) : undefined;
-      if (Array.isArray(rows)) return rows;
+      // Verify rows have branch_index before using them; fallback if not present (version mismatch).
+      if (Array.isArray(rows) && rows.some(row => Number.isInteger(row?.branch_index))) return rows;
     }
     return readOpenRows(openId);
   }
